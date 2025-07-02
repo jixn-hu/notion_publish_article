@@ -3,7 +3,9 @@ import re
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters import HtmlFormatter
-
+"""
+将 Markdown 转换为微信公众号友好的 HTML（仅核心内容）
+"""
 
 def md_to_wechat_html(md_content):
     """

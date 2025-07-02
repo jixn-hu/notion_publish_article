@@ -10,6 +10,10 @@ from urllib.parse import urljoin
 from typing import List, Dict, Union, Tuple
 from md_to_html import md_to_wechat_html
 from bs4 import BeautifulSoup
+"""
+微信公众号发布器
+支持 发布文章和（图文）类型
+"""
 
 # 配置日志
 logging.basicConfig(
