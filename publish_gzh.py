@@ -428,7 +428,7 @@ class WechatArticlePublisher:
         return publish_id
 
 
-# 使用示例
+# 使用示例1
 if __name__ == "__main__":
     # 1. 初始化API客户端
     api_client = WechatOfficialAccountPublisher(
