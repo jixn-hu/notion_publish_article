@@ -5,7 +5,7 @@ import time
 import os
 import mimetypes
 import logging
-import re
+import config
 from urllib.parse import urljoin
 from typing import List, Dict, Union, Tuple
 from md_to_html import md_to_wechat_html
@@ -432,8 +432,8 @@ class WechatArticlePublisher:
 if __name__ == "__main__":
     # 1. 初始化API客户端
     api_client = WechatOfficialAccountPublisher(
-        app_id="wxbeef1473346f82a8",
-        app_secret="4089354b7a84bb755366cbd01942c704"
+        app_id=config.gzh_app_id,
+        app_secret=config.gzh_app_secret
     )
 
     # 2. 初始化文章发布器
