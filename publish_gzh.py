@@ -1,3 +1,5 @@
+import re
+
 import markdown
 import requests
 import json
@@ -192,6 +194,18 @@ class MarkdownProcessor:
         return html_content
 
     @staticmethod
+    def convert_to_html1(md_content: str) -> str:
+        """
+        将Markdown转换为美观的HTML
+        :param md_content: Markdown内容
+        :return: 格式化后的HTML内容
+        """
+        # 将Markdown转换为HTML
+        html_content = markdown.markdown(md_content, extensions=['extra', 'tables'])
+        # html_content = md_to_wechat_html(md_content)
+        return html_content
+
+    @staticmethod
     def extract_images(html_content: str) -> List[str]:
         """
         从HTML中提取所有图片路径
@@ -232,58 +246,98 @@ class WechatArticlePublisher:
     def __init__(self, client: WechatOfficialAccountPublisher):
         self.client = client
 
-    def process_article_images(self, html_content: str, image_folder: str = "") -> Tuple[str, Dict[str, dict]]:
+    def process_article_images(self, html_content: str) -> Tuple[str, Dict[str, dict]]:
         """
-        处理文章中的图片（上传本地图片，保留远程图片）
+        处理文章中的图片（全部上传，无论本地还是远程）
         :param html_content: HTML内容
-        :param image_folder: 图片所在目录（用于本地图片）
+        :param image_folder: 图片所在目录（已废弃，不再使用）
         :return: (处理后的HTML, 图片信息映射)
         """
         image_info = {}
 
-        # 提取所有图片
+        # 提取所有图片路径
         image_paths = MarkdownProcessor.extract_images(html_content)
 
         for img_path in image_paths:
-            # 处理本地图片
-            if not img_path.startswith(('http://', 'https://')):
-                # 构建完整路径
-                full_path = os.path.join(image_folder, img_path) if image_folder else img_path
-
-                if os.path.exists(full_path):
-                    try:
-                        # 上传图片
-                        result = self.client.upload_permanent_image(full_path, image_type='content')
-                        image_info[img_path] = result
-                    except Exception as e:
-                        logger.error(f"图片上传失败: {img_path}, 错误: {str(e)}")
-                        # 上传失败时保留原路径
-                        image_info[img_path] = {'url': img_path, 'is_remote': False}
-                else:
-                    logger.warning(f"图片不存在: {full_path}")
-                    image_info[img_path] = {'url': img_path, 'is_remote': False}
-            else:
-                # 远程图片直接使用
-                image_info[img_path] = {'url': img_path, 'is_remote': True}
+            try:
+                # 直接上传，无论本地还是远程
+                result = self.client.upload_permanent_image(img_path, image_type='content')
+                image_info[img_path] = result
+            except Exception as e:
+                logger.error(f"图片上传失败: {img_path}, 错误: {str(e)}")
+                # 上传失败时保留原路径
+                image_info[img_path] = {'url': img_path, 'is_remote': img_path.startswith(('http://', 'https://'))}
 
         # 创建图片路径映射
         image_map = {old: info['url'] for old, info in image_info.items()}
 
-        # 替换图片路径
+        # 替换HTML中的图片路径
         updated_html = MarkdownProcessor.replace_image_sources(html_content, image_map)
 
         return updated_html, image_info
+
+    def extract_and_remove_images(self, html_content: str) -> Tuple[str, list]:
+        """
+        提取html_content中的所有图片，删除图片标签，返回处理后的html和图片列表
+        :param html_content: HTML内容
+        :return: (去除图片后的HTML, 图片src列表)
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        img_list = []
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src:
+                img_list.append(src)
+            img.decompose()  # 删除图片标签
+        html = self.wechat_content_cleaner(str(soup))
+        return html, img_list
+
+    def wechat_content_cleaner(self,html_content):
+        """
+        处理微信公众号HTML内容使其合规
+        功能：
+        1. 移除外链的http/https前缀
+        2. 移除非必要的<br/>和空段落
+        3. 移除可能违规的样式标签
+        """
+        # 使用BeautifulSoup解析HTML
+        soup = BeautifulSoup(html_content, 'html.parser')
+        # 去掉所有的a标签
+        for a_tag in soup.find_all('a'):
+            a_tag.decompose()
+        # 1. 处理外链 - 移除外链协议头
+        for a_tag in soup.find_all('a', href=True):
+            original_url = a_tag['href']
+            # 移除非微信白名单域名的http/https
+            if not any(domain in original_url for domain in ['qq.com', 'weixin.qq.com']):
+                cleaned_url = re.sub(r'^https?://', '', original_url)
+                a_tag['href'] = cleaned_url
+                # a标题也不要http/https
+                if a_tag.string:
+                    a_tag.string = re.sub(r'^https?://', '', a_tag.string)
+
+        # 2. 清理不必要的换行和空段落
+        for br in soup.find_all('br'):
+            br.decompose()
+
+        for p in soup.find_all('p'):
+            if not p.get_text(strip=True):  # 如果是空段落
+                p.decompose()
+
+        # 3. 移除可能违规的样式标签（保留内容）
+        for tag in soup.find_all(['strong', 'b', 'em', 'i', 'u']):
+            tag.unwrap()  # 移除标签但保留内容
+
+        # 返回处理后的HTML字符串
+        return str(soup)
 
     def publish_markdown_article(
             self,
             md_content: str,
             title: str,
             author: str,
-            digest: str,
             content_source_url: str,
             cover_image_path: str,
-            image_folder: str = "",
-            article_type: str = "news"
     ) -> str:
         """
         发布Markdown格式的文章
@@ -304,7 +358,7 @@ class WechatArticlePublisher:
 
             # 2. 处理内容图片
             logger.info("处理内容图片...")
-            processed_content, img_info = self.process_article_images(html_content, image_folder)
+            processed_content, img_info = self.process_article_images(html_content)
             logger.info(f"处理了 {len(img_info)} 张内容图片")
 
             # 3. 上传封面图
@@ -318,7 +372,7 @@ class WechatArticlePublisher:
                 "author": author,
                 "content": processed_content,
                 "content_source_url": content_source_url,
-                "digest": digest,
+                "need_open_comment": 1,
                 "thumb_media_id": cover_result['media_id'],
             }
             # article_data = {
@@ -339,9 +393,8 @@ class WechatArticlePublisher:
 
     def publish_image_message(
             self,
-            image_paths: List[str],
             title: str = "",
-            content: str = ""
+            md_content: str = ""
     ) -> str:
         """
         发布图片消息 (newspic)
@@ -353,6 +406,10 @@ class WechatArticlePublisher:
         try:
             # 1. 上传图片
             image_list = []
+            logger.info("转换Markdown为HTML...")
+            html_content = MarkdownProcessor.convert_to_html1(md_content)
+            logger.info("提取图片...")
+            html_content1, image_paths = self.extract_and_remove_images(html_content)
             logger.info("上传图片...")
             for image_path in image_paths:
                 image_result = self.client.upload_permanent_image(image_path, image_type='newspic')
@@ -366,8 +423,8 @@ class WechatArticlePublisher:
                 "article_type": "newspic",  # 指定为图片消息
                 "title": title,
                 "author": "小胡哥",
-                "content": f"{content}",
-                "content_source_url": "",
+                "content": f"{html_content1}",
+                "need_open_comment": 1,
                 "image_info": {
                     "image_list": image_list
                 }
@@ -407,7 +464,7 @@ class WechatArticlePublisher:
         logger.info(f"草稿创建成功, media_id: {draft_id}")
 
         # 发布草稿
-        return ''# self.publish_draft(draft_id)
+        return self.publish_draft(draft_id)
 
     def publish_draft(self, media_id: str) -> str:
         """
