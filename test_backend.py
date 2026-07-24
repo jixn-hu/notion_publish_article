@@ -6,10 +6,27 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 import backend.db
+import backend.media
+import backend.accounts
+import backend.browser
+import backend.proxies
 import backend.app as app_module
 from backend.assets import get_platform_asset, save_platform_asset
 from backend.logging_config import redact_text, redact_url
 from backend.notion_client import NotionClient, page_metadata
+from backend.platforms.bilibili import BilibiliPublisher
+from backend.platforms.channels import (
+    ChannelsPublisher,
+    _channels_text_profile,
+)
+from backend.platforms.douyin import DouyinPublisher
+from backend.platforms.douyin import (
+    _current_page as current_douyin_page,
+    _douyin_text_profile,
+)
+from backend.platforms.xiaohongshu import (
+    _parse_profile_count,
+)
 from backend.services import _upsert_synced_article
 
 
@@ -24,6 +41,20 @@ class BackendApiTests(unittest.TestCase):
         )
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
+        self.media_patch = patch.object(
+            backend.media,
+            "MEDIA_DIR",
+            Path(self.temp_dir.name) / "media",
+        )
+        self.media_patch.start()
+        self.addCleanup(self.media_patch.stop)
+        self.avatar_patch = patch.object(
+            backend.accounts,
+            "AVATAR_ROOT",
+            Path(self.temp_dir.name) / "account_avatars",
+        )
+        self.avatar_patch.start()
+        self.addCleanup(self.avatar_patch.stop)
         self.migration_patch = patch.object(
             app_module,
             "migrate_legacy_config",
@@ -43,10 +74,254 @@ class BackendApiTests(unittest.TestCase):
         platforms = self.client.get("/api/platforms").json()
         self.assertEqual(
             [item["key"] for item in platforms],
-            ["wechat", "xiaohongshu", "csdn"],
+            [
+                "wechat",
+                "xiaohongshu",
+                "douyin",
+                "channels",
+                "bilibili",
+                "csdn",
+            ],
         )
-        self.assertTrue(platforms[0]["implemented"])
-        self.assertFalse(platforms[1]["implemented"])
+        self.assertTrue(all(item["implemented"] for item in platforms[:5]))
+        self.assertFalse(platforms[5]["implemented"])
+
+    def test_browser_video_platform_accounts_and_content_boundary(self):
+        for key in ("xiaohongshu", "douyin", "channels", "bilibili"):
+            response = self.client.post(
+                "/api/accounts",
+                json={"platform": key, "name": f"{key}-主账号"},
+            )
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(response.json()["platform"], key)
+
+        settings = self.client.get("/api/settings").json()["values"]
+        self.assertFalse(settings["douyin_enabled"])
+        self.assertFalse(settings["channels_enabled"])
+        self.assertFalse(settings["bilibili_enabled"])
+        self.assertEqual(settings["bilibili_default_category"], "")
+        self.assertEqual(settings["bilibili_copyright"], "")
+
+        for publisher_class in (
+            DouyinPublisher,
+            ChannelsPublisher,
+            BilibiliPublisher,
+        ):
+            publisher = publisher_class(settings)
+            with self.assertRaisesRegex(ValueError, "首期仅支持视频内容"):
+                publisher.publish({"article_type": "image"})
+
+    def test_xiaohongshu_profile_is_saved_without_changing_login_status(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "xiaohongshu", "name": "资料测试账号"},
+        ).json()
+        from backend.accounts import update_account_status
+
+        update_account_status(account["id"], "valid")
+        profile = {
+            "display_name": "小红书昵称",
+            "platform_user_id": "123456",
+            "avatar_url": "https://example.com/avatar.jpg",
+            "avatar_cached": True,
+            "following_count": 7,
+            "followers_count": 240,
+            "likes_and_collections_count": 3197,
+        }
+        with patch(
+            "backend.accounts._fetch_account_profile",
+            return_value=profile,
+        ):
+            response = self.client.post(
+                f"/api/accounts/{account['id']}/profile"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "valid")
+        self.assertEqual(response.json()["profile"], profile)
+        self.assertTrue(response.json()["profile_synced_at"])
+        self.assertEqual(response.json()["profile_error"], "")
+
+        avatar_path = backend.accounts.account_avatar_path(response.json())
+        avatar_path.parent.mkdir(parents=True)
+        avatar_path.write_bytes(b"png-bytes")
+        avatar_response = self.client.get(
+            f"/api/accounts/{account['id']}/avatar"
+        )
+        self.assertEqual(avatar_response.status_code, 200)
+        self.assertEqual(avatar_response.content, b"png-bytes")
+
+    def test_xiaohongshu_compact_profile_counts(self):
+        self.assertEqual(_parse_profile_count("1.2万"), 12000)
+        self.assertEqual(_parse_profile_count("3,197"), 3197)
+        self.assertIsNone(_parse_profile_count("暂无"))
+
+    def test_douyin_profile_text_metrics(self):
+        profile = _douyin_text_profile(
+            "抖音号：dy123\n关注数 12\n粉丝数 1.2万\n"
+            "作品数 31\n获赞数 8.6万"
+        )
+        self.assertEqual(profile["platform_user_id"], "dy123")
+        self.assertEqual(profile["following_count"], 12)
+        self.assertEqual(profile["followers_count"], 12000)
+        self.assertEqual(profile["works_count"], 31)
+        self.assertEqual(profile["likes_count"], 86000)
+
+    def test_channels_profile_text_metrics(self):
+        profile = _channels_text_profile(
+            "视频号 ID：wx-channel-1\n有效关注人数 3.4万\n"
+            "发表视频数 18\n获赞数 2,406"
+        )
+        self.assertEqual(
+            profile["platform_user_id"],
+            "wx-channel-1",
+        )
+        self.assertEqual(profile["followers_count"], 34000)
+        self.assertEqual(profile["works_count"], 18)
+        self.assertEqual(profile["likes_count"], 2406)
+
+    def test_douyin_and_channels_profile_handlers_are_registered(self):
+        self.assertIn(
+            "douyin",
+            backend.accounts.ACCOUNT_PROFILE_HANDLERS,
+        )
+        self.assertIn(
+            "channels",
+            backend.accounts.ACCOUNT_PROFILE_HANDLERS,
+        )
+
+    def test_douyin_login_follows_replaced_page(self):
+        closed_page = Mock()
+        closed_page.is_closed.return_value = True
+        replacement = Mock()
+        replacement.is_closed.return_value = False
+        context = Mock()
+        context.pages = [closed_page, replacement]
+
+        self.assertIs(
+            current_douyin_page(context, closed_page),
+            replacement,
+        )
+
+    def test_windows_browser_command_avoids_automation_warning_flags(self):
+        command = backend.browser._native_browser_command(
+            Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            Path("D:/profiles/demo"),
+            9333,
+        )
+        joined = " ".join(command)
+        self.assertIn("--remote-debugging-port=9333", joined)
+        self.assertIn("--remote-debugging-address=127.0.0.1", joined)
+        for forbidden in backend.browser.FORBIDDEN_BROWSER_ARGS:
+            self.assertNotIn(forbidden, joined)
+
+    def test_saved_proxy_can_be_tested_and_selected_by_account(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "douyin", "name": "代理测试账号"},
+        ).json()
+        self.assertEqual(account["proxy_url"], "")
+
+        created = self.client.post(
+            "/api/proxies",
+            json={
+                "name": "本地代理",
+                "proxy_url": "SOCKS5://127.0.0.1:7890/",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(
+            created.json()["proxy_url"],
+            "socks5://127.0.0.1:7890",
+        )
+        self.assertEqual(created.json()["status"], "pending")
+
+        proxy_response = Mock()
+        proxy_response.json.return_value = {"ip": "203.0.113.8"}
+        proxy_response.raise_for_status.return_value = None
+        with patch(
+            "backend.proxies.requests.get",
+            return_value=proxy_response,
+        ):
+            tested = self.client.post(
+                f"/api/proxies/{created.json()['id']}/test"
+            )
+        self.assertEqual(tested.status_code, 200)
+        self.assertEqual(tested.json()["status"], "valid")
+        self.assertEqual(tested.json()["exit_ip"], "203.0.113.8")
+
+        response = self.client.put(
+            f"/api/accounts/{account['id']}/proxy",
+            json={"proxy_id": created.json()["id"]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["proxy"]["name"], "本地代理")
+        command = backend.browser._native_browser_command(
+            Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            Path("D:/profiles/demo"),
+            9333,
+            response.json()["proxy_url"],
+        )
+        self.assertIn(
+            "--proxy-server=socks5://127.0.0.1:7890",
+            command,
+        )
+
+        cleared = self.client.put(
+            f"/api/accounts/{account['id']}/proxy",
+            json={"proxy_id": None},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json()["proxy_url"], "")
+        self.assertIsNone(cleared.json()["proxy"])
+
+        self.client.put(
+            f"/api/accounts/{account['id']}/proxy",
+            json={"proxy_id": created.json()["id"]},
+        )
+        deleted = self.client.delete(
+            f"/api/proxies/{created.json()['id']}"
+        )
+        self.assertEqual(deleted.status_code, 200)
+        refreshed = self.client.get("/api/accounts").json()[0]
+        self.assertIsNone(refreshed["proxy_id"])
+        self.assertIsNone(refreshed["proxy"])
+
+    def test_saved_proxy_rejects_credentials_and_missing_port(self):
+        for proxy_url in (
+            "http://user:pass@127.0.0.1:7890",
+            "http://127.0.0.1",
+            "ftp://127.0.0.1:21",
+        ):
+            response = self.client.post(
+                "/api/proxies",
+                json={
+                    "name": f"错误代理-{proxy_url}",
+                    "proxy_url": proxy_url,
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+
+    def test_scheme_scoped_proxy_format_is_normalized_for_chromium(self):
+        value = "HTTPS:HTTP://192.0.2.10:808/"
+        self.assertEqual(
+            backend.proxies.normalize_proxy_url(value),
+            "https:http://192.0.2.10:808",
+        )
+        self.assertEqual(
+            backend.proxies.requests_proxy_map(value),
+            {"https": "http://192.0.2.10:808"},
+        )
+        command = backend.browser._native_browser_command(
+            Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            Path("D:/profiles/demo"),
+            9333,
+            value,
+        )
+        self.assertIn(
+            "--proxy-server=https=http://192.0.2.10:808",
+            command,
+        )
 
     def test_article_create_edit_and_list(self):
         created = self.client.post(
@@ -74,6 +349,41 @@ class BackendApiTests(unittest.TestCase):
         articles = self.client.get("/api/articles").json()
         self.assertEqual(len(articles), 1)
         self.assertEqual(articles[0]["author"], "测试作者")
+
+    def test_account_and_video_content_flow(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "xiaohongshu", "name": "主账号"},
+        )
+        self.assertEqual(account.status_code, 201)
+        self.assertEqual(account.json()["status"], "pending")
+
+        uploaded = self.client.post(
+            "/api/media",
+            files={"file": ("demo.mp4", b"video-bytes", "video/mp4")},
+        )
+        self.assertEqual(uploaded.status_code, 201)
+        media_path = uploaded.json()["path"]
+        self.assertTrue(Path(media_path).is_file())
+
+        created = self.client.post(
+            "/api/articles",
+            json={
+                "title": "视频测试",
+                "article_type": "video",
+                "media_paths": [media_path],
+                "target_platforms": ["xiaohongshu"],
+                "platform_actions": {"xiaohongshu": "publish"},
+                "platform_accounts": {"xiaohongshu": account.json()["id"]},
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["article_type"], "video")
+        self.assertEqual(created.json()["media_paths"], [media_path])
+        self.assertEqual(
+            created.json()["platform_accounts"],
+            {"xiaohongshu": account.json()["id"]},
+        )
 
     def test_settings_are_masked(self):
         saved = self.client.put(

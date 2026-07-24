@@ -297,8 +297,8 @@ def create_article(values):
     if not title:
         raise ValueError("文章标题不能为空")
     article_type = values.get("article_type", "article")
-    if article_type not in {"article", "image"}:
-        raise ValueError("article_type 必须是 article 或 image")
+    if article_type not in {"article", "image", "video"}:
+        raise ValueError("article_type 必须是 article、image 或 video")
     publish_mode = values.get("publish_mode", "manual")
     if publish_mode not in {"manual", "automatic"}:
         raise ValueError("publish_mode 必须是 manual 或 automatic")
@@ -308,9 +308,10 @@ def create_article(values):
             """
             INSERT INTO articles (
                 title, author, article_type, content_md, cover_url, source_url,
-                tags_json, publish_mode, target_platforms_json,
-                platform_actions_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                tags_json, media_paths_json, publish_mode, target_platforms_json,
+                platform_actions_json, platform_accounts_json, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
             """,
             (
                 title,
@@ -320,6 +321,7 @@ def create_article(values):
                 values.get("cover_url", ""),
                 values.get("source_url", ""),
                 json.dumps(values.get("tags", []), ensure_ascii=False),
+                json.dumps(values.get("media_paths", []), ensure_ascii=False),
                 publish_mode,
                 json.dumps(
                     values.get("target_platforms", ["wechat"]),
@@ -327,6 +329,10 @@ def create_article(values):
                 ),
                 json.dumps(
                     values.get("platform_actions", {"wechat": "draft"}),
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    values.get("platform_accounts", {}),
                     ensure_ascii=False,
                 ),
                 now,
@@ -368,9 +374,11 @@ def update_article(article_id, values):
         "content_md",
         "cover_url",
         "source_url",
+        "media_paths",
         "publish_mode",
         "target_platforms",
         "platform_actions",
+        "platform_accounts",
         "status",
         "tags",
         "ai_result",
@@ -378,8 +386,12 @@ def update_article(article_id, values):
     unknown = set(values) - allowed
     if unknown:
         raise ValueError(f"不可更新字段: {', '.join(sorted(unknown))}")
-    if "article_type" in values and values["article_type"] not in {"article", "image"}:
-        raise ValueError("article_type 必须是 article 或 image")
+    if "article_type" in values and values["article_type"] not in {
+        "article",
+        "image",
+        "video",
+    }:
+        raise ValueError("article_type 必须是 article、image 或 video")
     if "publish_mode" in values and values["publish_mode"] not in {
         "manual",
         "automatic",
@@ -392,10 +404,20 @@ def update_article(article_id, values):
         }
         if invalid_actions:
             raise ValueError("平台动作必须是 draft 或 publish")
+    if "platform_accounts" in values:
+        invalid_account_ids = [
+            value
+            for value in values["platform_accounts"].values()
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ]
+        if invalid_account_ids:
+            raise ValueError("平台账号 ID 必须是正整数")
 
     column_map = {
         "target_platforms": "target_platforms_json",
         "platform_actions": "platform_actions_json",
+        "platform_accounts": "platform_accounts_json",
+        "media_paths": "media_paths_json",
         "tags": "tags_json",
         "ai_result": "ai_result_json",
     }
@@ -403,7 +425,14 @@ def update_article(article_id, values):
     params = []
     for key, value in values.items():
         column = column_map.get(key, key)
-        if key in {"target_platforms", "platform_actions", "tags", "ai_result"}:
+        if key in {
+            "target_platforms",
+            "platform_actions",
+            "platform_accounts",
+            "media_paths",
+            "tags",
+            "ai_result",
+        }:
             value = json.dumps(value, ensure_ascii=False)
         assignments.append(f"{column} = ?")
         params.append(value)
@@ -506,6 +535,7 @@ def publish_article(article_id, requested_actions=None):
                         "action": platform_action,
                         "status": result_status,
                         "external_id": output.get("external_id", ""),
+                        "account_id": output.get("account_id"),
                     }
                 )
                 logger.info(

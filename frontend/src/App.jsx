@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { api } from './api'
+import Accounts from './Accounts'
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: '工作台', mark: '01' },
   { key: 'articles', label: '内容库', mark: '02' },
-  { key: 'settings', label: '连接与自动化', mark: '03' }
+  { key: 'accounts', label: '账号管理', mark: '03' },
+  { key: 'settings', label: '连接与自动化', mark: '04' }
 ]
 
 const STATUS_LABELS = {
@@ -23,7 +25,18 @@ const STATUS_LABELS = {
 const PLATFORM_LABELS = {
   wechat: '公众号',
   xiaohongshu: '小红书',
+  douyin: '抖音',
+  channels: '视频号',
+  bilibili: 'Bilibili',
   csdn: 'CSDN'
+}
+
+const BROWSER_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'channels', 'bilibili']
+
+const CONTENT_TYPE_LABELS = {
+  article: '文章',
+  image: '图文',
+  video: '视频'
 }
 
 const NOTION_FIELD_ROWS = [
@@ -42,6 +55,7 @@ function App () {
   const [dashboard, setDashboard] = useState(null)
   const [articles, setArticles] = useState([])
   const [platforms, setPlatforms] = useState([])
+  const [accounts, setAccounts] = useState([])
   const [settingsData, setSettingsData] = useState(null)
   const [health, setHealth] = useState(null)
   const [busy, setBusy] = useState('')
@@ -71,13 +85,21 @@ function App () {
     setSettingsData(await api.settings())
   }
 
+  const loadAccounts = async () => {
+    setAccounts(await api.accounts())
+  }
+
   useEffect(() => {
     loadOverview().catch(error => notify(error.message, 'error'))
   }, [])
 
   useEffect(() => {
     if (view === 'articles') {
-      loadArticles().catch(error => notify(error.message, 'error'))
+      Promise.all([loadArticles(), loadAccounts()])
+        .catch(error => notify(error.message, 'error'))
+    }
+    if (view === 'accounts') {
+      loadAccounts().catch(error => notify(error.message, 'error'))
     }
     if (view === 'settings') {
       Promise.all([loadSettings(), api.platforms().then(setPlatforms)])
@@ -180,6 +202,13 @@ function App () {
             reload={loadArticles}
             runAction={runAction}
             notify={notify}
+            accounts={accounts}
+          />
+        )}
+        {view === 'accounts' && (
+          <Accounts
+            notify={notify}
+            onChanged={setAccounts}
           />
         )}
         {view === 'settings' && settingsData && (
@@ -309,7 +338,7 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
   )
 }
 
-function Articles ({ articles, busy, reload, runAction, notify }) {
+function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
   const [status, setStatus] = useState('all')
   const [query, setQuery] = useState('')
   const [editing, setEditing] = useState(null)
@@ -385,7 +414,7 @@ function Articles ({ articles, busy, reload, runAction, notify }) {
                 </div>
               </div>
               <div className='type-cell'>
-                <b>{article.article_type === 'image' ? '图片' : '图文'}</b>
+                <b>{CONTENT_TYPE_LABELS[article.article_type] || article.article_type}</b>
                 <small>{article.publish_mode === 'automatic' ? '自动发布' : '手动发布'}</small>
               </div>
               <div className='platform-chips'>
@@ -430,6 +459,7 @@ function Articles ({ articles, busy, reload, runAction, notify }) {
       {(editing || creating) && (
         <ArticleEditor
           article={editing}
+          accounts={accounts}
           onClose={() => {
             setEditing(null)
             setCreating(false)
@@ -446,7 +476,7 @@ function Articles ({ articles, busy, reload, runAction, notify }) {
   )
 }
 
-function ArticleEditor ({ article, onClose, onSaved }) {
+function ArticleEditor ({ article, accounts, onClose, onSaved }) {
   const empty = {
     title: '',
     author: '',
@@ -455,14 +485,17 @@ function ArticleEditor ({ article, onClose, onSaved }) {
     cover_url: '',
     source_url: '',
     tags: [],
+    media_paths: [],
     publish_mode: 'manual',
     target_platforms: ['wechat'],
     platform_actions: { wechat: 'draft' },
+    platform_accounts: {},
     ai_result: {}
   }
   const [form, setForm] = useState(article ? { ...article } : empty)
   const [saving, setSaving] = useState(false)
   const [enriching, setEnriching] = useState(false)
+  const [uploading, setUploading] = useState(false)
   const [contentView, setContentView] = useState('edit')
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
 
@@ -477,9 +510,11 @@ function ArticleEditor ({ article, onClose, onSaved }) {
         cover_url: form.cover_url,
         source_url: form.source_url,
         tags: form.tags,
+        media_paths: form.media_paths,
         publish_mode: form.publish_mode,
         target_platforms: form.target_platforms,
         platform_actions: form.platform_actions,
+        platform_accounts: form.platform_accounts,
         ai_result: form.ai_result
       }
       if (article) {
@@ -532,6 +567,33 @@ function ArticleEditor ({ article, onClose, onSaved }) {
     }))
   }
 
+  const uploadMedia = async event => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (!files.length) return
+    setUploading(true)
+    try {
+      const uploaded = await Promise.all(files.map(file => api.uploadMedia(file)))
+      set('media_paths', [
+        ...(form.media_paths || []),
+        ...uploaded.map(item => item.path)
+      ])
+    } catch (error) {
+      window.alert(error.message)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const updatePlatformAccount = (platform, value) => {
+    setForm(current => {
+      const next = { ...(current.platform_accounts || {}) }
+      if (value) next[platform] = Number(value)
+      else delete next[platform]
+      return { ...current, platform_accounts: next }
+    })
+  }
+
   return (
     <div className='modal-backdrop' onMouseDown={onClose}>
       <section className='editor-drawer' onMouseDown={event => event.stopPropagation()}>
@@ -561,11 +623,57 @@ function ArticleEditor ({ article, onClose, onSaved }) {
             <label className='field'>
               <span>内容类型</span>
               <select value={form.article_type} onChange={e => set('article_type', e.target.value)}>
-                <option value='article'>公众号图文</option>
-                <option value='image'>图片消息</option>
+                <option value='article'>文章</option>
+                <option value='image'>图文（多图）</option>
+                <option value='video'>视频</option>
               </select>
             </label>
           </div>
+          {form.article_type !== 'article' && (
+            <div className='field full media-field'>
+              <div className='media-field-head'>
+                <div>
+                  <span>{form.article_type === 'video' ? '视频素材' : '图片素材'}</span>
+                  <small>
+                    {form.article_type === 'video'
+                      ? '小红书视频只选择 1 个视频文件'
+                      : '可一次选择多张图片，发布时保持当前顺序'}
+                  </small>
+                </div>
+                <label className={uploading ? 'button paper disabled' : 'button paper'}>
+                  {uploading ? '上传中…' : '选择本地素材'}
+                  <input
+                    type='file'
+                    hidden
+                    multiple={form.article_type === 'image'}
+                    disabled={uploading}
+                    accept={form.article_type === 'video'
+                      ? 'video/mp4,video/quicktime,video/webm'
+                      : 'image/jpeg,image/png,image/webp,image/gif'}
+                    onChange={uploadMedia}
+                  />
+                </label>
+              </div>
+              <div className='media-list'>
+                {(form.media_paths || []).map((path, index) => (
+                  <div key={`${path}-${index}`}>
+                    <span>{String(index + 1).padStart(2, '0')}</span>
+                    <b>{path.split(/[\\/]/).pop()}</b>
+                    <button
+                      type='button'
+                      onClick={() => set(
+                        'media_paths',
+                        form.media_paths.filter((_, itemIndex) => itemIndex !== index)
+                      )}
+                    >
+                      移除
+                    </button>
+                  </div>
+                ))}
+                {!form.media_paths?.length && <p>还没有上传素材。</p>}
+              </div>
+            </div>
+          )}
           <div className='field full markdown-field'>
             <div className='markdown-field-head'>
               <span>Markdown 正文</span>
@@ -649,9 +757,29 @@ function ArticleEditor ({ article, onClose, onSaved }) {
                         [key]: e.target.value
                       })}
                     >
-                      <option value='draft'>保存草稿</option>
+                      {key === 'wechat' && <option value='draft'>保存草稿</option>}
                       <option value='publish'>直接发布</option>
                     </select>
+                    {BROWSER_PLATFORM_KEYS.includes(key) && form.target_platforms.includes(key) && (
+                      <select
+                        className='account-select'
+                        value={form.platform_accounts?.[key] || ''}
+                        onChange={e => updatePlatformAccount(key, e.target.value)}
+                      >
+                        <option value=''>选择发布账号</option>
+                        {accounts
+                          .filter(account => account.platform === key)
+                          .map(account => (
+                            <option
+                              key={account.id}
+                              value={account.id}
+                              disabled={account.status !== 'valid'}
+                            >
+                              {account.name} · {account.status === 'valid' ? '可用' : '需登录'}
+                            </option>
+                          ))}
+                      </select>
+                    )}
                   </div>
                 ))}
               </div>
@@ -947,6 +1075,65 @@ function Settings ({ data, platforms, notify, onSaved }) {
 
       <SettingsSection
         index='03'
+        title='Patchright 浏览器发布'
+        description='每个账号使用独立的本地 Chrome 会话；四个平台均支持视频，小红书另支持图文。'
+        action={
+          <div className='settings-actions'>
+            {BROWSER_PLATFORM_KEYS.map(key => (
+              <button
+                key={key}
+                className='button paper'
+                disabled={Boolean(testing)}
+                onClick={() => test(key, () => api.testPlatform(key))}
+              >
+                {testing === key ? '检查中…' : `检查${PLATFORM_LABELS[key]}`}
+              </button>
+            ))}
+          </div>
+        }
+      >
+        <div className='settings-grid'>
+          <TextField
+            label='Chrome / Edge 可执行文件（可选）'
+            value={form.browser_executable_path}
+            onChange={v => set('browser_executable_path', v)}
+            placeholder='留空时自动检测本机浏览器'
+          />
+          <TextField
+            label='Bilibili 默认分区'
+            value={form.bilibili_default_category}
+            onChange={v => set('bilibili_default_category', v)}
+            placeholder='例如：生活'
+          />
+          <label className='field'>
+            <span>Bilibili 稿件类型</span>
+            <select
+              value={form.bilibili_copyright}
+              onChange={e => set('bilibili_copyright', e.target.value)}
+            >
+              <option value=''>发布前必须选择</option>
+              <option value='self'>自制 / 原创或已获授权</option>
+              <option value='repost'>转载</option>
+            </select>
+          </label>
+        </div>
+        {BROWSER_PLATFORM_KEYS.map(key => (
+          <Toggle
+            key={key}
+            label={`启用${PLATFORM_LABELS[key]}`}
+            note='发布前请先到“账号管理”添加账号并完成浏览器登录。'
+            checked={form[`${key}_enabled`]}
+            onChange={v => set(`${key}_enabled`, v)}
+          />
+        ))}
+        <div className='integration-note'>
+          <b>首期发布范围</b>
+          <span>抖音、视频号、Bilibili 为单视频直发；小红书为多图或单视频直发。</span>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        index='04'
         title='AI 内容编辑'
         description='自动提取标签、生成摘要，并按目标平台生成可人工修改的内容版本。'
         action={
@@ -988,7 +1175,7 @@ function Settings ({ data, platforms, notify, onSaved }) {
       </SettingsSection>
 
       <SettingsSection
-        index='04'
+        index='05'
         title='自动发布'
         description='只处理发布方式为“自动”且状态为“待发布”的稿件。'
       >
@@ -1011,12 +1198,12 @@ function Settings ({ data, platforms, notify, onSaved }) {
       </SettingsSection>
 
       <SettingsSection
-        index='05'
+        index='06'
         title='后续平台'
         description='接口和发布记录已经预留，接入时无需改动文章模型。'
       >
         <div className='roadmap-grid'>
-          {platforms.filter(item => item.key !== 'wechat').map(platform => (
+          {platforms.filter(item => !item.implemented).map(platform => (
             <article key={platform.key}>
               <span>{PLATFORM_LABELS[platform.key]}</span>
               <b>ADAPTER READY</b>

@@ -1,6 +1,10 @@
 async function request (path, options = {}) {
+  const isFormData = options.body instanceof FormData
   const response = await fetch(`/api${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+      ...options.headers
+    },
     ...options
   })
   const data = await response.json().catch(() => ({}))
@@ -35,6 +39,30 @@ export const api = {
   enrichArticle: id => request(`/articles/${id}/enrich`, { method: 'POST' }),
   syncNotion: () => request('/sync/notion', { method: 'POST' }),
   runAutomation: () => request('/automation/publish', { method: 'POST' }),
+  accounts: (platform = '') => request(`/accounts${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`),
+  createAccount: values => request('/accounts', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  loginAccount: id => request(`/accounts/${id}/login`, { method: 'POST' }),
+  checkAccount: id => request(`/accounts/${id}/check`, { method: 'POST' }),
+  refreshAccountProfile: id => request(`/accounts/${id}/profile`, { method: 'POST' }),
+  updateAccountProxy: (id, proxyId) => request(`/accounts/${id}/proxy`, {
+    method: 'PUT',
+    body: JSON.stringify({ proxy_id: proxyId })
+  }),
+  proxies: () => request('/proxies'),
+  createProxy: values => request('/proxies', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  testProxy: id => request(`/proxies/${id}/test`, { method: 'POST' }),
+  deleteProxy: id => request(`/proxies/${id}`, { method: 'DELETE' }),
+  uploadMedia: file => {
+    const body = new FormData()
+    body.append('file', file)
+    return request('/media', { method: 'POST', body })
+  },
   settings: () => request('/settings'),
   saveSettings: values => request('/settings', {
     method: 'PUT',

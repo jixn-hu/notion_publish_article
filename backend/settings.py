@@ -74,6 +74,36 @@ SETTING_DEFINITIONS = {
         "secret": False,
         "group": "xiaohongshu",
     },
+    "douyin_enabled": {
+        "default": False,
+        "secret": False,
+        "group": "douyin",
+    },
+    "channels_enabled": {
+        "default": False,
+        "secret": False,
+        "group": "channels",
+    },
+    "bilibili_enabled": {
+        "default": False,
+        "secret": False,
+        "group": "bilibili",
+    },
+    "bilibili_default_category": {
+        "default": "",
+        "secret": False,
+        "group": "bilibili",
+    },
+    "bilibili_copyright": {
+        "default": "",
+        "secret": False,
+        "group": "bilibili",
+    },
+    "browser_executable_path": {
+        "default": "",
+        "secret": False,
+        "group": "xiaohongshu",
+    },
     "csdn_enabled": {"default": False, "secret": False, "group": "csdn"},
     "auto_publish_enabled": {
         "default": False,

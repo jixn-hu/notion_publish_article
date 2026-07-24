@@ -50,9 +50,11 @@ def init_db():
                 cover_url TEXT NOT NULL DEFAULT '',
                 source_url TEXT NOT NULL DEFAULT '',
                 tags_json TEXT NOT NULL DEFAULT '[]',
+                media_paths_json TEXT NOT NULL DEFAULT '[]',
                 publish_mode TEXT NOT NULL DEFAULT 'manual',
                 target_platforms_json TEXT NOT NULL DEFAULT '["wechat"]',
                 platform_actions_json TEXT NOT NULL DEFAULT '{"wechat":"draft"}',
+                platform_accounts_json TEXT NOT NULL DEFAULT '{}',
                 ai_result_json TEXT NOT NULL DEFAULT '{}',
                 ai_enriched_at TEXT,
                 status TEXT NOT NULL DEFAULT 'ready',
@@ -74,6 +76,35 @@ def init_db():
                 created_at TEXT NOT NULL,
                 published_at TEXT,
                 FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS proxies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                proxy_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                exit_ip TEXT NOT NULL DEFAULT '',
+                last_latency_ms INTEGER,
+                last_error TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                name TEXT NOT NULL,
+                profile_dir TEXT NOT NULL DEFAULT '',
+                proxy_url TEXT NOT NULL DEFAULT '',
+                proxy_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(proxy_id) REFERENCES proxies(id),
+                UNIQUE(platform, name)
             );
 
             CREATE TABLE IF NOT EXISTS article_assets (
@@ -114,12 +145,25 @@ def init_db():
                 ),
                 "ai_result_json": "TEXT NOT NULL DEFAULT '{}'",
                 "ai_enriched_at": "TEXT",
+                "media_paths_json": "TEXT NOT NULL DEFAULT '[]'",
+                "platform_accounts_json": "TEXT NOT NULL DEFAULT '{}'",
             },
         )
         _ensure_columns(
             conn,
             "publish_records",
             {"action": "TEXT NOT NULL DEFAULT 'publish'"},
+        )
+        _ensure_columns(
+            conn,
+            "accounts",
+            {
+                "profile_json": "TEXT NOT NULL DEFAULT '{}'",
+                "profile_synced_at": "TEXT",
+                "profile_error": "TEXT NOT NULL DEFAULT ''",
+                "proxy_url": "TEXT NOT NULL DEFAULT ''",
+                "proxy_id": "INTEGER",
+            },
         )
         conn.execute(
             """
@@ -154,6 +198,10 @@ def row_to_article(row):
     )
     article["platform_actions"] = json.loads(
         article.pop("platform_actions_json") or "{}"
+    )
+    article["media_paths"] = json.loads(article.pop("media_paths_json") or "[]")
+    article["platform_accounts"] = json.loads(
+        article.pop("platform_accounts_json") or "{}"
     )
     article["ai_result"] = json.loads(article.pop("ai_result_json") or "{}")
     return article

@@ -4,7 +4,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,8 +14,25 @@ from backend.logging_config import configure_logging
 
 
 from backend.ai_service import AIContentService
+from backend.accounts import (
+    account_avatar_path,
+    check_account,
+    create_account,
+    get_account,
+    list_accounts,
+    login_account,
+    refresh_account_profile,
+    update_account_proxy,
+)
 from backend.db import init_db
+from backend.media import save_upload
 from backend.platforms import get_platforms
+from backend.proxies import (
+    create_proxy,
+    delete_proxy,
+    list_proxies,
+    test_proxy,
+)
 from backend.scheduler import AutomationScheduler
 from backend.services import (
     create_article,
@@ -104,11 +121,13 @@ class ArticlePayload(BaseModel):
     cover_url: str = ""
     source_url: str = ""
     tags: list[str] = Field(default_factory=list)
+    media_paths: list[str] = Field(default_factory=list)
     publish_mode: str = "manual"
     target_platforms: list[str] = Field(default_factory=lambda: ["wechat"])
     platform_actions: dict[str, str] = Field(
         default_factory=lambda: {"wechat": "draft"}
     )
+    platform_accounts: dict[str, int] = Field(default_factory=dict)
 
 
 class ArticleUpdatePayload(BaseModel):
@@ -119,15 +138,31 @@ class ArticleUpdatePayload(BaseModel):
     cover_url: str | None = None
     source_url: str | None = None
     tags: list[str] | None = None
+    media_paths: list[str] | None = None
     publish_mode: str | None = None
     target_platforms: list[str] | None = None
     platform_actions: dict[str, str] | None = None
+    platform_accounts: dict[str, int] | None = None
     ai_result: dict[str, Any] | None = None
     status: str | None = None
 
 
 class PublishPayload(BaseModel):
     platform_actions: dict[str, str] | None = None
+
+
+class AccountPayload(BaseModel):
+    platform: str
+    name: str
+
+
+class AccountProxyPayload(BaseModel):
+    proxy_id: int | None = None
+
+
+class ProxyPayload(BaseModel):
+    name: str
+    proxy_url: str
 
 
 def api_call(function, *args, **kwargs):
@@ -191,6 +226,70 @@ def platform_test(platform_key: str):
     if platform_key not in platforms:
         raise HTTPException(status_code=404, detail="平台不存在")
     return api_call(platforms[platform_key].test_connection)
+
+
+@app.get("/api/accounts")
+def accounts_get(platform: str | None = None):
+    return list_accounts(platform)
+
+
+@app.post("/api/accounts", status_code=201)
+def accounts_post(payload: AccountPayload):
+    return api_call(create_account, payload.platform, payload.name)
+
+
+@app.post("/api/accounts/{account_id}/login")
+def account_login(account_id: int):
+    return api_call(login_account, account_id)
+
+
+@app.post("/api/accounts/{account_id}/check")
+def account_check(account_id: int):
+    return api_call(check_account, account_id)
+
+
+@app.post("/api/accounts/{account_id}/profile")
+def account_profile(account_id: int):
+    return api_call(refresh_account_profile, account_id)
+
+
+@app.put("/api/accounts/{account_id}/proxy")
+def account_proxy(account_id: int, payload: AccountProxyPayload):
+    return api_call(update_account_proxy, account_id, payload.proxy_id)
+
+
+@app.get("/api/proxies")
+def proxies_get():
+    return list_proxies()
+
+
+@app.post("/api/proxies", status_code=201)
+def proxies_post(payload: ProxyPayload):
+    return api_call(create_proxy, payload.name, payload.proxy_url)
+
+
+@app.post("/api/proxies/{proxy_id}/test")
+def proxy_test(proxy_id: int):
+    return api_call(test_proxy, proxy_id)
+
+
+@app.delete("/api/proxies/{proxy_id}")
+def proxy_delete(proxy_id: int):
+    return api_call(delete_proxy, proxy_id)
+
+
+@app.get("/api/accounts/{account_id}/avatar")
+def account_avatar(account_id: int):
+    account = api_call(get_account, account_id)
+    path = account_avatar_path(account)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="账号头像尚未同步")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.post("/api/media", status_code=201)
+def media_post(file: UploadFile = File(...)):
+    return api_call(save_upload, file)
 
 
 @app.get("/api/articles")

@@ -6,19 +6,25 @@
 
 - 从 Notion 手动或自动同步待发布内容
 - 使用可配置 AI 自动提取标签、生成摘要和平台专用版本
-- 在内容库中创建、编辑和管理 Markdown 稿件
+- 在内容库中创建、编辑和管理文章、视频、图文稿件
+- 上传本地图片或视频素材，并为平台选择发布账号
 - 每个平台可单独选择“保存草稿”或“直接发布”
 - 手动或自动提交到微信公众号（默认保存草稿）
 - 分平台记录发布结果和错误
 - 在管理界面配置 Notion、公众号、代理和自动化间隔
-- 小红书、CSDN 已预留独立发布适配器，发布实现待后续接入
+- 使用 Patchright + 独立浏览器会话发布小红书视频/图文，以及
+  Bilibili、视频号、抖音视频
+- CSDN 已预留独立发布适配器，发布实现待后续接入
 
 ## 架构
 
 ```text
 Notion ──> 同步服务 ──> AI 编辑加工 ──> SQLite 内容库 ──> 发布调度
                                                      ├── 微信公众号（已实现）
-                                                     ├── 小红书（适配器占位）
+                                                     ├── 小红书（Patchright 浏览器发布）
+                                                     ├── 抖音（Patchright 视频发布）
+                                                     ├── 视频号（Patchright 视频发布）
+                                                     ├── Bilibili（Patchright 视频发布）
                                                      └── CSDN（适配器占位）
 
 React 管理界面 <── HTTP API ──> FastAPI 后端
@@ -30,7 +36,10 @@ React 管理界面 <── HTTP API ──> FastAPI 后端
 backend/
 ├── app.py                 # HTTP API 和前端静态文件服务
 ├── ai_service.py          # OpenAI-compatible 内容加工
+├── accounts.py            # 平台账号和浏览器会话目录
+├── browser.py             # Patchright 持久化浏览器
 ├── db.py                  # SQLite 数据模型
+├── media.py               # 本地图片/视频素材上传
 ├── notion_client.py       # Notion 2026-03-11 API
 ├── services.py            # 同步、文章、发布业务逻辑
 ├── scheduler.py           # 自动同步和自动发布
@@ -38,8 +47,12 @@ backend/
 └── platforms/
     ├── base.py            # 平台发布器统一接口
     ├── registry.py        # 平台注册表
+    ├── browser_video.py   # 浏览器视频平台共享校验
     ├── wechat.py          # 微信公众号
-    ├── xiaohongshu.py     # 小红书占位
+    ├── xiaohongshu.py     # 小红书视频/图文浏览器发布
+    ├── douyin.py          # 抖音视频浏览器发布
+    ├── channels.py        # 视频号视频浏览器发布
+    ├── bilibili.py        # Bilibili 视频浏览器发布
     └── csdn.py            # CSDN 占位
 ```
 
@@ -49,6 +62,7 @@ backend/
 
 - Python 3.10+
 - Node.js 20+
+- Google Chrome 或 Chromium 内核的 Microsoft Edge
 
 ```powershell
 cd D:\jixn\notion_publish_article
@@ -56,6 +70,8 @@ cd D:\jixn\notion_publish_article
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+# 可选：本机没有 Chrome/Edge 时安装 Chrome
+patchright install chrome
 
 cd frontend
 npm install
@@ -72,12 +88,32 @@ python main.py
 然后访问：
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8021
 ```
 
 第一次运行会创建 `data/publisher.db`。如果项目中存在旧版
 `config.py`，系统会将其中的 Notion 和公众号配置迁移到本地数据库；
 之后都可以在“连接与自动化”页面修改。
+
+### 浏览器平台发布流程
+
+1. 在“账号管理”选择小红书、抖音、视频号或 Bilibili，并添加账号。
+2. 点击“打开浏览器登录”，在弹出的可见浏览器中完成扫码或平台验证。
+   小红书登录或检查状态成功后，会同步昵称、账号 ID、头像、关注数、
+   粉丝数和获赞收藏数；也可以在账号卡片点击“刷新资料”。
+3. 在“连接与自动化”启用对应平台；如自动检测不到浏览器，填写
+   `chrome.exe` 或 `msedge.exe` 的完整路径。
+4. 新建稿件并上传素材：小红书支持图文和视频，其余三个平台首期只支持
+   单视频直发。
+5. Bilibili 发布前必须明确选择“自制/转载”并填写默认分区；转载稿件还要
+   在稿件中填写来源 URL。
+6. 先手动发布一条验证页面选择器和账号状态，再考虑开启自动发布。
+
+每个账号使用独立的 `data/browser_profiles/<platform>/<account_id>` 浏览器
+目录。系统不保存账号密码，也不会把 Cookie 返回给前端。浏览器自动化只
+使用 Patchright 持久化上下文，不包含 Playwright 运行路径。平台页面更新后，
+选择器仍可能需要调整；Patchright 也不能保证平台永远无法识别自动化，
+请遵守各平台规则，不要规避验证码、频率限制或内容审核。
 
 ## Docker Compose 部署
 
@@ -149,6 +185,9 @@ Compose 已配置 `host.docker.internal:host-gateway`，兼容 Docker Desktop
 登录，不要直接改成 `0.0.0.0` 暴露公网。正式绑定域名之前应增加认证、
 HTTPS 和反向代理。
 
+小红书首期依赖桌面环境中的可见浏览器，不建议在当前 Docker Compose
+容器中运行；容器部署目前主要用于 Notion、AI 和公众号 API 发布。
+
 ## Notion 数据源要求
 
 默认同步状态为“待发布”的页面。数据源需要包含以下字段：
@@ -200,7 +239,8 @@ Schema，并按照期望类型提供可选字段。例如文章标题只显示 `
 - AI 自动加工：同步后生成标签、摘要、人工确认事项和平台专用内容。
 - 自动发布：只处理发布方式为“自动”且状态为“待发布”的稿件。
 - 公众号默认保存到草稿箱；可以在单篇稿件中改为直接发布。
-- 已发布平台和每次发布结果保存在本系统，不回写到 Notion。
+- 已发布平台和每次发布结果保存在本系统；只有全部平台直发成功后才将
+  Notion 状态改为“已发布”。
 - 发布时优先使用经过人工确认的对应平台 AI 版本。
 - 新同步稿件的默认发布方式可以在前端配置。
 - 建议先完成连接测试，并手动成功发布一篇稿件后再打开自动发布。
@@ -237,11 +277,10 @@ Notion 和微信公众号分别配置代理：
 python -m unittest -v test_backend.py test_notion_utool.py
 ```
 
-端到端测试需要 Playwright：
+端到端测试使用 Patchright：
 
 ```powershell
 pip install -r requirements-dev.txt
-python -m playwright install chromium
 python main.py
 # 另一个终端运行
 python test_e2e.py
@@ -272,6 +311,7 @@ LOG_LEVEL=INFO
 
 ## 安全说明
 
-这是一个本地单用户工具，目前没有登录和权限系统。敏感配置保存在本机
+这是一个本地单用户工具，目前没有系统用户登录和权限控制。平台账号指
+浏览器发布账号，不是本系统的多用户权限账号。敏感配置保存在本机
 SQLite 中，API 返回时会遮罩 Token 和 Secret。请勿将服务直接暴露到公网；
 若以后部署到服务器，需要先增加身份认证、HTTPS 和密钥加密。
