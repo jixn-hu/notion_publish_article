@@ -7,26 +7,27 @@ import time
 import os
 import mimetypes
 import logging
-import config
 from urllib.parse import urljoin
 from typing import List, Dict, Union, Tuple
 from md_to_html import md_to_wechat_html
 from bs4 import BeautifulSoup
+from backend.logging_config import redact_text, redact_url
 """
 微信公众号发布器
 支持 发布文章和（图文）类型
 """
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('WechatPublisher')
+logger = logging.getLogger('mozhou.wechat.client')
 
 
 class WechatOfficialAccountPublisher:
-    def __init__(self, app_id: str, app_secret: str, max_retries: int = 3):
+    def __init__(
+            self,
+            app_id: str,
+            app_secret: str,
+            max_retries: int = 3,
+            proxy_url: str = "",
+    ):
         self.app_id = app_id
         self.app_secret = app_secret
         self.access_token = None
@@ -34,6 +35,9 @@ class WechatOfficialAccountPublisher:
         self.base_api = "https://api.weixin.qq.com/cgi-bin/"
         self.max_retries = max_retries
         self.session = requests.Session()
+        self.session.trust_env = False  # 微信 API 不读取系统/环境代理
+        if proxy_url:
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
         # 预定义图片类型限制
         self.image_types = {
@@ -49,11 +53,16 @@ class WechatOfficialAccountPublisher:
     def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> dict:
         """带重试机制的请求方法"""
         url = self._build_url(endpoint)
+        kwargs.setdefault("timeout", 30)
         for attempt in range(self.max_retries):
             try:
-                logger.debug(f"请求: {method} {url}")
+                logger.debug("微信 API 请求 method=%s url=%s", method, redact_url(url))
                 response = self.session.request(method, url, **kwargs)
-                logger.debug(f"响应状态码: {response.status_code}")
+                logger.debug(
+                    "微信 API 响应 method=%s status=%s",
+                    method,
+                    response.status_code,
+                )
 
                 # 处理非200响应
                 if response.status_code != 200:
@@ -78,7 +87,7 @@ class WechatOfficialAccountPublisher:
 
                 return data
             except requests.exceptions.RequestException as e:
-                logger.error(f"请求失败: {str(e)}")
+                logger.error("微信网络请求失败: %s", redact_text(str(e)))
                 if attempt == self.max_retries - 1:
                     raise
                 wait_time = 2 ** attempt
@@ -123,11 +132,12 @@ class WechatOfficialAccountPublisher:
         temp_file_path = None
         if image_path.startswith(('http://', 'https://')):
             import tempfile
-            import requests
-            logger.info(f"下载远程图片: {image_path}")
-            resp = requests.get(image_path, stream=True)
+            logger.info("下载远程图片: %s", redact_url(image_path))
+            resp = self.session.get(image_path, stream=True, timeout=60)
             if resp.status_code != 200:
-                raise Exception(f"下载远程图片失败: {image_path}")
+                raise Exception(
+                    f"下载远程图片失败: {redact_url(image_path)}"
+                )
             suffix = os.path.splitext(image_path)[-1]
             if suffix == '':
                 suffix = '.jpg'
@@ -264,7 +274,11 @@ class WechatArticlePublisher:
                 result = self.client.upload_permanent_image(img_path, image_type='content')
                 image_info[img_path] = result
             except Exception as e:
-                logger.error(f"图片上传失败: {img_path}, 错误: {str(e)}")
+                logger.error(
+                    "图片上传失败 source=%s error=%s",
+                    redact_url(img_path),
+                    redact_text(str(e)),
+                )
                 # 上传失败时保留原路径
                 image_info[img_path] = {'url': img_path, 'is_remote': img_path.startswith(('http://', 'https://'))}
 
@@ -338,6 +352,7 @@ class WechatArticlePublisher:
             author: str,
             content_source_url: str,
             cover_image_path: str,
+            submit: bool = True,
     ) -> str:
         """
         发布Markdown格式的文章
@@ -385,16 +400,17 @@ class WechatArticlePublisher:
             # }
             # 5. 发布文章
             logger.info("发布文章...")
-            return self.publish_article(article_data)
+            return self.publish_article(article_data, submit=submit)
 
         except Exception as e:
-            logger.error(f"文章发布失败: {str(e)}")
+            logger.error("文章发布失败: %s", redact_text(str(e)))
             raise
 
     def publish_image_message(
             self,
             title: str = "",
-            md_content: str = ""
+            md_content: str = "",
+            submit: bool = True,
     ) -> str:
         """
         发布图片消息 (newspic)
@@ -432,13 +448,13 @@ class WechatArticlePublisher:
 
             # 3. 发布图片消息
             logger.info("发布图片消息...")
-            return self.publish_article(article_data)
+            return self.publish_article(article_data, submit=submit)
 
         except Exception as e:
-            logger.error(f"图片消息发布失败: {str(e)}")
+            logger.error("图片消息发布失败: %s", redact_text(str(e)))
             raise
 
-    def publish_article(self, article_data: dict) -> str:
+    def publish_article(self, article_data: dict, submit: bool = True) -> str:
         """
         发布单篇文章
         :param article_data: 文章数据
@@ -463,7 +479,8 @@ class WechatArticlePublisher:
         draft_id = data['media_id']
         logger.info(f"草稿创建成功, media_id: {draft_id}")
 
-        # 发布草稿
+        if not submit:
+            return draft_id
         return self.publish_draft(draft_id)
 
     def publish_draft(self, media_id: str) -> str:
@@ -491,6 +508,8 @@ class WechatArticlePublisher:
 
 # 使用示例1
 if __name__ == "__main__":
+    import config
+
     # 1. 初始化API客户端
     api_client = WechatOfficialAccountPublisher(
         app_id=config.gzh_app_id,

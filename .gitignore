@@ -1,5 +1,9 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+config.py
+data/
+frontend/dist/
+frontend/node_modules/
 *.py[codz]
 *$py.class
 
