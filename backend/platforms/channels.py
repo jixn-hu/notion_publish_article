@@ -79,11 +79,11 @@ def _channels_text_profile(text):
         "platform_user_id": user_id.group(1).strip() if user_id else "",
         "followers_count": metric_from_text(
             text,
-            ("有效关注人数", "粉丝总数", "粉丝数", "粉丝"),
+            ("有效关注人数", "关注者", "粉丝总数", "粉丝数", "粉丝"),
         ),
         "works_count": metric_from_text(
             text,
-            ("发表视频数", "作品总数", "作品数", "内容数"),
+            ("发表视频数", "视频", "作品总数", "作品数", "内容数"),
         ),
         "likes_count": metric_from_text(
             text,
@@ -93,7 +93,7 @@ def _channels_text_profile(text):
 
 
 def extract_channels_profile(page):
-    body_text = page.locator("body").inner_text()
+    body_text = page.locator("html > body").first.inner_text()
     profile = _channels_text_profile(body_text)
     profile.update(
         {

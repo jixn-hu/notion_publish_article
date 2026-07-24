@@ -169,15 +169,15 @@ class BackendApiTests(unittest.TestCase):
 
     def test_channels_profile_text_metrics(self):
         profile = _channels_text_profile(
-            "视频号 ID：wx-channel-1\n有效关注人数 3.4万\n"
-            "发表视频数 18\n获赞数 2,406"
+            "视频号ID:\nwx-channel-1\n视频58\n关注者4654\n"
+            "获赞数 2,406"
         )
         self.assertEqual(
             profile["platform_user_id"],
             "wx-channel-1",
         )
-        self.assertEqual(profile["followers_count"], 34000)
-        self.assertEqual(profile["works_count"], 18)
+        self.assertEqual(profile["followers_count"], 4654)
+        self.assertEqual(profile["works_count"], 58)
         self.assertEqual(profile["likes_count"], 2406)
 
     def test_douyin_and_channels_profile_handlers_are_registered(self):
