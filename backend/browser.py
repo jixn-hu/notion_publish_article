@@ -54,6 +54,7 @@ def _native_browser_command(executable, profile_dir, port, proxy_url=""):
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-extensions",
         "about:blank",
     ]
     if proxy_url:
@@ -161,9 +162,21 @@ def open_account_browser(account):
 
 
 def get_or_create_page(context):
-    if context.pages:
-        return context.pages[0]
-    return context.new_page()
+    pages = [page for page in context.pages if not page.is_closed()]
+    if not pages:
+        return context.new_page()
+    page = next(
+        (candidate for candidate in pages if candidate.url == "about:blank"),
+        pages[-1],
+    )
+    for candidate in pages:
+        if candidate is page:
+            continue
+        try:
+            candidate.close()
+        except Exception:
+            pass
+    return page
 
 
 def interaction_pause(page, minimum_ms=220, maximum_ms=650):

@@ -212,8 +212,30 @@ class BackendApiTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("--remote-debugging-port=9333", joined)
         self.assertIn("--remote-debugging-address=127.0.0.1", joined)
+        self.assertIn("--disable-extensions", joined)
         for forbidden in backend.browser.FORBIDDEN_BROWSER_ARGS:
             self.assertNotIn(forbidden, joined)
+
+    def test_browser_reuses_one_tab_and_closes_stale_tabs(self):
+        stale = Mock()
+        stale.is_closed.return_value = False
+        stale.url = "https://example.com/old"
+        blank = Mock()
+        blank.is_closed.return_value = False
+        blank.url = "about:blank"
+        another = Mock()
+        another.is_closed.return_value = False
+        another.url = "https://example.com/another"
+        context = Mock()
+        context.pages = [stale, blank, another]
+
+        selected = backend.browser.get_or_create_page(context)
+
+        self.assertIs(selected, blank)
+        stale.close.assert_called_once_with()
+        another.close.assert_called_once_with()
+        blank.close.assert_not_called()
+        context.new_page.assert_not_called()
 
     def test_saved_proxy_can_be_tested_and_selected_by_account(self):
         account = self.client.post(
