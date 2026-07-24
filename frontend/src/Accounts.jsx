@@ -246,7 +246,8 @@ function Accounts ({ notify, onChanged }) {
             {busy === 'create-proxy' ? '保存中…' : '＋ 保存代理'}
           </button>
           <small className='proxy-create-hint'>
-            复合格式“https:http://…”表示仅让 HTTPS 请求使用该 HTTP 代理。
+            代理按账号全局生效，HTTP 和 HTTPS 请求都会通过它；
+            兼容“https:http://…”格式并自动规范为“http://…”。
           </small>
         </form>
         {proxies.length > 0 && (

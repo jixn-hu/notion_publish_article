@@ -302,15 +302,28 @@ class BackendApiTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 400)
 
-    def test_scheme_scoped_proxy_format_is_normalized_for_chromium(self):
+    def test_http_proxy_is_used_for_both_http_and_https(self):
+        value = "http://192.0.2.10:808"
+        self.assertEqual(
+            backend.proxies.requests_proxy_map(value),
+            {
+                "http": "http://192.0.2.10:808",
+                "https": "http://192.0.2.10:808",
+            },
+        )
+
+    def test_compatible_proxy_prefix_still_applies_globally(self):
         value = "HTTPS:HTTP://192.0.2.10:808/"
         self.assertEqual(
             backend.proxies.normalize_proxy_url(value),
-            "https:http://192.0.2.10:808",
+            "http://192.0.2.10:808",
         )
         self.assertEqual(
             backend.proxies.requests_proxy_map(value),
-            {"https": "http://192.0.2.10:808"},
+            {
+                "http": "http://192.0.2.10:808",
+                "https": "http://192.0.2.10:808",
+            },
         )
         command = backend.browser._native_browser_command(
             Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
@@ -319,7 +332,7 @@ class BackendApiTests(unittest.TestCase):
             value,
         )
         self.assertIn(
-            "--proxy-server=https=http://192.0.2.10:808",
+            "--proxy-server=http://192.0.2.10:808",
             command,
         )
 

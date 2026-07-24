@@ -8,7 +8,6 @@ from backend.db import connection, utc_now
 
 
 IP_CHECK_URL = "https://api.ipify.org?format=json"
-IP_CHECK_HTTP_URL = "http://api.ipify.org?format=json"
 
 
 def parse_proxy_spec(value):
@@ -17,7 +16,6 @@ def parse_proxy_spec(value):
         raise ValueError("代理地址不能为空")
     if len(value) > 300:
         raise ValueError("代理地址不能超过 300 个字符")
-    target_scheme = ""
     prefix, separator, remainder = value.partition(":")
     if (
         separator
@@ -26,7 +24,6 @@ def parse_proxy_spec(value):
             ("http://", "https://", "socks5://")
         )
     ):
-        target_scheme = prefix.lower()
         value = remainder
     try:
         parsed = urlsplit(value)
@@ -45,28 +42,20 @@ def parse_proxy_spec(value):
     if ":" in host:
         host = f"[{host}]"
     proxy_url = f"{parsed.scheme.lower()}://{host}:{port}"
-    return target_scheme, proxy_url
-
-
-def normalize_proxy_url(value):
-    target_scheme, proxy_url = parse_proxy_spec(value)
-    if target_scheme:
-        return f"{target_scheme}:{proxy_url}"
     return proxy_url
 
 
+def normalize_proxy_url(value):
+    return parse_proxy_spec(value)
+
+
 def requests_proxy_map(proxy_spec):
-    target_scheme, proxy_url = parse_proxy_spec(proxy_spec)
-    if target_scheme:
-        return {target_scheme: proxy_url}
+    proxy_url = parse_proxy_spec(proxy_spec)
     return {"http": proxy_url, "https": proxy_url}
 
 
 def browser_proxy_rule(proxy_spec):
-    target_scheme, proxy_url = parse_proxy_spec(proxy_spec)
-    if target_scheme:
-        return f"{target_scheme}={proxy_url}"
-    return proxy_url
+    return parse_proxy_spec(proxy_spec)
 
 
 def _row_to_proxy(row):
@@ -120,14 +109,8 @@ def test_proxy(proxy_id):
     proxy = get_proxy(proxy_id)
     started = time.perf_counter()
     try:
-        target_scheme, _ = parse_proxy_spec(proxy["proxy_url"])
-        check_url = (
-            IP_CHECK_HTTP_URL
-            if target_scheme == "http"
-            else IP_CHECK_URL
-        )
         response = requests.get(
-            check_url,
+            IP_CHECK_URL,
             proxies=requests_proxy_map(proxy["proxy_url"]),
             timeout=12,
         )
