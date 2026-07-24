@@ -312,6 +312,35 @@ class BackendApiTests(unittest.TestCase):
             },
         )
 
+    def test_proxy_test_falls_back_when_ipify_tls_fails(self):
+        created = self.client.post(
+            "/api/proxies",
+            json={
+                "name": "TLS 回退测试",
+                "proxy_url": "http://192.0.2.10:808",
+            },
+        ).json()
+        ip_response = Mock(status_code=200, text="203.0.113.9\n")
+        ip_response.raise_for_status.return_value = None
+        https_response = Mock(status_code=200)
+        with patch(
+            "backend.proxies.requests.get",
+            side_effect=[
+                backend.proxies.requests.exceptions.SSLError(
+                    "unexpected EOF"
+                ),
+                ip_response,
+                https_response,
+            ],
+        ):
+            tested = self.client.post(
+                f"/api/proxies/{created['id']}/test"
+            )
+
+        self.assertEqual(tested.status_code, 200)
+        self.assertEqual(tested.json()["status"], "valid")
+        self.assertEqual(tested.json()["exit_ip"], "203.0.113.9")
+
     def test_compatible_proxy_prefix_still_applies_globally(self):
         value = "HTTPS:HTTP://192.0.2.10:808/"
         self.assertEqual(
