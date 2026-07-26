@@ -71,7 +71,7 @@ def login_douyin_account(account, timeout_seconds=300):
         while time.monotonic() < deadline:
             page = _current_page(context, page)
             if _is_logged_in(page):
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
                 return
             try:
                 page.wait_for_timeout(1500)

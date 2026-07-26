@@ -107,6 +107,50 @@ def init_db():
                 UNIQUE(platform, name)
             );
 
+            CREATE TABLE IF NOT EXISTS materials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
+                content_md TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                mime_type TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS article_materials (
+                article_id INTEGER NOT NULL,
+                material_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(article_id, material_id),
+                FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+                FOREIGN KEY(material_id) REFERENCES materials(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS news_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                source_name TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL UNIQUE,
+                author TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                content_md TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                published_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS article_news (
+                article_id INTEGER NOT NULL,
+                news_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(article_id, news_id),
+                FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+                FOREIGN KEY(news_id) REFERENCES news_items(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS article_assets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 article_id INTEGER NOT NULL,
@@ -129,6 +173,14 @@ def init_db():
                 UNIQUE(source_key, platform)
             );
 
+            CREATE INDEX IF NOT EXISTS idx_materials_kind
+                ON materials(kind, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_article_materials_material
+                ON article_materials(material_id);
+            CREATE INDEX IF NOT EXISTS idx_news_items_updated
+                ON news_items(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_article_news_news
+                ON article_news(news_id);
             CREATE INDEX IF NOT EXISTS idx_articles_status
                 ON articles(status);
             CREATE INDEX IF NOT EXISTS idx_publish_records_article

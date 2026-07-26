@@ -56,7 +56,7 @@ def login_channels_account(account, timeout_seconds=300):
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if _is_logged_in(page):
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
                 return
             page.wait_for_timeout(1500)
     raise RuntimeError("等待视频号登录超时，请重新发起登录")

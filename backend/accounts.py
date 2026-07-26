@@ -3,22 +3,32 @@ import json
 import sqlite3
 from pathlib import Path
 
+from backend.browser import open_account_dashboard
 from backend.db import DATA_DIR, connection, utc_now
 
 
 SUPPORTED_ACCOUNT_PLATFORMS = {
+    "wechat",
     "xiaohongshu",
     "douyin",
     "channels",
     "bilibili",
+    "csdn",
 }
 ACCOUNT_PLATFORM_NAMES = {
+    "wechat": "微信公众号",
     "xiaohongshu": "小红书",
     "douyin": "抖音",
     "channels": "视频号",
     "bilibili": "Bilibili",
+    "csdn": "CSDN",
 }
 ACCOUNT_HANDLERS = {
+    "wechat": (
+        "backend.platforms.wechat_browser",
+        "login_wechat_account",
+        "check_wechat_account",
+    ),
     "xiaohongshu": (
         "backend.platforms.xiaohongshu",
         "login_xiaohongshu_account",
@@ -39,8 +49,17 @@ ACCOUNT_HANDLERS = {
         "login_bilibili_account",
         "check_bilibili_account",
     ),
+    "csdn": (
+        "backend.platforms.csdn",
+        "login_csdn_account",
+        "check_csdn_account",
+    ),
 }
 ACCOUNT_PROFILE_HANDLERS = {
+    "wechat": (
+        "backend.platforms.wechat_browser",
+        "fetch_wechat_profile",
+    ),
     "xiaohongshu": (
         "backend.platforms.xiaohongshu",
         "fetch_xiaohongshu_profile",
@@ -52,6 +71,10 @@ ACCOUNT_PROFILE_HANDLERS = {
     "channels": (
         "backend.platforms.channels",
         "fetch_channels_profile",
+    ),
+    "csdn": (
+        "backend.platforms.csdn",
+        "fetch_csdn_profile",
     ),
 }
 PROFILE_ROOT = DATA_DIR / "browser_profiles"
@@ -276,6 +299,16 @@ def login_account(account_id):
         update_account_status(account_id, "invalid", str(exc))
         raise
 
+
+def open_account_view(account_id):
+    account = get_account(account_id)
+    if account["platform"] == "wechat":
+        module = importlib.import_module("backend.platforms.wechat_browser")
+        return open_account_dashboard(
+            account,
+            module.wechat_dashboard_url(account),
+        )
+    return open_account_dashboard(account)
 
 def check_account(account_id):
     account = get_account(account_id)

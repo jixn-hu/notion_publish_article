@@ -1,130 +1,164 @@
-# 墨舟 · 内容发布台
+# 墨舟内容发布台
 
-一个本地运行的内容同步与多平台发布系统。
+墨舟是一个本地优先的内容生产、管理与多平台发布工作台。它将 Notion 同步、AI 辅助写作、Markdown 编辑、素材与资讯管理、浏览器账号会话和发布记录集中到一个 Web 界面中，适合个人创作者在自己的电脑上管理内容工作流。
 
-当前支持：
+> [!IMPORTANT]
+> 项目当前是单用户本地工具，没有系统登录和权限隔离。请只绑定到本机地址，不要直接暴露到公网。浏览器自动化依赖平台页面结构，平台改版后可能需要更新。
 
-- 从 Notion 手动或自动同步待发布内容
-- 使用可配置 AI 自动提取标签、生成摘要和平台专用版本
-- 在内容库中创建、编辑和管理文章、视频、图文稿件
-- 上传本地图片或视频素材，并为平台选择发布账号
-- 每个平台可单独选择“保存草稿”或“直接发布”
-- 手动或自动提交到微信公众号（默认保存草稿）
-- 分平台记录发布结果和错误
-- 在管理界面配置 Notion、公众号、代理和自动化间隔
-- 使用 Patchright + 独立浏览器会话发布小红书视频/图文，以及
-  Bilibili、视频号、抖音视频
-- CSDN 已预留独立发布适配器，发布实现待后续接入
+## 主要功能
 
-## 架构
+- **内容库**：统一管理文章、图文和视频稿件，保存标签、摘要、媒体、发布目标与结果。
+- **Markdown 编辑器**：CodeMirror 编辑、实时预览、图片插入和平台内容版本管理。
+- **AI 创作**：使用 OpenAI-compatible 接口生成文章、摘要、标签、平台版本和图文分镜；支持独立图片生成接口，生成图片保存到本地。
+- **素材库**：管理图片、视频和卡片笔记，支持搜索、标签、稿件引用和批量 ZIP 下载。
+- **资讯库**：从公开网页采集或手动录入资讯，保留来源信息，并作为 AI 生成的参考资料。
+- **Notion 同步**：手动或定时同步待发布内容，可配置字段映射、状态和去重键。
+- **账号管理**：每个平台账号使用独立浏览器目录，可检查登录状态、查看账号和同步资料。
+- **代理管理**：集中维护代理并分配给账号，也可为 Notion、AI 等连接单独配置代理。
+- **自动化**：设置同步、AI 加工和发布周期，记录每个平台的成功结果与失败原因。
+
+## 平台能力
+
+| 平台 | 内容类型 | 保存草稿 | 直接发布 | 实现方式 |
+| --- | --- | ---: | ---: | --- |
+| 微信公众号 | 图文文章 | 是 | 否 | Patchright 可见浏览器 |
+| 小红书 | 图文、视频 | 否 | 是 | Patchright 可见浏览器 |
+| CSDN | 图文文章 | 是 | 是 | Patchright 可见浏览器 |
+| 抖音 | 单视频 | 否 | 是 | Patchright 可见浏览器 |
+| 视频号 | 单视频 | 否 | 是 | Patchright 可见浏览器 |
+| Bilibili | 单视频 | 否 | 是 | Patchright 可见浏览器 |
+
+微信公众号目前只自动保存到草稿箱。正式发表需要管理员在微信侧扫码验证，项目不会尝试绕过该验证。CSDN 直发需要文章标签；Bilibili 需要配置分区和自制/转载类型，转载内容还需要来源 URL。
+
+## 技术架构
 
 ```text
-Notion ──> 同步服务 ──> AI 编辑加工 ──> SQLite 内容库 ──> 发布调度
-                                                     ├── 微信公众号（已实现）
-                                                     ├── 小红书（Patchright 浏览器发布）
-                                                     ├── 抖音（Patchright 视频发布）
-                                                     ├── 视频号（Patchright 视频发布）
-                                                     ├── Bilibili（Patchright 视频发布）
-                                                     └── CSDN（适配器占位）
+Notion ──> 同步与去重 ──┐
+资讯库 ──> AI 参考 ─────┼──> SQLite 内容库 ──> 发布调度 ──> 平台浏览器
+素材库 ──> 媒体与笔记 ──┘
 
-React 管理界面 <── HTTP API ──> FastAPI 后端
+React + Vite 管理界面 <── HTTP API ──> FastAPI 后端
+                                          ├── Patchright 持久会话
+                                          ├── OpenAI-compatible AI
+                                          └── 本地文件与 SQLite
 ```
 
-后端采用模块化结构：
+核心目录：
 
 ```text
 backend/
-├── app.py                 # HTTP API 和前端静态文件服务
-├── ai_service.py          # OpenAI-compatible 内容加工
-├── accounts.py            # 平台账号和浏览器会话目录
-├── browser.py             # Patchright 持久化浏览器
-├── db.py                  # SQLite 数据模型
-├── media.py               # 本地图片/视频素材上传
-├── notion_client.py       # Notion 2026-03-11 API
-├── services.py            # 同步、文章、发布业务逻辑
-├── scheduler.py           # 自动同步和自动发布
-├── settings.py            # 配置与敏感字段遮罩
-└── platforms/
-    ├── base.py            # 平台发布器统一接口
-    ├── registry.py        # 平台注册表
-    ├── browser_video.py   # 浏览器视频平台共享校验
-    ├── wechat.py          # 微信公众号
-    ├── xiaohongshu.py     # 小红书视频/图文浏览器发布
-    ├── douyin.py          # 抖音视频浏览器发布
-    ├── channels.py        # 视频号视频浏览器发布
-    ├── bilibili.py        # Bilibili 视频浏览器发布
-    └── csdn.py            # CSDN 占位
+├── app.py                 # FastAPI 路由与前端静态文件
+├── services.py            # 内容、同步和发布业务
+├── ai_service.py          # AI 文本加工
+├── ai_generation.py       # AI 图片生成与本地保存
+├── materials.py           # 素材库
+├── news.py                # 资讯采集与资讯库
+├── accounts.py            # 平台账号与资料
+├── browser.py             # Patchright 持久浏览器
+├── db.py                  # SQLite 数据结构
+└── platforms/             # 各平台登录、检测与发布流程
+
+frontend/src/
+├── App.jsx                # 工作台、内容库与设置
+├── MarkdownComposer.jsx   # Markdown 编辑与预览
+├── Materials.jsx          # 素材库
+├── News.jsx               # 资讯库
+├── Accounts.jsx           # 账号管理
+├── Proxies.jsx            # 代理管理
+└── Automation.jsx         # 自动化设置
 ```
 
-## 安装
+## 快速开始
 
-要求：
+### 环境要求
 
+- Windows 10/11（桌面浏览器发布推荐）
 - Python 3.10+
 - Node.js 20+
-- Google Chrome 或 Chromium 内核的 Microsoft Edge
+- Google Chrome 或 Microsoft Edge
+
+克隆项目后，在资源管理器中双击 `启动.cmd`，或在终端运行：
 
 ```powershell
-cd D:\jixn\notion_publish_article
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-# 可选：本机没有 Chrome/Edge 时安装 Chrome
-patchright install chrome
-
-cd frontend
-npm install
-npm run build
-cd ..
+git clone git@github.com:jixn-hu/notion_publish_article.git
+cd notion_publish_article
+.\启动.cmd
 ```
 
-## 运行
+启动脚本会：
+
+1. 在 `.venv` 不存在时创建 Python 虚拟环境并安装依赖；已存在则直接复用。
+2. 在 `frontend/node_modules` 不存在时执行 `npm ci`。
+3. 在前端未构建或源码比构建结果更新时自动执行 `npm run build`。
+4. 启动 FastAPI，并由后端同时提供 API 和前端页面。
+
+打开 <http://127.0.0.1:8021>。首次运行会创建 `data/publisher.db`；配置、浏览器会话、上传素材和日志都保存在 `data/`，该目录不会提交到 Git。
+
+### 手动安装
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+
+cd frontend
+npm ci
+npm run build
+cd ..
+
 python main.py
 ```
 
-然后访问：
+如果系统没有可用的 Chrome/Edge，可运行 `patchright install chrome`。开发前端时使用 `npm run dev` 可获得热更新；正式页面仍由 `npm run build` 的结果提供。
 
-```text
-http://127.0.0.1:8021
-```
+## 初次配置
 
-第一次运行会创建 `data/publisher.db`。如果项目中存在旧版
-`config.py`，系统会将其中的 Notion 和公众号配置迁移到本地数据库；
-之后都可以在“连接与自动化”页面修改。
+界面中的“设置”只管理连接和平台配置，“自动化”单独管理定时任务。
 
-### 浏览器平台发布流程
+1. **AI**：填写兼容 Chat Completions 协议的 Base URL、API Key 和模型。图片模型可复用该密钥，也可配置独立的图片接口、模型与尺寸。
+2. **Notion**：填写 Integration Token、Database ID，读取 Schema 后检查字段映射。
+3. **浏览器平台**：启用需要的平台；自动识别失败时填写 Chrome/Edge 可执行文件路径。
+4. **代理**：先在代理管理中新增并测试，再分配给对应账号；留空表示直连。
+5. **账号**：新增平台账号，点击“打开浏览器登录”，等待系统确认后台账号信息。
 
-1. 在“账号管理”选择小红书、抖音、视频号或 Bilibili，并添加账号。
-2. 点击“打开浏览器登录”，在弹出的可见浏览器中完成扫码或平台验证。
-   小红书登录或检查状态成功后，会同步昵称、账号 ID、头像、关注数、
-   粉丝数和获赞收藏数；也可以在账号卡片点击“刷新资料”。
-3. 在“连接与自动化”启用对应平台；如自动检测不到浏览器，填写
-   `chrome.exe` 或 `msedge.exe` 的完整路径。
-4. 新建稿件并上传素材：小红书支持图文和视频，其余三个平台首期只支持
-   单视频直发。
-5. Bilibili 发布前必须明确选择“自制/转载”并填写默认分区；转载稿件还要
-   在稿件中填写来源 URL。
-6. 先手动发布一条验证页面选择器和账号状态，再考虑开启自动发布。
+每个账号的浏览器数据位于 `data/browser_profiles/<platform>/<account_id>`。系统不保存账号密码，也不会把 Cookie 返回给前端。删除该目录会同时丢失对应登录会话。
 
-每个账号使用独立的 `data/browser_profiles/<platform>/<account_id>` 浏览器
-目录。系统不保存账号密码，也不会把 Cookie 返回给前端。浏览器自动化只
-使用 Patchright 持久化上下文，不包含 Playwright 运行路径。平台页面更新后，
-选择器仍可能需要调整；Patchright 也不能保证平台永远无法识别自动化，
-请遵守各平台规则，不要规避验证码、频率限制或内容审核。
+## 推荐工作流
 
-## Docker Compose 部署
+1. 从 Notion 同步稿件，或直接在内容库创建文章、图文或视频。
+2. 在资讯库采集公开资料，在素材库整理自己的图片、视频和卡片笔记。
+3. 创建或 AI 生成稿件时选择参考资讯和素材，在 Markdown 编辑器中校对结果。
+4. 选择目标平台、账号以及草稿/直发动作，先用一篇测试稿验证流程。
+5. 确认账号、页面选择器和内容格式稳定后，再开启自动同步或自动发布。
 
-项目已包含：
+AI 生成内容仅作为草稿。请核实事实、版权、引用和平台规则，不要将未经审核的内容直接自动发布。
 
-- `Dockerfile`：Node 构建前端 + Python 运行时的多阶段镜像
-- `compose.yaml`：持久卷、健康检查和安全限制
-- `.dockerignore`：排除密钥、开发依赖和本地数据
-- `.env.docker.example`：端口配置示例
+## Notion 数据源
 
-启动：
+默认字段如下，名称和值都可在设置页修改：
+
+| 字段 | Notion 类型 | 必填 |
+| --- | --- | --- |
+| 标题 | Title | 是 |
+| 文章类型 | Select（默认值：图文/图片） | 是 |
+| 作者 | Select | 否 |
+| 封面图片 | URL | 视内容而定 |
+| 阅读原文 | URL | 否 |
+| 标签 | Multi-select | 否 |
+| 状态 | Status | 是 |
+| 唯一ID | Unique ID | 推荐 |
+
+Notion Integration 必须有读取、更新权限，目标数据库也必须共享给该 Integration。系统优先使用配置的唯一字段去重，否则使用稳定的 `page_id`。旧版 `config.py` 存在时，首次启动会迁移其中的 Notion 和公众号配置；新安装无需创建该文件。
+
+## 浏览器发布说明
+
+- 登录、状态检查和发布都会打开真实浏览器，账号会话相互隔离。
+- 系统只在检测到明确的账号后台元素和有效会话后标记账号可用。
+- 图片上传、编辑器保存和发布结果都有等待与校验；成功后浏览器会短暂停留再关闭。
+- 平台页面、风控策略和验证码可能随时变化。请遵守服务条款，不要规避验证、限流或审核。
+- 自动发布前应先手动完成一次登录和测试发布。重要内容建议保存草稿后人工复核。
+
+## Docker Compose
 
 ```powershell
 docker compose up -d --build
@@ -132,186 +166,46 @@ docker compose ps
 docker compose logs -f app
 ```
 
-默认访问地址：
+默认访问 <http://127.0.0.1:8000>，数据保存在 Docker 卷 `mozhou-publisher-data`。可复制 `.env.docker.example` 为 `.env` 并修改 `APP_PORT`。
 
-```text
-http://127.0.0.1:8000
-```
+Docker 适合运行 API、内容管理、Notion 同步和 AI 功能。当前浏览器发布依赖可见桌面浏览器和本机持久会话，不建议在容器内使用。容器中的 `127.0.0.1` 指向容器自身；访问宿主机代理应使用 `http://host.docker.internal:7890`。
 
-修改宿主机端口：
+## 开发与测试
 
 ```powershell
-Copy-Item .env.docker.example .env
-# 修改 .env 中的 APP_PORT
-docker compose up -d
+.\.venv\Scripts\python.exe -m unittest -v test_backend.py test_notion_utool.py
+cd frontend
+npm run build
 ```
 
-数据保存在 Docker 卷 `mozhou-publisher-data`。如果项目的 `data` 目录
-已经存在 `publisher.db`，首次启动且 Docker 卷为空时会自动导入；卷内
-已经有数据库时不会覆盖。
-
-升级：
+端到端测试需要先启动应用，并确保本机存在测试脚本指定的浏览器：
 
 ```powershell
-git pull
-docker compose up -d --build
+.\.venv\Scripts\python.exe test_e2e.py
 ```
 
-停止和删除容器：
+后端日志默认写入 `data/backend.log`。可通过 `LOG_LEVEL` 和 `LOG_FILE` 调整：
 
 ```powershell
-docker compose down
-```
-
-上面的命令不会删除数据卷。只有明确不再需要数据时才能执行：
-
-```powershell
-docker compose down -v
-```
-
-### Docker 中的代理地址
-
-容器里的 `127.0.0.1` 指向容器本身，不是宿主机。如果代理运行在宿主机
-的 `7890` 端口，应在前端配置：
-
-```text
-http://host.docker.internal:7890
-```
-
-Compose 已配置 `host.docker.internal:host-gateway`，兼容 Docker Desktop
-和现代 Linux Docker。
-
-当前 Compose 默认将端口绑定到宿主机 `127.0.0.1`。系统尚未实现用户
-登录，不要直接改成 `0.0.0.0` 暴露公网。正式绑定域名之前应增加认证、
-HTTPS 和反向代理。
-
-小红书首期依赖桌面环境中的可见浏览器，不建议在当前 Docker Compose
-容器中运行；容器部署目前主要用于 Notion、AI 和公众号 API 发布。
-
-## Notion 数据源要求
-
-默认同步状态为“待发布”的页面。数据源需要包含以下字段：
-
-| 字段 | Notion 类型 | 必填 |
-| --- | --- | --- |
-| 标题 | Title | 是 |
-| 文章类型 | Select，值为“图文”或“图片” | 是 |
-| 作者 | Select | 否 |
-| 封面图片 | URL | 图文发布时是 |
-| 阅读原文 | URL | 否 |
-| 标签 | Multi-select | 否 |
-| 状态 | Status | 是 |
-| 唯一ID | Unique ID | 推荐；字段名可在前端修改 |
-
-Notion Integration 需要具有读取内容和更新内容权限，并且目标数据库
-必须共享给该 Integration。
-
-### 前端字段映射
-
-在“连接与自动化 → Notion 内容源 → 字段对应关系”中可以修改系统字段与
-Notion 字段的对应关系，包括：
-
-- 文章标题、文章类型和作者
-- 封面图片、阅读原文和标签
-- 同步状态和唯一标识
-- Notion 中代表“图文”和“图片”的 Select 值
-- 待同步状态和发布完成状态
-
-填写 Token、Database ID 后点击“读取字段”，系统会读取实际 Data Source
-Schema，并按照期望类型提供可选字段。例如文章标题只显示 `title` 类型，
-封面图片只显示 `url` 类型。也可以不读取 Schema，直接手动填写字段名。
-
-## 同步与图片去重
-
-- 如果配置的 Notion 唯一字段存在，系统优先用它识别文章。
-- 没有唯一字段时，使用 Notion 自带且稳定的 `page_id`。
-- 同一来源再次同步只覆盖原记录，不会创建重复文章。
-- 如果唯一字段和 `page_id` 命中不同文章，系统停止本次同步并保留旧数据，
-  不会尝试新增。
-- Markdown 正文图片和封面图会生成稳定素材键。URL 中过期时间、签名、
-  Token 等临时参数不参与判断，图片处理参数会保留。
-- 微信永久素材上传成功后保存 `media_id`。再次遇到相同图片时直接复用，
-  不会重复上传到公众号素材库。
-
-## 自动化规则
-
-- 自动同步：按配置间隔，从 Notion 拉取“待发布”页面。
-- AI 自动加工：同步后生成标签、摘要、人工确认事项和平台专用内容。
-- 自动发布：只处理发布方式为“自动”且状态为“待发布”的稿件。
-- 公众号默认保存到草稿箱；可以在单篇稿件中改为直接发布。
-- 已发布平台和每次发布结果保存在本系统；只有全部平台直发成功后才将
-  Notion 状态改为“已发布”。
-- 发布时优先使用经过人工确认的对应平台 AI 版本。
-- 新同步稿件的默认发布方式可以在前端配置。
-- 建议先完成连接测试，并手动成功发布一篇稿件后再打开自动发布。
-
-## AI 内容加工
-
-在“连接与自动化 → AI 内容编辑”中配置兼容 OpenAI Chat Completions
-协议的接口：
-
-- API Base URL
-- API Key
-- 模型名称
-- 可选代理
-- 自定义编辑要求
-
-AI 不会直接覆盖 Notion 原稿。生成结果包括标签、摘要、人工确认事项以及
-公众号、小红书、CSDN 的独立版本。用户可以在稿件编辑器中修改生成内容，
-或将某个平台版本应用到主稿。没有启用 AI 时，原有同步、编辑和发布流程
-仍可正常使用。
-
-## 代理
-
-Notion 和微信公众号分别配置代理：
-
-- 留空：直接连接，不读取系统代理。
-- 填写 `http://127.0.0.1:7890`：仅该连接通过指定代理。
-
-公众号后台的 IP 白名单必须包含微信请求的实际出口 IP。如果代理节点
-会变化，不建议公众号请求使用该代理。
-
-## 测试
-
-```powershell
-python -m unittest -v test_backend.py test_notion_utool.py
-```
-
-端到端测试使用 Patchright：
-
-```powershell
-pip install -r requirements-dev.txt
-python main.py
-# 另一个终端运行
-python test_e2e.py
-```
-
-## 开发日志
-
-后端默认使用 `DEBUG` 级别，同时输出到启动终端和
-`data/backend.log`。日志文件达到 10 MB 后自动轮转，最多保留 5 份。
-
-日志会记录 Notion 查询条件与命中数量、逐篇同步和去重结果、素材缓存、
-AI 加工、自动发布筛选原因、各平台发布结果、HTTP 状态码和耗时。不会记录
-Token、Secret、请求正文或完整文章正文，URL 中的签名参数也会遮罩。
-
-可通过环境变量调整：
-
-```powershell
-$env:LOG_LEVEL = "INFO"       # 上线后建议 INFO 或 WARNING
+$env:LOG_LEVEL = "INFO"
 $env:LOG_FILE = "data/app.log"
 python main.py
 ```
 
-Docker Compose 默认也是 `DEBUG`，部署时可在 `.env` 中设置：
+`notion_utool.py`、`publish_gzh.py` 和 `config-example.py` 是早期兼容代码；当前 Web 工作台以 `backend/` 下的服务和浏览器发布器为主。修改旧脚本前请确认仍有兼容需求。
 
-```dotenv
-LOG_LEVEL=INFO
-```
+## 安全与隐私
 
-## 安全说明
+- API Key、Token、Cookie、`data/`、`.env` 和浏览器资料目录都不应提交。
+- 设置接口会遮罩敏感字段，但 SQLite 当前没有对本地密钥做静态加密，请保护电脑和备份。
+- 资讯采集会拒绝本机和内网地址，以降低 SSRF 风险；仍应只采集有权使用的公开网页。
+- 项目没有多用户鉴权。远程部署前必须增加身份认证、HTTPS、访问控制和密钥管理。
+- 提交漏洞请阅读 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中附带真实凭据或 Cookie。
 
-这是一个本地单用户工具，目前没有系统用户登录和权限控制。平台账号指
-浏览器发布账号，不是本系统的多用户权限账号。敏感配置保存在本机
-SQLite 中，API 返回时会遮罩 Token 和 Secret。请勿将服务直接暴露到公网；
-若以后部署到服务器，需要先增加身份认证、HTTPS 和密钥加密。
+## 参与贡献
+
+欢迎提交问题和改进。开始前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；第三方项目声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 许可证
+
+本项目使用 [Apache License 2.0](LICENSE)。平台名称和商标归各自权利人所有，本项目与 Notion、微信、CSDN、小红书、抖音、视频号或 Bilibili 没有官方关联。

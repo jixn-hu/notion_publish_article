@@ -1,11 +1,24 @@
 import json
 import logging
+from pathlib import Path
 import threading
 import time
 
+from backend.ai_generation import AIImageService
 from backend.ai_service import AIContentService
 from backend.assets import sync_article_assets
 from backend.db import connection, row_to_article, utc_now
+from backend.media import MEDIA_DIR
+from backend.materials import (
+    format_material_context,
+    get_material_references,
+    link_article_materials,
+)
+from backend.news import (
+    format_news_context,
+    get_news_references,
+    link_article_news,
+)
 from backend.notion_client import NotionClient, page_metadata
 from backend.platforms import get_platforms
 from backend.settings import get_settings
@@ -260,12 +273,17 @@ def _upsert_synced_article(article, default_publish_mode):
         return "created", cursor.lastrowid
 
 
-def list_articles(status=None, query=None):
+def list_articles(status=None, query=None, article_type=None):
     clauses = []
     params = []
     if status and status != "all":
         clauses.append("a.status = ?")
         params.append(status)
+    if article_type and article_type != "all":
+        if article_type not in {"article", "image", "video"}:
+            raise ValueError("内容类型必须是 article、image 或 video")
+        clauses.append("a.article_type = ?")
+        params.append(article_type)
     if query:
         clauses.append("(a.title LIKE ? OR a.author LIKE ?)")
         term = f"%{query}%"
@@ -465,7 +483,7 @@ def publish_article(article_id, requested_actions=None):
         else:
             actions = {
                 key: article["platform_actions"].get(
-                    key, "draft" if key == "wechat" else "publish"
+                    key, "draft" if key in {"wechat", "csdn"} else "publish"
                 )
                 for key in article["target_platforms"]
             }
@@ -637,6 +655,240 @@ def _article_for_platform(article, platform_key):
     if variant.get("content_md"):
         platform_article["content_md"] = variant["content_md"]
     return platform_article
+
+
+def _insert_generated_images(markdown, images):
+    content = str(markdown or "").strip()
+    appended = []
+    for image in images:
+        alt = str(image.get("alt") or "文章配图").replace("]", "")
+        source = Path(image["path"]).as_posix()
+        image_markdown = f"![{alt}]({source})"
+        marker = f"<!-- {image['position']} -->"
+        if marker in content:
+            content = content.replace(marker, image_markdown, 1)
+        else:
+            appended.append(image_markdown)
+    if appended:
+        content = "\n\n".join([content, *appended]).strip()
+    return content
+
+
+def generate_ai_storyboard(values, settings=None):
+    settings = settings or get_settings()
+    if not settings["ai_enabled"]:
+        raise RuntimeError("AI 内容生成尚未启用")
+    page_count = int(values.get("image_count") or 5)
+    if page_count < 1 or page_count > 9:
+        raise ValueError("图文分镜页数必须在 1-9 之间")
+    material_ids = values.get("material_ids") or []
+    references = get_material_references(material_ids)
+    news_ids = values.get("news_ids") or []
+    news_references = get_news_references(news_ids)
+    specification = {
+        "topic": str(values["topic"]).strip(),
+        "audience": str(values.get("audience") or "").strip(),
+        "style": str(values.get("style") or "").strip(),
+        "requirements": str(values.get("requirements") or "").strip(),
+        "image_count": page_count,
+        "materials": format_material_context(references),
+        "material_ids": [material["id"] for material in references],
+        "news": format_news_context(news_references),
+        "news_ids": [item["id"] for item in news_references],
+    }
+    logger.info(
+        "AI 图文分镜生成开始 topic=%r pages=%s model=%s",
+        specification["topic"],
+        page_count,
+        settings["ai_model"] or "(未配置)",
+    )
+    return AIContentService(settings).generate_image_storyboard(specification)
+
+
+def generate_ai_article(values, settings=None):
+    settings = settings or get_settings()
+    if not settings["ai_enabled"]:
+        raise RuntimeError("AI 内容生成尚未启用")
+    article_type = values.get("article_type", "article")
+    image_count = int(values.get("image_count") or 0)
+    if article_type not in {"article", "image"}:
+        raise ValueError("AI 生成仅支持 article 或 image")
+    if article_type == "image" and image_count < 1:
+        raise ValueError("图文内容至少需要生成 1 张图片")
+
+    material_ids = values.get("material_ids") or []
+    references = get_material_references(material_ids)
+    news_ids = values.get("news_ids") or []
+    news_references = get_news_references(news_ids)
+    started = time.perf_counter()
+    logger.info(
+        "AI 文章生成开始 type=%s topic=%r words=%s images=%s model=%s",
+        article_type,
+        values["topic"],
+        values["word_count"],
+        image_count,
+        settings["ai_model"] or "(未配置)",
+    )
+    specification = {
+        "topic": str(values["topic"]).strip(),
+        "article_type": article_type,
+        "audience": str(values.get("audience") or "").strip(),
+        "style": str(values.get("style") or "").strip(),
+        "requirements": str(values.get("requirements") or "").strip(),
+        "word_count": int(values["word_count"]),
+        "image_count": image_count,
+        "materials": format_material_context(references),
+        "material_ids": [material["id"] for material in references],
+        "news": format_news_context(news_references),
+        "news_ids": [item["id"] for item in news_references],
+    }
+    storyboard = None
+    if article_type == "image" and values.get("storyboard"):
+        storyboard = AIContentService.validate_image_storyboard(
+            values["storyboard"],
+            expected_pages=image_count,
+        )
+        generated = {
+            "title": storyboard["title"],
+            "summary": storyboard["summary"],
+            "content_md": "\n\n".join(
+                [
+                    storyboard["caption_md"],
+                    *[
+                        f"<!-- image:{index} -->"
+                        for index in range(1, len(storyboard["pages"]) + 1)
+                    ],
+                ]
+            ),
+            "tags": storyboard["tags"],
+            "image_plan": AIContentService.image_plan_from_storyboard(
+                storyboard,
+                specification,
+            ),
+        }
+    else:
+        generated = AIContentService(settings).generate_article(specification)
+
+    images = AIImageService(settings).generate_images(generated["image_plan"])
+    content_md = _insert_generated_images(generated["content_md"], images)
+    media_paths = [image["path"] for image in images]
+    ai_result = {
+        "source": "generated",
+        "summary": generated["summary"],
+        "editor_notes": "AI 生成初稿，请在发布前核对事实、图片与平台要求。",
+        "tags": generated["tags"],
+        "image_plan": generated["image_plan"],
+        "generated_images": images,
+        "material_ids": [material["id"] for material in references],
+        "news_ids": [item["id"] for item in news_references],
+        "platforms": {},
+    }
+    if storyboard:
+        ai_result["storyboard"] = storyboard
+    try:
+        article = create_article(
+            {
+                "title": generated["title"],
+                "author": str(values.get("author") or "").strip(),
+                "article_type": article_type,
+                "content_md": content_md,
+                "cover_url": media_paths[0] if media_paths else "",
+                "tags": generated["tags"],
+                "media_paths": media_paths,
+                "publish_mode": "manual",
+                "target_platforms": ["wechat"],
+                "platform_actions": {"wechat": "draft"},
+            }
+        )
+    except Exception:
+        for image in images:
+            Path(image["path"]).unlink(missing_ok=True)
+        raise
+
+    link_article_materials(article["id"], material_ids)
+    link_article_news(article["id"], news_ids)
+    now = utc_now()
+    with connection() as conn:
+        conn.execute(
+            """
+            UPDATE articles
+            SET ai_result_json = ?, ai_enriched_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(ai_result, ensure_ascii=False),
+                now,
+                now,
+                article["id"],
+            ),
+        )
+    logger.info(
+        "AI 文章生成完成 article_id=%s type=%s images=%s elapsed_ms=%.1f",
+        article["id"],
+        article_type,
+        len(images),
+        (time.perf_counter() - started) * 1000,
+    )
+    return get_article(article["id"])
+
+
+def regenerate_ai_image(article_id, image_index, settings=None):
+    settings = settings or get_settings()
+    if not settings["ai_enabled"]:
+        raise RuntimeError("AI 内容生成尚未启用")
+    article = get_article(article_id, include_records=False)
+    image_plan = article.get("ai_result", {}).get("image_plan") or []
+    generated_images = list(
+        article.get("ai_result", {}).get("generated_images") or []
+    )
+    if image_index < 0 or image_index >= len(image_plan):
+        raise ValueError("图片序号超出可重绘范围")
+
+    replacement = AIImageService(settings).generate_images([image_plan[image_index]])[0]
+    old_path = (
+        generated_images[image_index].get("path")
+        if image_index < len(generated_images)
+        else ""
+    )
+    while len(generated_images) <= image_index:
+        generated_images.append({})
+    generated_images[image_index] = replacement
+
+    media_paths = list(article.get("media_paths") or [])
+    while len(media_paths) <= image_index:
+        media_paths.append("")
+    media_paths[image_index] = replacement["path"]
+
+    content_md = article.get("content_md") or ""
+    if old_path:
+        content_md = content_md.replace(
+            Path(old_path).as_posix(),
+            Path(replacement["path"]).as_posix(),
+        )
+    ai_result = dict(article.get("ai_result") or {})
+    ai_result["generated_images"] = generated_images
+    values = {
+        "content_md": content_md,
+        "media_paths": media_paths,
+        "ai_result": ai_result,
+    }
+    if image_index == 0:
+        values["cover_url"] = replacement["path"]
+    try:
+        updated = update_article(article_id, values)
+    except Exception:
+        Path(replacement["path"]).unlink(missing_ok=True)
+        raise
+
+    if old_path:
+        old_file = Path(old_path).resolve()
+        try:
+            old_file.relative_to((MEDIA_DIR / "ai").resolve())
+        except ValueError:
+            pass
+        else:
+            old_file.unlink(missing_ok=True)
+    return updated
 
 
 def enrich_article(article_id, settings=None):

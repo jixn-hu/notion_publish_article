@@ -25,6 +25,14 @@ KNOWN_BROWSER_PATHS = [
 ]
 
 
+ACCOUNT_HOME_URLS = {
+    "wechat": "https://mp.weixin.qq.com/",
+    "xiaohongshu": "https://creator.xiaohongshu.com/",
+    "douyin": "https://creator.douyin.com/",
+    "channels": "https://channels.weixin.qq.com/platform/home",
+    "bilibili": "https://member.bilibili.com/platform/home",
+    "csdn": "https://mp.csdn.net/",
+}
 def _browser_executable_path():
     configured = str(get_settings().get("browser_executable_path") or "").strip()
     if configured:
@@ -110,6 +118,27 @@ def _close_native_browser(browser, context, process):
         process.kill()
         process.wait(timeout=3)
 
+
+def open_account_dashboard(account, target_url=None):
+    profile_dir = Path(account["profile_dir"])
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    target_url = target_url or ACCOUNT_HOME_URLS.get(account["platform"])
+    if not target_url:
+        raise ValueError("该平台暂不支持打开账号浏览器")
+    command = _native_browser_command(
+        _browser_executable_path(),
+        profile_dir,
+        _available_debugging_port(),
+        account.get("proxy_url") or "",
+    )
+    command[-1] = target_url
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return {"platform": account["platform"], "url": target_url}
 
 @contextmanager
 def open_account_browser(account):

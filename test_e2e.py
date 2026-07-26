@@ -33,8 +33,9 @@ with sync_playwright() as playwright:
     assert page.get_by_text("一个账号，").is_visible()
     assert page.get_by_role("button", name="＋ 添加小红书账号").is_visible()
     platform_select = page.locator(".account-create select")
-    assert platform_select.locator("option").count() == 4
+    assert platform_select.locator("option").count() == 6
     platform_select.select_option("bilibili")
+    assert page.get_by_role("button", name="查看账号").first.is_visible()
     assert page.get_by_role("button", name="＋ 添加Bilibili账号").is_visible()
     account_screenshot = Path("artifacts/mozhou-publisher-accounts.png")
     account_screenshot.parent.mkdir(parents=True, exist_ok=True)
@@ -45,12 +46,16 @@ with sync_playwright() as playwright:
     assert page.locator(".settings-section h3").nth(0).is_visible()
     assert page.locator(".settings-section h3").nth(1).is_visible()
     assert page.locator(".settings-section h3").nth(2).is_visible()
-    assert page.get_by_role("heading", name="Patchright 浏览器发布").is_visible()
+    assert page.get_by_role("heading", name="浏览器发布通道").is_visible()
     assert page.get_by_text("启用抖音", exact=True).is_visible()
     assert page.get_by_text("启用视频号", exact=True).is_visible()
     assert page.get_by_text("启用Bilibili", exact=True).is_visible()
     assert page.locator(".mapping-row").count() == 8
     assert page.locator(".mapping-row input").nth(0).input_value() == "标题"
+
+    page.locator("nav button").nth(4).click()
+    page.wait_for_selector(".settings-section h3")
+    assert page.get_by_role("heading", name="自动发布").is_visible()
 
     screenshot = Path("artifacts/mozhou-publisher-settings.png")
     screenshot.parent.mkdir(parents=True, exist_ok=True)

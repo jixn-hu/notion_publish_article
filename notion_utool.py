@@ -1,8 +1,17 @@
 import time
+from types import SimpleNamespace
 
 import requests
 
-import config
+try:
+    import config
+except ImportError:
+    config = SimpleNamespace(
+        notion_token="",
+        databases_id="",
+        data_source_id="",
+        notion_proxy=None,
+    )
 
 
 NOTION_API_BASE = "https://api.notion.com/v1"

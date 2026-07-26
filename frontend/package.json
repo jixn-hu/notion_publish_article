@@ -9,7 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/lang-markdown": "^6.5.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.6",
     "dompurify": "^3.4.12",
+    "lucide-react": "^1.27.0",
     "marked": "^18.0.7",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

@@ -14,13 +14,16 @@ const PROXY_STATUS_LABELS = {
 }
 
 const ACCOUNT_PLATFORMS = {
+  wechat: { label: '公众号', mark: '公' },
   xiaohongshu: { label: '小红书', mark: '红' },
   douyin: { label: '抖音', mark: '抖' },
   channels: { label: '视频号', mark: '视' },
-  bilibili: { label: 'Bilibili', mark: 'B' }
+  bilibili: { label: 'Bilibili', mark: 'B' },
+  csdn: { label: 'CSDN', mark: 'C' }
 }
 
 const PROFILE_ID_LABELS = {
+  wechat: '微信号',
   xiaohongshu: '小红书号',
   douyin: '抖音号',
   channels: '视频号 ID'
@@ -42,6 +45,12 @@ const PROFILE_METRICS = {
     ['followers_count', '粉丝'],
     ['works_count', '作品'],
     ['likes_count', '获赞']
+  ],
+  csdn: [
+    ['followers_count', '\u7c89\u4e1d'],
+    ['works_count', '\u539f\u521b'],
+    ['read_count', '\u9605\u8bfb'],
+    ['favorites_count', '\u6536\u85cf']
   ]
 }
 
@@ -215,77 +224,6 @@ function Accounts ({ notify, onChanged }) {
         </form>
       </section>
 
-      <section className='proxy-sheet'>
-        <header>
-          <div>
-            <span className='eyebrow'>PROXY DIRECTORY</span>
-            <h3>代理管理</h3>
-          </div>
-          <small>{proxies.length} 个已保存代理</small>
-        </header>
-        <form className='proxy-create' onSubmit={createProxy}>
-          <label className='field'>
-            <span>代理名称</span>
-            <input
-              value={proxyName}
-              maxLength={50}
-              placeholder='例如：上海线路'
-              onChange={event => setProxyName(event.target.value)}
-            />
-          </label>
-          <label className='field'>
-            <span>代理地址</span>
-            <input
-              value={proxyAddress}
-              maxLength={300}
-              placeholder='http://127.0.0.1:7890 或 https:http://主机:端口'
-              onChange={event => setProxyAddress(event.target.value)}
-            />
-          </label>
-          <button className='button vermilion' disabled={Boolean(busy)}>
-            {busy === 'create-proxy' ? '保存中…' : '＋ 保存代理'}
-          </button>
-          <small className='proxy-create-hint'>
-            代理按账号全局生效，HTTP 和 HTTPS 请求都会通过它；
-            兼容“https:http://…”格式并自动规范为“http://…”。
-          </small>
-        </form>
-        {proxies.length > 0 && (
-          <div className='proxy-list'>
-            {proxies.map(proxy => (
-              <article key={proxy.id} className='proxy-item'>
-                <div>
-                  <b>{proxy.name}</b>
-                  <code>{proxy.proxy_url}</code>
-                </div>
-                <span className={`proxy-status ${proxy.status}`}>
-                  {PROXY_STATUS_LABELS[proxy.status] || proxy.status}
-                  {proxy.exit_ip ? ` · ${proxy.exit_ip}` : ''}
-                  {proxy.last_latency_ms !== null ? ` · ${proxy.last_latency_ms}ms` : ''}
-                </span>
-                {proxy.last_error && <small title={proxy.last_error}>{proxy.last_error}</small>}
-                <div>
-                  <button
-                    className='button ink'
-                    disabled={Boolean(busy)}
-                    onClick={() => testSavedProxy(proxy)}
-                  >
-                    {busy === `test-proxy-${proxy.id}` ? '测试中…' : '测试'}
-                  </button>
-                  <button
-                    className='button ghost'
-                    disabled={Boolean(busy)}
-                    onClick={() => removeProxy(proxy)}
-                  >
-                    删除
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
-
       <section className='account-sheet'>
         <header>
           <div>
@@ -351,6 +289,17 @@ function Accounts ({ notify, onChanged }) {
                   </div>
                   <div className='account-actions'>
                     <button
+                      className='button ghost'
+                      disabled={Boolean(busy)}
+                      onClick={() => run(
+                        `browser-${account.id}`,
+                        () => api.openAccountBrowser(account.id),
+                        `已打开“${account.name}”的账号浏览器`
+                      )}
+                    >
+                      {busy === `browser-${account.id}` ? '正在打开…' : '查看账号'}
+                    </button>
+                    <button
                       className='button ink'
                       disabled={Boolean(busy)}
                       onClick={() => run(
@@ -372,7 +321,7 @@ function Accounts ({ notify, onChanged }) {
                     >
                       {busy === `check-${account.id}` ? '检查中…' : '检查状态'}
                     </button>
-                    {['xiaohongshu', 'douyin', 'channels'].includes(account.platform) && (
+                    {['wechat', 'xiaohongshu', 'douyin', 'channels', 'csdn'].includes(account.platform) && (
                       <button
                         className='button ghost'
                         disabled={Boolean(busy) || account.status !== 'valid'}

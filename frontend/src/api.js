@@ -17,18 +17,77 @@ async function request (path, options = {}) {
 export const api = {
   health: () => request('/health'),
   dashboard: () => request('/dashboard'),
-  articles: (status = 'all', q = '') => {
+  articles: (status = 'all', q = '', articleType = 'all') => {
     const params = new URLSearchParams()
     if (status !== 'all') params.set('status', status)
     if (q) params.set('q', q)
-    return request(`/articles?${params}`)
+    if (articleType !== 'all') params.set('article_type', articleType)
+    return request('/articles?' + params.toString())
   },
-  article: id => request(`/articles/${id}`),
+  news: (q = '', source = '') => {
+    const params = new URLSearchParams()
+    if (q) params.set('q', q)
+    if (source) params.set('source', source)
+    return request('/news?' + params.toString())
+  },
+  collectNews: url => request('/news/collect', {
+    method: 'POST',
+    body: JSON.stringify({ url })
+  }),
+  createNews: values => request('/news', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  updateNews: (id, values) => request('/news/' + id, {
+    method: 'PATCH',
+    body: JSON.stringify(values)
+  }),
+  deleteNews: id => request('/news/' + id, { method: 'DELETE' }),  materials: (kind = '', q = '') => {
+    const params = new URLSearchParams()
+    if (kind) params.set('kind', kind)
+    if (q) params.set('q', q)
+    return request('/materials?' + params.toString())
+  },
+  uploadMaterial: file => {
+    const body = new FormData()
+    body.append('file', file)
+    return request('/materials/files', { method: 'POST', body })
+  },
+  createMaterialNote: values => request('/materials/notes', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  updateMaterial: (id, values) => request('/materials/' + id, {
+    method: 'PATCH',
+    body: JSON.stringify(values)
+  }),
+  deleteMaterial: id => request('/materials/' + id, { method: 'DELETE' }),
+  downloadMaterials: async ids => {
+    const response = await fetch('/api/materials/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.detail || '请求失败 (' + response.status + ')')
+    }
+    return response.blob()
+  },  article: id => request(`/articles/${id}`),
   createArticle: values => request('/articles', {
     method: 'POST',
     body: JSON.stringify(values)
   }),
-  updateArticle: (id, values) => request(`/articles/${id}`, {
+  generateStoryboard: values => request('/articles/generate-storyboard', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  generateArticle: values => request('/articles/generate', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  regenerateArticleImage: (id, imageIndex) =>
+    request('/articles/' + id + '/images/' + imageIndex + '/regenerate', { method: 'POST' }),  updateArticle: (id, values) => request(`/articles/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(values)
   }),
@@ -44,6 +103,7 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(values)
   }),
+  openAccountBrowser: id => request(`/accounts/${id}/browser`, { method: 'POST' }),
   loginAccount: id => request(`/accounts/${id}/login`, { method: 'POST' }),
   checkAccount: id => request(`/accounts/${id}/check`, { method: 'POST' }),
   refreshAccountProfile: id => request(`/accounts/${id}/profile`, { method: 'POST' }),
@@ -74,3 +134,8 @@ export const api = {
   testAI: () => request('/connections/ai/test', { method: 'POST' }),
   testPlatform: key => request(`/platforms/${key}/test`, { method: 'POST' })
 }
+
+export const materialFileUrl = id => '/api/materials/' + id + '/file'
+
+export const mediaPreviewUrl = path =>
+  `/api/media/file?path=${encodeURIComponent(path)}`

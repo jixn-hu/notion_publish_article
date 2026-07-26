@@ -135,6 +135,10 @@ SETTING_DEFINITIONS = {
     "ai_model": {"default": "", "secret": False, "group": "ai"},
     "ai_proxy_url": {"default": "", "secret": False, "group": "ai"},
     "ai_custom_prompt": {"default": "", "secret": False, "group": "ai"},
+    "ai_image_base_url": {"default": "", "secret": False, "group": "ai"},
+    "ai_image_api_key": {"default": "", "secret": True, "group": "ai"},
+    "ai_image_model": {"default": "", "secret": False, "group": "ai"},
+    "ai_image_size": {"default": "1024x1024", "secret": False, "group": "ai"},
 }
 
 

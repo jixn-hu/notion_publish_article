@@ -1,16 +1,23 @@
-import { useEffect, useMemo, useState } from 'react'
-import DOMPurify from 'dompurify'
-import { marked } from 'marked'
-import { api } from './api'
+import { lazy, Suspense, useEffect, useState } from 'react'
+import { ArrowLeft, Plus, Sparkles, Trash2, WandSparkles } from 'lucide-react'
+import { api, mediaPreviewUrl } from './api'
 import Accounts from './Accounts'
+import Automation from './Automation'
+import ProxyDirectory from './Proxies'
+import Materials, { MaterialPicker } from './Materials'
+import News, { NewsPicker } from './News'
+
+const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: '工作台', mark: '01' },
   { key: 'articles', label: '内容库', mark: '02' },
-  { key: 'accounts', label: '账号管理', mark: '03' },
-  { key: 'settings', label: '连接与自动化', mark: '04' }
+  { key: 'news', label: '资讯', mark: '03' },
+  { key: 'materials', label: '素材库', mark: '04' },
+  { key: 'accounts', label: '账号管理', mark: '05' },
+  { key: 'settings', label: '设置', mark: '06' },
+  { key: 'automation', label: '自动化', mark: '07' }
 ]
-
 const STATUS_LABELS = {
   ready: '待发布',
   publishing: '发布中',
@@ -31,7 +38,9 @@ const PLATFORM_LABELS = {
   csdn: 'CSDN'
 }
 
-const BROWSER_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'channels', 'bilibili']
+const BROWSER_PLATFORM_KEYS = ['wechat', 'xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
+const DRAFT_PLATFORM_KEYS = ['wechat', 'csdn']
+const PUBLISH_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
 
 const CONTENT_TYPE_LABELS = {
   article: '文章',
@@ -101,7 +110,7 @@ function App () {
     if (view === 'accounts') {
       loadAccounts().catch(error => notify(error.message, 'error'))
     }
-    if (view === 'settings') {
+    if (view === 'settings' || view === 'automation') {
       Promise.all([loadSettings(), api.platforms().then(setPlatforms)])
         .catch(error => notify(error.message, 'error'))
     }
@@ -205,6 +214,12 @@ function App () {
             accounts={accounts}
           />
         )}
+        {view === 'news' && (
+          <News notify={notify} />
+        )}
+        {view === 'materials' && (
+          <Materials notify={notify} />
+        )}
         {view === 'accounts' && (
           <Accounts
             notify={notify}
@@ -215,6 +230,15 @@ function App () {
           <Settings
             data={settingsData}
             platforms={platforms}
+            notify={notify}
+            onSaved={async () => {
+              await Promise.all([loadSettings(), loadOverview()])
+            }}
+          />
+        )}
+        {view === 'automation' && settingsData && (
+          <Automation
+            data={settingsData}
             notify={notify}
             onSaved={async () => {
               await Promise.all([loadSettings(), loadOverview()])
@@ -341,14 +365,19 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
 function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
   const [status, setStatus] = useState('all')
   const [query, setQuery] = useState('')
+  const [articleType, setArticleType] = useState('all')
   const [editing, setEditing] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [generating, setGenerating] = useState(false)
 
   const applyFilter = async (nextStatus = status, nextQuery = query) => {
     setStatus(nextStatus)
     await reload(nextStatus, nextQuery)
   }
 
+  const visibleArticles = articles.filter(
+    article => articleType === 'all' || article.article_type === articleType
+  )
   return (
     <div className='page enter'>
       <div className='library-toolbar'>
@@ -380,11 +409,41 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
             }}
           />
         </div>
-        <button className='button vermilion' onClick={() => setCreating(true)}>
-          ＋ 新建稿件
-        </button>
+        <div className='library-actions'>
+          <button className='button paper ai-create-button' onClick={() => setGenerating(true)}>
+            <span>✦</span>
+            AI 生成
+          </button>
+          <button className='button vermilion' onClick={() => setCreating(true)}>
+            ＋ 新建稿件
+          </button>
+        </div>
       </div>
 
+      <div className='content-type-tabs' role='tablist' aria-label='内容类型'>
+        {[
+          ['all', '全部类型'],
+          ['article', '文章'],
+          ['image', '图文'],
+          ['video', '视频']
+        ].map(([key, label]) => (
+          <button
+            type='button'
+            role='tab'
+            aria-selected={articleType === key}
+            className={articleType === key ? 'active' : ''}
+            key={key}
+            onClick={() => setArticleType(key)}
+          >
+            {label}
+            <span>
+              {key === 'all'
+                ? articles.length
+                : articles.filter(article => article.article_type === key).length}
+            </span>
+          </button>
+        ))}
+      </div>
       <section className='article-sheet'>
         <div className='article-table-head'>
           <span>稿件</span>
@@ -393,8 +452,8 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
           <span>状态</span>
           <span>操作</span>
         </div>
-        {articles.length
-          ? articles.map((article, index) => (
+        {visibleArticles.length
+          ? visibleArticles.map((article, index) => (
             <article className='article-row' key={article.id}>
               <div className='article-title-cell'>
                 <span className='folio'>{String(index + 1).padStart(2, '0')}</span>
@@ -456,6 +515,17 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
           : <EmptyState text='内容库还是空的。你可以新建稿件，或从 Notion 同步。' />}
       </section>
 
+      {generating && (
+        <AIArticleGenerator
+          onClose={() => setGenerating(false)}
+          onGenerated={async article => {
+            setGenerating(false)
+            await reload(status, query)
+            setEditing(article)
+            notify('AI 稿件已生成，发布前请核对正文与图片')
+          }}
+        />
+      )}
       {(editing || creating) && (
         <ArticleEditor
           article={editing}
@@ -472,6 +542,471 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
           }}
         />
       )}
+    </div>
+  )
+}
+
+
+function AIArticleGenerator ({ onClose, onGenerated }) {
+  const [form, setForm] = useState({
+    topic: '',
+    article_type: 'article',
+    author: '',
+    audience: '',
+    style: '',
+    requirements: '',
+    word_count: 1200,
+    image_count: 1,
+    material_ids: [],
+    news_ids: []
+  })
+  const [storyboard, setStoryboard] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
+
+  const selectType = articleType => {
+    setStoryboard(null)
+    setForm(current => ({
+      ...current,
+      article_type: articleType,
+      word_count: articleType === 'image' ? 700 : 1200,
+      image_count: articleType === 'image' ? 5 : 1
+    }))
+  }
+
+  const requestValues = () => ({
+    ...form,
+    topic: form.topic.trim(),
+    word_count: Number(form.word_count),
+    image_count: Number(form.image_count)
+  })
+
+  const submit = async event => {
+    event.preventDefault()
+    if (form.topic.trim().length < 2 || submitting) return
+    setSubmitting(true)
+    setError('')
+    try {
+      if (form.article_type === 'image' && !storyboard) {
+        const result = await api.generateStoryboard(requestValues())
+        setStoryboard(result)
+        setForm(current => ({
+          ...current,
+          image_count: result.pages.length
+        }))
+        setSubmitting(false)
+        return
+      }
+      const article = await api.generateArticle({
+        ...requestValues(),
+        storyboard: form.article_type === 'image' ? storyboard : null
+      })
+      await onGenerated(article)
+    } catch (generationError) {
+      setError(generationError.message)
+      setSubmitting(false)
+    }
+  }
+
+  const updateStoryboard = (key, value) => {
+    setStoryboard(current => ({ ...current, [key]: value }))
+  }
+
+  const updateVisualStyle = (key, value) => {
+    setStoryboard(current => ({
+      ...current,
+      visual_style: {
+        ...(current.visual_style || {}),
+        [key]: value
+      }
+    }))
+  }
+
+  const updatePage = (pageIndex, key, value) => {
+    setStoryboard(current => ({
+      ...current,
+      pages: current.pages.map((page, index) => (
+        index === pageIndex ? { ...page, [key]: value } : page
+      ))
+    }))
+  }
+
+  const addPage = () => {
+    if (!storyboard || storyboard.pages.length >= 9) return
+    const pages = [
+      ...storyboard.pages,
+      {
+        index: storyboard.pages.length,
+        role: 'content',
+        headline: '新页面',
+        body: '',
+        visual: '根据主题补充这一页的视觉主体与场景',
+        layout: ''
+      }
+    ]
+    setStoryboard(current => ({ ...current, pages }))
+    set('image_count', pages.length)
+  }
+
+  const removePage = pageIndex => {
+    if (!storyboard || pageIndex === 0 || storyboard.pages.length <= 1) return
+    const pages = storyboard.pages
+      .filter((_, index) => index !== pageIndex)
+      .map((page, index) => ({
+        ...page,
+        index,
+        role: index === 0 ? 'cover' : page.role
+      }))
+    setStoryboard(current => ({ ...current, pages }))
+    set('image_count', pages.length)
+  }
+
+  const isStoryboard = form.article_type === 'image' && storyboard
+  const statusTitle = isStoryboard ? '正在生成整套图片' : '正在生成正文与配图'
+  const statusNote = isStoryboard ? '先生成封面，再生成其余页面' : '图片会保存到本地素材目录'
+
+  return (
+    <div
+      className='modal-backdrop ai-generator-backdrop'
+      onMouseDown={submitting ? undefined : onClose}
+    >
+      <form
+        className={isStoryboard ? 'ai-generator storyboard-mode' : 'ai-generator'}
+        role='dialog'
+        aria-modal='true'
+        aria-labelledby='ai-generator-title'
+        onSubmit={submit}
+        onMouseDown={event => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className='eyebrow'>AI DRAFT STUDIO</span>
+            <h2 id='ai-generator-title'>
+              {isStoryboard ? '编排图文分镜' : '生成新稿件'}
+            </h2>
+          </div>
+          {form.article_type === 'image' && (
+            <div className='ai-step-indicator' aria-label='生成进度'>
+              <span className={!isStoryboard ? 'active' : 'done'}>01 选题</span>
+              <i />
+              <span className={isStoryboard ? 'active' : ''}>02 分镜</span>
+              <i />
+              <span>03 出图</span>
+            </div>
+          )}
+          <button
+            type='button'
+            className='close-button'
+            aria-label='关闭'
+            disabled={submitting}
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </header>
+
+        <div className='ai-generator-body'>
+          {!isStoryboard && (
+            <>
+              <div className='ai-type-switch' role='group' aria-label='内容类型'>
+                <button
+                  type='button'
+                  className={form.article_type === 'article' ? 'active' : ''}
+                  aria-pressed={form.article_type === 'article'}
+                  onClick={() => selectType('article')}
+                >
+                  <b>文章</b>
+                  <span>结构完整的长内容</span>
+                </button>
+                <button
+                  type='button'
+                  className={form.article_type === 'image' ? 'active' : ''}
+                  aria-pressed={form.article_type === 'image'}
+                  onClick={() => selectType('image')}
+                >
+                  <b>图文</b>
+                  <span>可编辑分镜与统一视觉</span>
+                </button>
+              </div>
+
+              <label className='field full ai-topic-field'>
+                <span>创作主题</span>
+                <textarea
+                  autoFocus
+                  required
+                  minLength='2'
+                  maxLength='300'
+                  value={form.topic}
+                  onChange={event => set('topic', event.target.value)}
+                  placeholder='输入选题、核心观点或一段创作方向'
+                />
+              </label>
+
+              <div className='field-grid'>
+                <label className='field'>
+                  <span>作者</span>
+                  <input
+                    maxLength='50'
+                    value={form.author}
+                    onChange={event => set('author', event.target.value)}
+                    placeholder='可留空'
+                  />
+                </label>
+                <label className='field'>
+                  <span>目标读者</span>
+                  <input
+                    maxLength='200'
+                    value={form.audience}
+                    onChange={event => set('audience', event.target.value)}
+                    placeholder='例如：内容运营从业者'
+                  />
+                </label>
+                <label className='field'>
+                  <span>表达风格</span>
+                  <input
+                    maxLength='100'
+                    value={form.style}
+                    onChange={event => set('style', event.target.value)}
+                    placeholder='例如：专业、具体、克制'
+                  />
+                </label>
+                <div className='ai-number-fields'>
+                  <label className='field'>
+                    <span>目标字数</span>
+                    <input
+                      type='number'
+                      min='300'
+                      max='5000'
+                      step='100'
+                      value={form.word_count}
+                      onChange={event => set('word_count', event.target.value)}
+                    />
+                  </label>
+                  <label className='field'>
+                    <span>{form.article_type === 'image' ? '分镜页数' : '配图数量'}</span>
+                    <input
+                      type='number'
+                      min={form.article_type === 'image' ? 1 : 0}
+                      max='9'
+                      value={form.image_count}
+                      onChange={event => set('image_count', event.target.value)}
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <label className='field full ai-requirements-field'>
+                <span>补充要求</span>
+                <textarea
+                  maxLength='2000'
+                  value={form.requirements}
+                  onChange={event => set('requirements', event.target.value)}
+                  placeholder='必须覆盖的要点、需要避开的表达、已有资料等'
+                />
+              </label>
+
+              <div className='reference-picker-grid'>
+                <MaterialPicker
+                  selected={form.material_ids}
+                  onChange={value => set('material_ids', value)}
+                />
+                <NewsPicker
+                  selected={form.news_ids}
+                  onChange={value => set('news_ids', value)}
+                />
+              </div>
+            </>
+          )}
+
+          {isStoryboard && (
+            <>
+              <section className='storyboard-meta'>
+                <label className='field full'>
+                  <span>帖子标题</span>
+                  <input
+                    maxLength='120'
+                    value={storyboard.title}
+                    onChange={event => updateStoryboard('title', event.target.value)}
+                  />
+                </label>
+                <label className='field full'>
+                  <span>发布文案</span>
+                  <textarea
+                    maxLength='5000'
+                    value={storyboard.caption_md}
+                    onChange={event => updateStoryboard('caption_md', event.target.value)}
+                  />
+                </label>
+                <div className='storyboard-style-grid'>
+                  <label className='field'>
+                    <span>视觉方向</span>
+                    <input
+                      value={storyboard.visual_style?.direction || ''}
+                      onChange={event => updateVisualStyle('direction', event.target.value)}
+                    />
+                  </label>
+                  <label className='field'>
+                    <span>字体气质</span>
+                    <input
+                      value={storyboard.visual_style?.typography || ''}
+                      onChange={event => updateVisualStyle('typography', event.target.value)}
+                    />
+                  </label>
+                  <label className='field full'>
+                    <span>统一版式</span>
+                    <input
+                      value={storyboard.visual_style?.composition || ''}
+                      onChange={event => updateVisualStyle('composition', event.target.value)}
+                    />
+                  </label>
+                </div>
+                {!!storyboard.visual_style?.palette?.length && (
+                  <div className='storyboard-palette' aria-label='统一色板'>
+                    {storyboard.visual_style.palette.map((color, index) => (
+                      <span
+                        key={color + index}
+                        style={{ backgroundColor: color }}
+                        title={color}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <div className='storyboard-grid'>
+                {storyboard.pages.map((page, index) => (
+                  <article className='storyboard-page' key={page.index}>
+                    <header>
+                      <div>
+                        <b>P{String(index + 1).padStart(2, '0')}</b>
+                        {index === 0
+                          ? <span>封面</span>
+                          : (
+                            <select
+                              value={page.role}
+                              aria-label={'第 ' + (index + 1) + ' 页类型'}
+                              onChange={event => updatePage(index, 'role', event.target.value)}
+                            >
+                              <option value='content'>内容</option>
+                              <option value='ending'>收尾</option>
+                            </select>
+                            )}
+                      </div>
+                      {index > 0 && (
+                        <button
+                          type='button'
+                          className='icon-action'
+                          title='删除此页'
+                          aria-label={'删除第 ' + (index + 1) + ' 页'}
+                          onClick={() => removePage(index)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      )}
+                    </header>
+                    <label className='field'>
+                      <span>页面标题</span>
+                      <input
+                        maxLength='120'
+                        value={page.headline}
+                        onChange={event => updatePage(index, 'headline', event.target.value)}
+                      />
+                    </label>
+                    <label className='field'>
+                      <span>页面正文</span>
+                      <textarea
+                        maxLength='1200'
+                        value={page.body}
+                        onChange={event => updatePage(index, 'body', event.target.value)}
+                      />
+                    </label>
+                    <label className='field visual-field'>
+                      <span>视觉画面</span>
+                      <textarea
+                        maxLength='800'
+                        value={page.visual}
+                        onChange={event => updatePage(index, 'visual', event.target.value)}
+                      />
+                    </label>
+                    <label className='field'>
+                      <span>版式安排</span>
+                      <textarea
+                        maxLength='500'
+                        value={page.layout}
+                        onChange={event => updatePage(index, 'layout', event.target.value)}
+                      />
+                    </label>
+                  </article>
+                ))}
+                {storyboard.pages.length < 9 && (
+                  <button type='button' className='storyboard-add' onClick={addPage}>
+                    <Plus size={19} />
+                    <span>添加一页</span>
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+
+          {error && <div className='ai-generator-error' role='alert'>{error}</div>}
+          {submitting && (
+            <div className='ai-generating-status' role='status'>
+              <span />
+              <div>
+                <b>{statusTitle}</b>
+                <small>{statusNote}</small>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <footer>
+          {isStoryboard && (
+            <button
+              type='button'
+              className='button ghost'
+              disabled={submitting}
+              onClick={() => {
+                setStoryboard(null)
+                setError('')
+              }}
+            >
+              <ArrowLeft size={15} />
+              返回选题
+            </button>
+          )}
+          <button
+            type='button'
+            className='button ghost'
+            disabled={submitting}
+            onClick={onClose}
+          >
+            取消
+          </button>
+          <button
+            type='submit'
+            className='button vermilion'
+            disabled={
+              submitting ||
+              form.topic.trim().length < 2 ||
+              (isStoryboard && (
+                !storyboard.title.trim() ||
+                !storyboard.caption_md.trim() ||
+                storyboard.pages.some(page => !page.headline.trim() || !page.visual.trim())
+              ))
+            }
+          >
+            {submitting
+              ? '正在生成…'
+              : isStoryboard
+                ? <><WandSparkles size={16} />生成整套图片</>
+                : form.article_type === 'image'
+                  ? <><Sparkles size={16} />生成分镜</>
+                  : '生成稿件'}
+          </button>
+        </footer>
+      </form>
     </div>
   )
 }
@@ -496,7 +1031,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
   const [saving, setSaving] = useState(false)
   const [enriching, setEnriching] = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [contentView, setContentView] = useState('edit')
+  const [regeneratingImage, setRegeneratingImage] = useState(null)
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
 
   const save = async () => {
@@ -567,21 +1102,56 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
     }))
   }
 
+  const uploadFiles = async files => {
+    const selected = Array.from(files || [])
+    if (!selected.length) return []
+    setUploading(true)
+    try {
+      const uploaded = await Promise.all(selected.map(file => api.uploadMedia(file)))
+      const paths = uploaded.map(item => item.path)
+      setForm(current => ({
+        ...current,
+        media_paths: [...(current.media_paths || []), ...paths]
+      }))
+      return paths
+    } catch (error) {
+      window.alert(error.message)
+      return []
+    } finally {
+      setUploading(false)
+    }
+  }
+
   const uploadMedia = async event => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
-    if (!files.length) return
-    setUploading(true)
+    await uploadFiles(files)
+  }
+
+  const regenerateImage = async imageIndex => {
+    if (!article || regeneratingImage !== null) return
+    setRegeneratingImage(imageIndex)
     try {
-      const uploaded = await Promise.all(files.map(file => api.uploadMedia(file)))
-      set('media_paths', [
-        ...(form.media_paths || []),
-        ...uploaded.map(item => item.path)
-      ])
+      const updated = await api.regenerateArticleImage(article.id, imageIndex)
+      setForm(current => {
+        const oldPath = current.media_paths?.[imageIndex] || ''
+        const nextPath = updated.media_paths?.[imageIndex] || ''
+        const oldSource = oldPath.replaceAll('\\', '/')
+        const nextSource = nextPath.replaceAll('\\', '/')
+        return {
+          ...current,
+          content_md: oldSource && nextSource
+            ? current.content_md.replaceAll(oldSource, nextSource)
+            : updated.content_md,
+          cover_url: imageIndex === 0 ? nextPath : current.cover_url,
+          media_paths: updated.media_paths,
+          ai_result: updated.ai_result
+        }
+      })
     } catch (error) {
       window.alert(error.message)
     } finally {
-      setUploading(false)
+      setRegeneratingImage(null)
     }
   }
 
@@ -629,15 +1199,17 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
               </select>
             </label>
           </div>
-          {form.article_type !== 'article' && (
+          {(form.article_type !== 'article' || form.media_paths?.length > 0) && (
             <div className='field full media-field'>
               <div className='media-field-head'>
                 <div>
-                  <span>{form.article_type === 'video' ? '视频素材' : '图片素材'}</span>
+                  <span>{form.article_type === 'video' ? '视频素材' : form.article_type === 'article' ? '文章配图' : '图片素材'}</span>
                   <small>
                     {form.article_type === 'video'
                       ? '小红书视频只选择 1 个视频文件'
-                      : '可一次选择多张图片，发布时保持当前顺序'}
+                      : form.article_type === 'article'
+                        ? '正文配图与封面会保存在本地，发布时自动上传'
+                        : '可一次选择多张图片，发布时保持当前顺序'}
                   </small>
                 </div>
                 <label className={uploading ? 'button paper disabled' : 'button paper'}>
@@ -645,7 +1217,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                   <input
                     type='file'
                     hidden
-                    multiple={form.article_type === 'image'}
+                    multiple={form.article_type !== 'video'}
                     disabled={uploading}
                     accept={form.article_type === 'video'
                       ? 'video/mp4,video/quicktime,video/webm'
@@ -656,18 +1228,34 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
               </div>
               <div className='media-list'>
                 {(form.media_paths || []).map((path, index) => (
-                  <div key={`${path}-${index}`}>
-                    <span>{String(index + 1).padStart(2, '0')}</span>
+                  <div className='media-item' key={`${path}-${index}`}>
+                    {form.article_type !== 'video' && (
+                      <img src={mediaPreviewUrl(path)} alt='' loading='lazy' />
+                    )}
+                    <span className='media-order'>{String(index + 1).padStart(2, '0')}</span>
                     <b>{path.split(/[\\/]/).pop()}</b>
-                    <button
-                      type='button'
-                      onClick={() => set(
-                        'media_paths',
-                        form.media_paths.filter((_, itemIndex) => itemIndex !== index)
+                    <div className='media-item-actions'>
+                      {article && form.ai_result?.image_plan?.[index] && (
+                        <button
+                          type='button'
+                          className='regenerate'
+                          disabled={regeneratingImage !== null}
+                          onClick={() => regenerateImage(index)}
+                        >
+                          <WandSparkles size={13} />
+                          {regeneratingImage === index ? '重绘中…' : '重绘'}
+                        </button>
                       )}
-                    >
-                      移除
-                    </button>
+                      <button
+                        type='button'
+                        onClick={() => set(
+                          'media_paths',
+                          form.media_paths.filter((_, itemIndex) => itemIndex !== index)
+                        )}
+                      >
+                        移除
+                      </button>
+                    </div>
                   </div>
                 ))}
                 {!form.media_paths?.length && <p>还没有上传素材。</p>}
@@ -675,37 +1263,14 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
             </div>
           )}
           <div className='field full markdown-field'>
-            <div className='markdown-field-head'>
-              <span>Markdown 正文</span>
-              <div className='view-switch' role='group' aria-label='正文显示方式'>
-                <button
-                  type='button'
-                  className={contentView === 'edit' ? 'active' : ''}
-                  aria-pressed={contentView === 'edit'}
-                  onClick={() => setContentView('edit')}
-                >
-                  编辑
-                </button>
-                <button
-                  type='button'
-                  className={contentView === 'preview' ? 'active' : ''}
-                  aria-pressed={contentView === 'preview'}
-                  onClick={() => setContentView('preview')}
-                >
-                  预览
-                </button>
-              </div>
-            </div>
-            {contentView === 'edit'
-              ? (
-                <textarea
-                  className='content-editor'
-                  value={form.content_md}
-                  onChange={e => set('content_md', e.target.value)}
-                  placeholder='# 从这里开始写作'
-                />
-                )
-              : <MarkdownPreview markdown={form.content_md} />}
+            <Suspense fallback={<div className='markdown-loading'>正在加载编辑器…</div>}>
+              <MarkdownComposer
+                value={form.content_md}
+                mediaPaths={form.media_paths}
+                onChange={value => set('content_md', value)}
+                onUploadImages={uploadFiles}
+              />
+            </Suspense>
           </div>
           <label className='field full'>
             <span>封面图片 URL</span>
@@ -742,7 +1307,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                             platform_actions: {
                               ...current.platform_actions,
                               [key]: current.platform_actions?.[key] ||
-                                (key === 'wechat' ? 'draft' : 'publish')
+                                (DRAFT_PLATFORM_KEYS.includes(key) ? 'draft' : 'publish')
                             }
                           }))
                         }}
@@ -751,14 +1316,14 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                     </label>
                     <select
                       disabled={!form.target_platforms.includes(key)}
-                      value={form.platform_actions?.[key] || (key === 'wechat' ? 'draft' : 'publish')}
+                      value={form.platform_actions?.[key] || (DRAFT_PLATFORM_KEYS.includes(key) ? 'draft' : 'publish')}
                       onChange={e => set('platform_actions', {
                         ...form.platform_actions,
                         [key]: e.target.value
                       })}
                     >
-                      {key === 'wechat' && <option value='draft'>保存草稿</option>}
-                      <option value='publish'>直接发布</option>
+                      {DRAFT_PLATFORM_KEYS.includes(key) && <option value='draft'>保存草稿</option>}
+                      {PUBLISH_PLATFORM_KEYS.includes(key) && <option value='publish'>直接发布</option>}
                     </select>
                     {BROWSER_PLATFORM_KEYS.includes(key) && form.target_platforms.includes(key) && (
                       <select
@@ -860,32 +1425,6 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
         </footer>
       </section>
     </div>
-  )
-}
-
-function MarkdownPreview ({ markdown }) {
-  const html = useMemo(() => {
-    const source = (markdown || '').replace(/<empty-block\s*\/?>/gi, '')
-    return DOMPurify.sanitize(marked.parse(source, {
-      breaks: true,
-      gfm: true
-    }))
-  }, [markdown])
-
-  if (!(markdown || '').trim()) {
-    return (
-      <div className='markdown-preview empty'>
-        <span>PREVIEW</span>
-        <p>正文为空，切换到“编辑”开始写作。</p>
-      </div>
-    )
-  }
-
-  return (
-    <article
-      className='markdown-preview'
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
   )
 }
 
@@ -1043,40 +1582,8 @@ function Settings ({ data, platforms, notify, onSaved }) {
 
       <SettingsSection
         index='02'
-        title='微信公众号'
-        description='当前唯一已实现的发布通道，支持图文和图片消息。'
-        action={
-          <button
-            className='button paper'
-            disabled={testing === 'wechat'}
-            onClick={() => test('wechat', () => api.testPlatform('wechat'))}
-          >
-            {testing === 'wechat' ? '测试中…' : '验证凭据'}
-          </button>
-        }
-      >
-        <div className='settings-grid'>
-          <TextField label='AppID' value={form.wechat_app_id} onChange={v => set('wechat_app_id', v)} />
-          <TextField label='AppSecret' secret value={form.wechat_app_secret} onChange={v => set('wechat_app_secret', v)} />
-          <TextField
-            label='微信专用代理（留空直连）'
-            value={form.wechat_proxy_url}
-            onChange={v => set('wechat_proxy_url', v)}
-            placeholder='http://127.0.0.1:7890'
-          />
-        </div>
-        <Toggle
-          label='启用微信公众号'
-          note='关闭后，即使稿件选择了公众号也不会发布。'
-          checked={form.wechat_enabled}
-          onChange={v => set('wechat_enabled', v)}
-        />
-      </SettingsSection>
-
-      <SettingsSection
-        index='03'
-        title='Patchright 浏览器发布'
-        description='每个账号使用独立的本地 Chrome 会话；四个平台均支持视频，小红书另支持图文。'
+        title='浏览器发布通道'
+        description='每个账号使用独立的本地 Chrome 会话；公众号保存草稿，CSDN 支持草稿和直发，其余平台按各自能力发布。'
         action={
           <div className='settings-actions'>
             {BROWSER_PLATFORM_KEYS.map(key => (
@@ -1132,8 +1639,10 @@ function Settings ({ data, platforms, notify, onSaved }) {
         </div>
       </SettingsSection>
 
+      <ProxyDirectory notify={notify} />
+
       <SettingsSection
-        index='04'
+        index='03'
         title='AI 内容编辑'
         description='自动提取标签、生成摘要，并按目标平台生成可人工修改的内容版本。'
         action={
@@ -1151,6 +1660,35 @@ function Settings ({ data, platforms, notify, onSaved }) {
           <TextField label='API Key' secret value={form.ai_api_key} onChange={v => set('ai_api_key', v)} />
           <TextField label='模型名称' value={form.ai_model} onChange={v => set('ai_model', v)} placeholder='例如：gpt-5-mini' />
           <TextField label='AI 专用代理（留空直连）' value={form.ai_proxy_url} onChange={v => set('ai_proxy_url', v)} />
+          <div className='settings-subhead full'>
+            <b>图片生成</b>
+          </div>
+          <TextField
+            label='图片 API Base URL'
+            value={form.ai_image_base_url}
+            onChange={v => set('ai_image_base_url', v)}
+            placeholder='留空时复用上方 API Base URL'
+          />
+          <TextField
+            label='图片 API Key'
+            secret
+            value={form.ai_image_api_key}
+            onChange={v => set('ai_image_api_key', v)}
+            placeholder='留空时复用上方 API Key'
+          />
+          <TextField
+            label='图片模型'
+            value={form.ai_image_model}
+            onChange={v => set('ai_image_model', v)}
+            placeholder='例如：gpt-image-1'
+          />
+          <TextField
+            label='图片尺寸'
+            value={form.ai_image_size}
+            onChange={v => set('ai_image_size', v)}
+            placeholder='1024x1024'
+          />
+
           <label className='field full ai-prompt-field'>
             <span>自定义编辑要求</span>
             <textarea
@@ -1172,45 +1710,6 @@ function Settings ({ data, platforms, notify, onSaved }) {
           checked={form.ai_auto_enrich_after_sync}
           onChange={v => set('ai_auto_enrich_after_sync', v)}
         />
-      </SettingsSection>
-
-      <SettingsSection
-        index='05'
-        title='自动发布'
-        description='只处理发布方式为“自动”且状态为“待发布”的稿件。'
-      >
-        <div className='settings-grid compact-grid'>
-          <NumberField label='检查间隔（分钟）' value={form.auto_publish_interval_minutes} onChange={v => set('auto_publish_interval_minutes', v)} />
-          <label className='field'>
-            <span>新同步稿件默认方式</span>
-            <select value={form.default_publish_mode} onChange={e => set('default_publish_mode', e.target.value)}>
-              <option value='manual'>手动发布</option>
-              <option value='automatic'>自动发布</option>
-            </select>
-          </label>
-        </div>
-        <Toggle
-          label='启用自动发布'
-          note='建议先完成平台测试，并用一篇稿件手动验证。'
-          checked={form.auto_publish_enabled}
-          onChange={v => set('auto_publish_enabled', v)}
-        />
-      </SettingsSection>
-
-      <SettingsSection
-        index='06'
-        title='后续平台'
-        description='接口和发布记录已经预留，接入时无需改动文章模型。'
-      >
-        <div className='roadmap-grid'>
-          {platforms.filter(item => !item.implemented).map(platform => (
-            <article key={platform.key}>
-              <span>{PLATFORM_LABELS[platform.key]}</span>
-              <b>ADAPTER READY</b>
-              <p>模块已注册，登录与发布实现待下一阶段接入。</p>
-            </article>
-          ))}
-        </div>
       </SettingsSection>
 
       <div className='save-bar'>

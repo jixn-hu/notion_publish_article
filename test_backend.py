@@ -1,5 +1,8 @@
+import base64
+import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -19,6 +22,7 @@ from backend.platforms.channels import (
     ChannelsPublisher,
     _channels_text_profile,
 )
+from backend.platforms.csdn import _csdn_profile_text
 from backend.platforms.douyin import DouyinPublisher
 from backend.platforms.douyin import (
     _current_page as current_douyin_page,
@@ -66,6 +70,424 @@ class BackendApiTests(unittest.TestCase):
         self.client = self.client_context.__enter__()
         self.addCleanup(self.client_context.__exit__, None, None, None)
 
+    def test_account_browser_view_uses_account_profile(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "CSDN 主账号"},
+        ).json()
+        with patch.object(
+            backend.accounts,
+            "open_account_dashboard",
+            return_value={"platform": "csdn", "url": "https://mp.csdn.net/"},
+        ) as launcher:
+            response = self.client.post(f"/api/accounts/{account['id']}/browser")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["platform"], "csdn")
+        launcher.assert_called_once_with(
+            unittest.mock.ANY,
+        )
+        self.assertEqual(
+            launcher.call_args.args[0]["profile_dir"],
+            account["profile_dir"],
+        )
+    def test_wechat_account_browser_opens_saved_dashboard(self):
+        from backend.platforms.wechat_browser import _save_session_url
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "公众号主账号"},
+        ).json()
+        dashboard_url = (
+            "https://mp.weixin.qq.com/cgi-bin/home?"
+            "t=home/index&lang=zh_CN&token=123456"
+        )
+        _save_session_url(account, dashboard_url)
+        with patch.object(
+            backend.accounts,
+            "open_account_dashboard",
+            return_value={"platform": "wechat", "url": dashboard_url},
+        ) as launcher:
+            response = self.client.post(
+                f"/api/accounts/{account['id']}/browser"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        launcher.assert_called_once_with(
+            unittest.mock.ANY,
+            dashboard_url,
+        )
+    def test_csdn_login_check_rejects_visible_login_entry(self):
+        from backend.platforms.csdn import _is_logged_in
+
+        class Locator:
+            def __init__(self, count=0, visible=False):
+                self._count = count
+                self._visible = visible
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return self._count
+
+            def is_visible(self):
+                return self._visible
+
+        class Page:
+            url = "https://mp.csdn.net/mp_blog/creation/editor"
+
+            def get_by_text(self, text, exact=False):
+                return Locator(count=1, visible=True)
+
+            def locator(self, selector):
+                return Locator(count=1 if "manage/article" in selector else 0)
+
+        self.assertFalse(_is_logged_in(Page()))
+
+    def test_csdn_login_check_accepts_visible_profile_card(self):
+        from backend.platforms.csdn import _is_logged_in
+
+        class Locator:
+            def __init__(self, count=0, visible=False):
+                self._count = count
+                self._visible = visible
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return self._count
+
+            def is_visible(self):
+                return self._visible
+
+        class Page:
+            url = "https://mp.csdn.net/"
+
+            def get_by_text(self, text, exact=False):
+                return Locator()
+
+            def locator(self, selector):
+                return Locator(
+                    count=1 if selector == ".home-exp-user-card" else 0,
+                    visible=selector == ".home-exp-user-card",
+                )
+
+        self.assertTrue(_is_logged_in(Page()))
+
+    def test_wechat_login_check_rejects_root_page_with_qr_frame(self):
+        from backend.platforms.wechat_browser import _is_logged_in
+
+        class Locator:
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return 0
+
+            def is_visible(self):
+                return False
+
+        class Frame:
+            url = "https://open.weixin.qq.com/connect/qrconnect?appid=test"
+
+        class Page:
+            url = "https://mp.weixin.qq.com/"
+            frames = [Frame()]
+
+            def locator(self, selector):
+                return Locator()
+
+        self.assertFalse(_is_logged_in(Page()))
+
+    def test_wechat_login_check_rejects_empty_backend_shell(self):
+        from backend.platforms.wechat_browser import _is_logged_in
+
+        class Locator:
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self):
+                return ""
+
+        class Frame:
+            url = "https://mp.weixin.qq.com/cgi-bin/home"
+
+        class Page:
+            url = "https://mp.weixin.qq.com/cgi-bin/home?t=home/index&lang=zh_CN"
+            frames = [Frame()]
+
+            def locator(self, selector):
+                return Locator()
+
+        self.assertFalse(_is_logged_in(Page()))
+    def test_wechat_login_check_accepts_authenticated_backend_token(self):
+        from backend.platforms.wechat_browser import _is_logged_in
+
+        class Locator:
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return 0
+
+            def is_visible(self):
+                return False
+
+        class Frame:
+            url = "https://mp.weixin.qq.com/cgi-bin/home"
+
+        class Context:
+            def cookies(self, url):
+                return [
+                    {"name": "slave_sid"},
+                    {"name": "slave_user"},
+                    {"name": "bizuin"},
+                ]
+
+        class Page:
+            url = (
+                "https://mp.weixin.qq.com/cgi-bin/home?"
+                "t=home/index&lang=zh_CN&token=123456"
+            )
+            frames = [Frame()]
+            context = Context()
+
+            def locator(self, selector):
+                return Locator()
+
+        self.assertTrue(_is_logged_in(Page()))
+
+    def test_wechat_session_requires_all_backend_cookies(self):
+        from backend.platforms.wechat_browser import _has_authenticated_session
+
+        page = Mock()
+        page.context.cookies.return_value = [
+            {"name": "slave_sid"},
+            {"name": "slave_user"},
+        ]
+        self.assertFalse(_has_authenticated_session(page))
+
+        page.context.cookies.return_value.append({"name": "bizuin"})
+        self.assertTrue(_has_authenticated_session(page))
+    def test_wechat_article_images_are_local_and_deduplicated(self):
+        from backend.platforms.wechat_browser import _article_image_paths
+
+        first = Path(self.temp_dir.name) / "cover.png"
+        second = Path(self.temp_dir.name) / "body.jpg"
+        video = Path(self.temp_dir.name) / "clip.mp4"
+        first.write_bytes(b"image")
+        second.write_bytes(b"image")
+        video.write_bytes(b"video")
+        article = {
+            "cover_url": str(first),
+            "content_md": (
+                f"![cover]({first.as_posix()})\n"
+                f"![body]({second.as_posix()})"
+            ),
+            "media_paths": [str(second), str(video)],
+        }
+
+        self.assertEqual(
+            _article_image_paths(article),
+            [first.resolve(), second.resolve()],
+        )
+
+    def test_wechat_saved_draft_requires_appmsg_id(self):
+        from backend.platforms.wechat_browser import _saved_draft_id
+
+        self.assertEqual(
+            _saved_draft_id(
+                "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+                "t=media/appmsg_edit&appmsgid=100000004"
+            ),
+            "100000004",
+        )
+        self.assertEqual(
+            _saved_draft_id(
+                "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+                "t=media/appmsg_edit_v2&isNew=1"
+            ),
+            "",
+        )
+
+    def test_wechat_draft_waits_for_appmsgid_after_save(self):
+        from backend.platforms.wechat_browser import _save_wechat_draft
+
+        page = Mock()
+        page.url = (
+            "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+            "t=media/appmsg_edit_v2&isNew=1"
+        )
+        save_button = Mock()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.nth.return_value = save_button
+        save_button.is_visible.return_value = True
+        page.get_by_role.return_value = locator
+        save_button.click.side_effect = lambda: setattr(
+            page,
+            "url",
+            "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+            "t=media/appmsg_edit&appmsgid=100000004",
+        )
+
+        result = _save_wechat_draft(page)
+
+        page.get_by_role.assert_called_once_with(
+            "button",
+            name="保存为草稿",
+            exact=True,
+        )
+        save_button.click.assert_called_once_with()
+        self.assertIn("appmsgid=100000004", result)
+
+    def test_wechat_cover_follows_manual_crop_sequence(self):
+        from backend.platforms.wechat_browser import _select_wechat_cover
+
+        page = Mock()
+        selected = Mock()
+        selected.first = selected
+        selected.count.side_effect = [0, 1]
+        selected.is_visible.return_value = True
+        cover = Mock()
+        cover.first = cover
+        from_content = Mock()
+        from_content.first = from_content
+        image = Mock()
+        next_button = Mock()
+        confirm_button = Mock()
+
+        def visible_locator(item):
+            locator = Mock()
+            locator.count.return_value = 1
+            locator.nth.return_value = item
+            item.is_visible.return_value = True
+            return locator
+
+        image_locator = visible_locator(image)
+        button_locators = {
+            "下一步": visible_locator(next_button),
+            "确认": visible_locator(confirm_button),
+        }
+
+        def page_locator(selector):
+            return {
+                ".js_share_type_image": selected,
+                ".js_cover_btn_area": cover,
+                "a.js_selectCoverFromContent": from_content,
+                ".card_mask_global.apmsg_content_img_mask": image_locator,
+            }[selector]
+
+        page.locator.side_effect = page_locator
+        page.get_by_role.side_effect = (
+            lambda role, name, exact: button_locators[name]
+        )
+
+        _select_wechat_cover(page)
+
+        cover.click.assert_called_once_with()
+        from_content.click.assert_called_once_with()
+        image.click.assert_called_once_with()
+        next_button.click.assert_called_once_with()
+        confirm_button.click.assert_called_once_with()
+    def test_wechat_publish_uses_v2_editor_and_waits_after_save(self):
+        from contextlib import nullcontext
+
+        from backend.platforms.wechat_browser import WechatPublisher
+
+        page = Mock()
+        article = {
+            "title": "公众号草稿",
+            "author": "作者",
+            "content_md": "正文",
+            "platform_accounts": {"wechat": 3},
+        }
+        editor_url = (
+            "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+            "t=media/appmsg_edit_v2&action=edit&isNew=1&"
+            "type=77&createType=0&token=123456&lang=zh_CN"
+        )
+        saved_url = (
+            "https://mp.weixin.qq.com/cgi-bin/appmsg?"
+            "t=media/appmsg_edit&appmsgid=100000004"
+        )
+        image = Path(self.temp_dir.name) / "cover.png"
+        with (
+            patch(
+                "backend.platforms.wechat_browser.resolve_publish_account",
+                return_value={"id": 3},
+            ),
+            patch(
+                "backend.platforms.wechat_browser.open_account_browser",
+                return_value=nullcontext(Mock()),
+            ),
+            patch(
+                "backend.platforms.wechat_browser.get_or_create_page",
+                return_value=page,
+            ),
+            patch(
+                "backend.platforms.wechat_browser._new_article_url",
+                return_value=editor_url,
+            ),
+            patch(
+                "backend.platforms.wechat_browser._is_logged_in",
+                return_value=True,
+            ),
+            patch(
+                "backend.platforms.wechat_browser._fill_wechat_editor"
+            ) as fill_editor,
+            patch(
+                "backend.platforms.wechat_browser._article_image_paths",
+                return_value=[image],
+            ),
+            patch(
+                "backend.platforms.wechat_browser._upload_wechat_images",
+                return_value=1,
+            ) as upload_images,
+            patch(
+                "backend.platforms.wechat_browser._select_wechat_cover"
+            ) as select_cover,
+            patch(
+                "backend.platforms.wechat_browser._save_wechat_draft",
+                return_value=saved_url,
+            ) as save_draft,
+        ):
+            result = WechatPublisher({}).publish(article, action="draft")
+
+        page.goto.assert_called_once_with(
+            editor_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        fill_editor.assert_called_once_with(page, article)
+        upload_images.assert_called_once_with(page, [image])
+        select_cover.assert_called_once_with(page)
+        save_draft.assert_called_once_with(page)
+        self.assertEqual(
+            [call.args[0] for call in page.wait_for_timeout.call_args_list],
+            [3000, 3000],
+        )
+        self.assertEqual(result["external_id"], saved_url)
+        self.assertEqual(result["status"], "drafted")
+    def test_wechat_profile_text_extracts_wechat_id(self):
+        from backend.platforms.wechat_browser import _wechat_profile_text
+
+        self.assertEqual(
+            _wechat_profile_text("账号信息\n微信号：demo_account"),
+            {"platform_user_id": "demo_account"},
+        )
     def test_health_and_platform_registry(self):
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
@@ -84,7 +506,7 @@ class BackendApiTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(item["implemented"] for item in platforms[:5]))
-        self.assertFalse(platforms[5]["implemented"])
+        self.assertTrue(platforms[5]["implemented"])
 
     def test_browser_video_platform_accounts_and_content_boundary(self):
         for key in ("xiaohongshu", "douyin", "channels", "bilibili"):
@@ -156,6 +578,213 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(_parse_profile_count("3,197"), 3197)
         self.assertIsNone(_parse_profile_count("暂无"))
 
+    def test_csdn_profile_text_metrics(self):
+        profile = _csdn_profile_text(
+            "3\u539f\u521b 12\u7c89\u4e1d \u603b\u9605\u8bfb\u91cf 2.3\u4e07 \u6536\u85cf\u6570 9"
+        )
+        self.assertEqual(profile["works_count"], 3)
+        self.assertEqual(profile["followers_count"], 12)
+        self.assertEqual(profile["read_count"], 23000)
+        self.assertEqual(profile["favorites_count"], 9)
+
+    def test_csdn_publish_opens_editor_directly_and_closes_ai(self):
+        from contextlib import nullcontext
+
+        from backend.platforms.csdn import (
+            CsdnPublisher,
+            EDITOR_URL,
+            TITLE_SELECTOR,
+        )
+
+        page = Mock()
+        title_input = Mock()
+        save = Mock()
+        page.locator.return_value.first = title_input
+        page.get_by_role.return_value.first = save
+        article = {
+            "title": "CSDN draft",
+            "content_md": "Draft body",
+            "platform_accounts": {"csdn": 2},
+        }
+        with (
+            patch(
+                "backend.platforms.csdn.resolve_publish_account",
+                return_value={"id": 2},
+            ),
+            patch(
+                "backend.platforms.csdn.open_account_browser",
+                return_value=nullcontext(Mock()),
+            ),
+            patch("backend.platforms.csdn.get_or_create_page", return_value=page),
+            patch("backend.platforms.csdn._close_recent_draft_prompt") as close_draft_prompt,
+            patch("backend.platforms.csdn._close_ai_assistant") as close_ai,
+            patch("backend.platforms.csdn.replace_text"),
+            patch("backend.platforms.csdn._prepare_editor_html") as prepare_editor,
+            patch("backend.platforms.csdn._wait_for_draft_saved") as wait_saved,
+        ):
+            result = CsdnPublisher({}).publish(article, action="draft")
+
+        self.assertEqual(
+            [call.args[0] for call in page.goto.call_args_list],
+            [EDITOR_URL],
+        )
+        page.locator.assert_called_once_with(TITLE_SELECTOR)
+        page.get_by_role.assert_called_once_with(
+            "button", name="保存草稿", exact=True
+        )
+        close_draft_prompt.assert_called_once_with(page)
+        close_ai.assert_called_once_with(page)
+        prepare_editor.assert_called_once_with(page, "Draft body")
+        wait_saved.assert_called_once_with(page)
+        page.wait_for_timeout.assert_called_once_with(3000)
+        self.assertEqual(result["status"], "drafted")
+
+    def test_csdn_can_publish_directly_and_waits_before_closing(self):
+        from contextlib import nullcontext
+
+        from backend.platforms.csdn import CsdnPublisher
+
+        page = Mock()
+        title_input = Mock()
+        page.locator.return_value.first = title_input
+        article = {
+            "title": "CSDN publish",
+            "content_md": "Publish body",
+            "tags": ["Python", "自动化"],
+            "platform_accounts": {"csdn": 2},
+        }
+        with (
+            patch(
+                "backend.platforms.csdn.resolve_publish_account",
+                return_value={"id": 2},
+            ),
+            patch(
+                "backend.platforms.csdn.open_account_browser",
+                return_value=nullcontext(Mock()),
+            ),
+            patch("backend.platforms.csdn.get_or_create_page", return_value=page),
+            patch("backend.platforms.csdn._close_recent_draft_prompt"),
+            patch("backend.platforms.csdn._close_ai_assistant"),
+            patch("backend.platforms.csdn.replace_text"),
+            patch("backend.platforms.csdn._prepare_editor_html"),
+            patch("backend.platforms.csdn._fill_publish_tags") as fill_tags,
+            patch("backend.platforms.csdn._publish_blog") as publish_blog,
+        ):
+            result = CsdnPublisher({}).publish(article, action="publish")
+
+        fill_tags.assert_called_once_with(page, ["Python", "自动化"])
+        publish_blog.assert_called_once_with(page)
+        page.wait_for_timeout.assert_called_once_with(3000)
+        self.assertEqual(result["status"], "published")
+
+    def test_csdn_publish_retries_when_editor_is_still_saving(self):
+        from backend.platforms.csdn import _publish_blog
+
+        page = Mock()
+        submit = Mock()
+        page.get_by_role.return_value.first = submit
+        with (
+            patch("backend.platforms.csdn._wait_for_editor_ready") as wait_ready,
+            patch(
+                "backend.platforms.csdn._wait_for_publish_success",
+                side_effect=[
+                    RuntimeError("CSDN 发布失败：文章正在保存，请耐心等待。"),
+                    None,
+                ],
+            ) as wait_success,
+        ):
+            _publish_blog(page)
+
+        self.assertEqual(wait_ready.call_count, 2)
+        self.assertEqual(submit.click.call_count, 2)
+        self.assertEqual(wait_success.call_count, 2)
+    def test_csdn_publish_tags_accepts_existing_automatic_tag(self):
+        from backend.platforms.csdn import _fill_publish_tags
+
+        page = Mock()
+        with patch(
+            "backend.platforms.csdn._selected_publish_tags",
+            return_value=["notion"],
+        ):
+            _fill_publish_tags(page, ["Notion入门", "效率工具"])
+
+        page.get_by_role.assert_not_called()
+
+    def test_csdn_uploads_local_images_before_setting_final_html(self):
+        from backend.platforms.csdn import _prepare_editor_html
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "article.png"
+            image_path.write_bytes(b"image")
+            markdown_text = (
+                f"Before\n\n![diagram]({image_path.as_posix()})\n\nAfter"
+            )
+            page = Mock()
+            with (
+                patch("backend.platforms.csdn._set_editor_html") as set_editor,
+                patch(
+                    "backend.platforms.csdn._upload_csdn_image",
+                    return_value="https://img-blog.csdnimg.cn/article.png",
+                ) as upload_image,
+            ):
+                final_html = _prepare_editor_html(page, markdown_text)
+
+        self.assertEqual(set_editor.call_count, 2)
+        self.assertNotIn("<img", set_editor.call_args_list[0].args[1])
+        self.assertIn("https://img-blog.csdnimg.cn/article.png", final_html)
+        self.assertEqual(set_editor.call_args_list[1].args[1], final_html)
+        upload_image.assert_called_once_with(page, image_path.resolve())
+
+    def test_csdn_rejects_missing_local_image_before_save(self):
+        from backend.platforms.csdn import _prepare_editor_html
+
+        missing = (Path(tempfile.gettempdir()) / "missing-csdn-image.png").as_posix()
+        with self.assertRaisesRegex(ValueError, "本地配图不存在"):
+            _prepare_editor_html(Mock(), f"![missing]({missing})")
+
+    def test_csdn_closes_visible_ai_assistant(self):
+        from backend.platforms.csdn import (
+            AI_ASSISTANT_CLOSE_SELECTOR,
+            AI_ASSISTANT_DRAWER_SELECTOR,
+            _close_ai_assistant,
+        )
+
+        page = Mock()
+        drawer = Mock()
+        close = Mock()
+        page.locator.return_value.first = drawer
+        drawer.locator.return_value.first = close
+
+        self.assertTrue(_close_ai_assistant(page))
+
+        page.locator.assert_called_once_with(AI_ASSISTANT_DRAWER_SELECTOR)
+        drawer.locator.assert_called_once_with(AI_ASSISTANT_CLOSE_SELECTOR)
+        close.click.assert_called_once_with()
+        drawer.wait_for.assert_any_call(state="hidden", timeout=5_000)
+
+    def test_csdn_editor_targets_recorded_ckeditor_frame(self):
+        from backend.platforms.csdn import (
+            EDITOR_BODY_SELECTOR,
+            EDITOR_FRAME_SELECTOR,
+            _set_editor_html,
+        )
+
+        page = Mock()
+        frame = Mock()
+        editor = Mock()
+        page.frame_locator.return_value = frame
+        frame.locator.return_value.first = editor
+
+        _set_editor_html(page, "<p>Draft body</p>")
+
+        page.frame_locator.assert_called_once_with(EDITOR_FRAME_SELECTOR)
+        frame.locator.assert_called_once_with(EDITOR_BODY_SELECTOR)
+        editor.wait_for.assert_called_once_with(
+            state="visible", timeout=30_000
+        )
+        editor.evaluate.assert_called_once()
+        page.evaluate.assert_called_once()
+
     def test_douyin_profile_text_metrics(self):
         profile = _douyin_text_profile(
             "抖音号：dy123\n关注数 12\n粉丝数 1.2万\n"
@@ -181,6 +810,10 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(profile["likes_count"], 2406)
 
     def test_douyin_and_channels_profile_handlers_are_registered(self):
+        self.assertIn(
+            "wechat",
+            backend.accounts.ACCOUNT_PROFILE_HANDLERS,
+        )
         self.assertIn(
             "douyin",
             backend.accounts.ACCOUNT_PROFILE_HANDLERS,
@@ -751,6 +1384,621 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("secret-token", safe_url)
         self.assertNotIn("secret-signature", safe_error)
         self.assertNotIn("secret-token", safe_error)
+
+
+    def test_frontend_index_is_not_cached(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+
+    def test_generate_article_creates_local_image_draft(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        image_dir = backend.media.MEDIA_DIR / "ai"
+        image_dir.mkdir(parents=True)
+        first = image_dir / "cover.png"
+        second = image_dir / "detail.png"
+        first.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+        second.write_bytes(b"\x89PNG\r\n\x1a\ndetail")
+        generated = {
+            "title": "一篇生成稿",
+            "summary": "生成摘要",
+            "content_md": "开头\n\n<!-- image:1 -->\n\n结尾\n\n<!-- image:2 -->",
+            "tags": ["AI", "写作"],
+            "image_plan": [
+                {
+                    "position": "image:1",
+                    "alt": "封面",
+                    "prompt": "封面提示词",
+                    "purpose": "封面",
+                },
+                {
+                    "position": "image:2",
+                    "alt": "细节",
+                    "prompt": "细节提示词",
+                    "purpose": "正文",
+                },
+            ],
+        }
+        images = [
+            {**generated["image_plan"][0], "path": str(first.resolve())},
+            {**generated["image_plan"][1], "path": str(second.resolve())},
+        ]
+
+        with (
+            patch(
+                "backend.services.AIContentService.generate_article",
+                return_value=generated,
+            ),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                return_value=images,
+            ),
+        ):
+            response = self.client.post(
+                "/api/articles/generate",
+                json={
+                    "topic": "本地图片生成测试",
+                    "article_type": "image",
+                    "word_count": 700,
+                    "image_count": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 201)
+        article = response.json()
+        self.assertEqual(article["article_type"], "image")
+        self.assertEqual(article["media_paths"], [str(first.resolve()), str(second.resolve())])
+        self.assertEqual(article["cover_url"], str(first.resolve()))
+        self.assertIn(f"![封面]({first.resolve().as_posix()})", article["content_md"])
+        self.assertNotIn("<!-- image:", article["content_md"])
+        self.assertEqual(article["ai_result"]["source"], "generated")
+
+    def test_material_library_file_note_edit_and_bulk_download(self):
+        image_response = self.client.post(
+            "/api/materials/files",
+            files={"file": ("参考图.png", b"\x89PNG\r\n\x1a\nmaterial", "image/png")},
+        )
+        self.assertEqual(image_response.status_code, 201)
+        image = image_response.json()
+        note_response = self.client.post(
+            "/api/materials/notes",
+            json={
+                "title": "采访要点",
+                "content_md": "核心事实与表达边界",
+                "description": "用于 AI 写作",
+                "tags": ["采访", "事实"],
+            },
+        )
+        self.assertEqual(note_response.status_code, 201)
+        note = note_response.json()
+
+        listed = self.client.get("/api/materials").json()
+        self.assertEqual(listed["counts"]["all"], 2)
+        self.assertEqual(listed["counts"]["image"], 1)
+        self.assertEqual(listed["counts"]["note"], 1)
+
+        updated = self.client.patch(
+            f"/api/materials/{note['id']}",
+            json={"title": "采访卡片", "content_md": "更新后的事实边界"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["title"], "采访卡片")
+
+        preview = self.client.get(f"/api/materials/{image['id']}/file")
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.content, b"\x89PNG\r\n\x1a\nmaterial")
+
+        archive = self.client.post(
+            "/api/materials/download",
+            json={"ids": [image["id"], note["id"]]},
+        )
+        self.assertEqual(archive.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
+            names = bundle.namelist()
+            self.assertIn("materials-manifest.json", names)
+            self.assertTrue(any(name.endswith(".png") for name in names))
+            self.assertTrue(any(name.endswith(".md") for name in names))
+
+        bulk_ids = [image["id"], note["id"]]
+        for index in range(20):
+            response = self.client.post(
+                "/api/materials/notes",
+                json={
+                    "title": f"批量素材 {index}",
+                    "content_md": f"批量下载测试内容 {index}",
+                },
+            )
+            self.assertEqual(response.status_code, 201)
+            bulk_ids.append(response.json()["id"])
+        bulk_archive = self.client.post(
+            "/api/materials/download",
+            json={"ids": bulk_ids},
+        )
+        self.assertEqual(bulk_archive.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(bulk_archive.content)) as bundle:
+            self.assertEqual(len(bundle.namelist()), len(bulk_ids) + 1)
+
+        image_path = Path(image["path"])
+        deleted = self.client.delete(f"/api/materials/{image['id']}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(image_path.exists())
+
+    def test_storyboard_generation_receives_selected_material_context(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        note = self.client.post(
+            "/api/materials/notes",
+            json={
+                "title": "产品事实",
+                "content_md": "只允许使用本地部署和批量发布两个卖点",
+                "tags": ["产品"],
+            },
+        ).json()
+        storyboard = {
+            "title": "素材驱动分镜",
+            "summary": "摘要",
+            "caption_md": "发布文案",
+            "tags": ["产品"],
+            "visual_style": {},
+            "pages": [
+                {
+                    "index": 0,
+                    "role": "cover",
+                    "headline": "本地内容工作台",
+                    "body": "",
+                    "visual": "桌面工作场景",
+                    "layout": "标题居中",
+                }
+            ],
+        }
+        with patch(
+            "backend.services.AIContentService.generate_image_storyboard",
+            return_value=storyboard,
+        ) as generate:
+            response = self.client.post(
+                "/api/articles/generate-storyboard",
+                json={
+                    "topic": "产品介绍",
+                    "article_type": "image",
+                    "image_count": 1,
+                    "material_ids": [note["id"]],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        specification = generate.call_args.args[0]
+        self.assertEqual(specification["material_ids"], [note["id"]])
+        self.assertIn("本地部署和批量发布", specification["materials"])
+
+    def test_article_list_filters_content_type(self):
+        for title, article_type in [
+            ("长文章", "article"),
+            ("图文稿", "image"),
+            ("视频稿", "video"),
+        ]:
+            response = self.client.post(
+                "/api/articles",
+                json={"title": title, "article_type": article_type},
+            )
+            self.assertEqual(response.status_code, 201)
+
+        response = self.client.get(
+            "/api/articles",
+            params={"article_type": "image"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [(item["title"], item["article_type"]) for item in response.json()],
+            [("图文稿", "image")],
+        )
+    def test_generate_image_storyboard_returns_editable_pages(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        storyboard = {
+            "title": "分镜标题",
+            "summary": "分镜摘要",
+            "caption_md": "发布文案",
+            "tags": ["图文"],
+            "visual_style": {
+                "direction": "编辑设计",
+                "palette": ["#ffffff", "#111111", "#d9483b"],
+                "typography": "清晰中文黑体",
+                "graphics": "扁平图形",
+                "composition": "统一网格",
+            },
+            "pages": [
+                {
+                    "index": 0,
+                    "role": "cover",
+                    "headline": "封面",
+                    "body": "",
+                    "visual": "明确主体",
+                    "layout": "居中标题",
+                },
+                {
+                    "index": 1,
+                    "role": "content",
+                    "headline": "重点",
+                    "body": "简短正文",
+                    "visual": "信息图",
+                    "layout": "上下结构",
+                },
+            ],
+        }
+        with patch(
+            "backend.services.AIContentService.generate_image_storyboard",
+            return_value=storyboard,
+        ) as generate:
+            response = self.client.post(
+                "/api/articles/generate-storyboard",
+                json={
+                    "topic": "两页图文",
+                    "article_type": "image",
+                    "image_count": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["pages"][0]["role"], "cover")
+        self.assertEqual(response.json()["pages"][1]["headline"], "重点")
+        self.assertEqual(generate.call_args.args[0]["image_count"], 2)
+
+    def test_generate_image_article_uses_reviewed_storyboard(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        image_dir = backend.media.MEDIA_DIR / "ai"
+        image_dir.mkdir(parents=True)
+        cover = image_dir / "story-cover.png"
+        cover.write_bytes(b"\x89PNG\r\n\x1a\nstory-cover")
+        storyboard = {
+            "title": "确认后的标题",
+            "summary": "确认后的摘要",
+            "caption_md": "确认后的发布文案",
+            "tags": ["分镜"],
+            "visual_style": {
+                "direction": "编辑设计",
+                "palette": ["#ffffff", "#111111"],
+                "typography": "清晰中文黑体",
+                "graphics": "信息图",
+                "composition": "统一网格",
+            },
+            "pages": [
+                {
+                    "index": 0,
+                    "role": "cover",
+                    "headline": "确认后的封面",
+                    "body": "",
+                    "visual": "明确主体",
+                    "layout": "居中标题",
+                },
+            ],
+        }
+
+        def generated_images(plans):
+            self.assertEqual(len(plans), 1)
+            self.assertIn("全套统一视觉规范", plans[0]["prompt"])
+            return [{**plans[0], "path": str(cover.resolve())}]
+
+        with (
+            patch(
+                "backend.services.AIContentService.generate_article",
+            ) as generate_article,
+            patch(
+                "backend.services.AIImageService.generate_images",
+                side_effect=generated_images,
+            ),
+        ):
+            response = self.client.post(
+                "/api/articles/generate",
+                json={
+                    "topic": "已确认的图文",
+                    "article_type": "image",
+                    "word_count": 700,
+                    "image_count": 1,
+                    "storyboard": storyboard,
+                },
+            )
+
+        self.assertEqual(response.status_code, 201)
+        article = response.json()
+        self.assertEqual(article["title"], "确认后的标题")
+        self.assertEqual(article["ai_result"]["storyboard"]["pages"][0]["headline"], "确认后的封面")
+        self.assertIn("确认后的发布文案", article["content_md"])
+        generate_article.assert_not_called()
+
+    def test_regenerate_ai_image_replaces_saved_references(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        image_dir = backend.media.MEDIA_DIR / "ai"
+        image_dir.mkdir(parents=True)
+        old_image = image_dir / "old.png"
+        new_image = image_dir / "new.png"
+        old_image.write_bytes(b"\x89PNG\r\n\x1a\nold")
+        new_image.write_bytes(b"\x89PNG\r\n\x1a\nnew")
+        old_source = old_image.resolve().as_posix()
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "可重绘图文",
+                "article_type": "image",
+                "content_md": f"![封面]({old_source})",
+                "cover_url": str(old_image.resolve()),
+                "media_paths": [str(old_image.resolve())],
+            },
+        ).json()
+        ai_result = {
+            "source": "generated",
+            "image_plan": [
+                {
+                    "position": "image:1",
+                    "alt": "封面",
+                    "purpose": "cover",
+                    "prompt": "保持统一风格的封面",
+                }
+            ],
+            "generated_images": [
+                {
+                    "position": "image:1",
+                    "alt": "封面",
+                    "purpose": "cover",
+                    "prompt": "保持统一风格的封面",
+                    "path": str(old_image.resolve()),
+                }
+            ],
+        }
+        self.client.patch(
+            f"/api/articles/{article['id']}",
+            json={"ai_result": ai_result},
+        )
+        replacement = {
+            **ai_result["image_plan"][0],
+            "path": str(new_image.resolve()),
+        }
+        with (
+            patch(
+                "backend.services.AIImageService.generate_images",
+                return_value=[replacement],
+            ),
+            patch("backend.services.MEDIA_DIR", backend.media.MEDIA_DIR),
+        ):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/images/0/regenerate"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        updated = response.json()
+        self.assertEqual(updated["cover_url"], str(new_image.resolve()))
+        self.assertEqual(updated["media_paths"], [str(new_image.resolve())])
+        self.assertIn(new_image.resolve().as_posix(), updated["content_md"])
+        self.assertFalse(old_image.exists())
+    def test_ai_image_service_writes_valid_base64_image(self):
+        from backend.ai_generation import AIImageService
+
+        png = b"\x89PNG\r\n\x1a\n" + b"test-image"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [{"b64_json": base64.b64encode(png).decode("ascii")}],
+        }
+        service = AIImageService(
+            {
+                "ai_image_base_url": "",
+                "ai_base_url": "https://example.test/v1",
+                "ai_image_api_key": "",
+                "ai_api_key": "secret",
+                "ai_image_model": "image-model",
+                "ai_image_size": "1024x1024",
+                "ai_proxy_url": "",
+            }
+        )
+        with patch.object(service.session, "post", return_value=response):
+            images = service.generate_images(
+                [{"position": "image:1", "alt": "测试图", "prompt": "一张测试图"}]
+            )
+
+        path = Path(images[0]["path"])
+        self.assertEqual(path.parent, (backend.media.MEDIA_DIR / "ai").resolve())
+        self.assertEqual(path.read_bytes(), png)
+
+    def test_media_preview_only_serves_images_under_media_root(self):
+        image = backend.media.MEDIA_DIR / "ai" / "preview.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+        outside = Path(self.temp_dir.name) / "outside.png"
+        outside.write_bytes(b"\x89PNG\r\n\x1a\noutside")
+
+        response = self.client.get("/api/media/file", params={"path": str(image)})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, image.read_bytes())
+
+        response = self.client.get("/api/media/file", params={"path": str(outside)})
+        self.assertEqual(response.status_code, 400)
+
+        missing = backend.media.MEDIA_DIR / "missing.png"
+        response = self.client.get("/api/media/file", params={"path": str(missing)})
+        self.assertEqual(response.status_code, 404)
+
+    def test_generate_article_validates_enabled_and_image_count(self):
+        disabled = self.client.post(
+            "/api/articles/generate",
+            json={"topic": "未启用 AI", "article_type": "article"},
+        )
+        self.assertEqual(disabled.status_code, 400)
+        self.assertIn("尚未启用", disabled.json()["detail"])
+
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        invalid = self.client.post(
+            "/api/articles/generate",
+            json={
+                "topic": "图文必须有图",
+                "article_type": "image",
+                "image_count": 0,
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("至少需要生成 1 张图片", invalid.json()["detail"])
+
+    def test_news_library_crud_and_duplicate_url(self):
+        created = self.client.post(
+            "/api/news",
+            json={
+                "title": "行业更新",
+                "source_name": "示例资讯",
+                "source_url": "https://example.com/news/1#section",
+                "summary": "一条可供 AI 参考的外部资讯。",
+                "content_md": "正文事实与背景。",
+                "tags": ["行业", "趋势"],
+                "published_at": "2026-07-26T10:00",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        item = created.json()
+        self.assertEqual(item["source_url"], "https://example.com/news/1")
+        self.assertEqual(item["tags"], ["行业", "趋势"])
+
+        listing = self.client.get("/api/news", params={"q": "外部资讯"})
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual([row["id"] for row in listing.json()["items"]], [item["id"]])
+        self.assertEqual(listing.json()["counts"], {"all": 1, "sources": 1})
+
+        updated = self.client.patch(
+            f"/api/news/{item['id']}",
+            json={"summary": "已经人工校正的摘要", "author": "编辑部"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["author"], "编辑部")
+
+        duplicate = self.client.post(
+            "/api/news",
+            json={
+                "title": "重复资讯",
+                "source_url": "https://example.com/news/1",
+            },
+        )
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertIn("已经采集", duplicate.json()["detail"])
+
+        deleted = self.client.delete(f"/api/news/{item['id']}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/news").json()["items"], [])
+
+    def test_news_collect_extracts_public_web_page(self):
+        html = """
+        <html>
+          <head>
+            <title>普通标题</title>
+            <meta property="og:title" content="采集标题">
+            <meta property="og:site_name" content="示例站点">
+            <meta name="description" content="采集摘要">
+            <meta name="author" content="资讯作者">
+            <meta property="article:published_time" content="2026-07-25T08:00:00+08:00">
+          </head>
+          <body>
+            <nav>导航内容</nav>
+            <article>
+              <h1>采集标题</h1>
+              <p>第一段有效正文，包含重要事实。</p>
+              <p>第二段有效正文，提供更多背景。</p>
+            </article>
+          </body>
+        </html>
+        """
+        response = Mock(
+            status_code=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            content=html.encode("utf-8"),
+            encoding="utf-8",
+        )
+        response.raise_for_status.return_value = None
+        with (
+            patch("backend.news._validate_public_host"),
+            patch("backend.news.requests.Session") as client_factory,
+        ):
+            client_factory.return_value.__enter__.return_value.get.return_value = response
+            collected = self.client.post(
+                "/api/news/collect",
+                json={"url": "https://example.com/story"},
+            )
+
+        self.assertEqual(collected.status_code, 201)
+        item = collected.json()
+        self.assertEqual(item["title"], "采集标题")
+        self.assertEqual(item["source_name"], "示例站点")
+        self.assertEqual(item["author"], "资讯作者")
+        self.assertIn("第一段有效正文", item["content_md"])
+        self.assertNotIn("导航内容", item["content_md"])
+
+    def test_generate_article_receives_and_links_news_context(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        news = self.client.post(
+            "/api/news",
+            json={
+                "title": "公开资料",
+                "source_name": "官方站点",
+                "source_url": "https://example.com/reference",
+                "summary": "明确事实：产品于七月更新。",
+                "content_md": "更新包含资讯引用能力。",
+                "published_at": "2026-07-20",
+            },
+        ).json()
+        generated = {
+            "title": "资讯参考稿",
+            "summary": "摘要",
+            "content_md": "正文",
+            "tags": ["资讯"],
+            "image_plan": [],
+        }
+        with (
+            patch(
+                "backend.services.AIContentService.generate_article",
+                return_value=generated,
+            ) as generate,
+            patch(
+                "backend.services.AIImageService.generate_images",
+                return_value=[],
+            ),
+        ):
+            response = self.client.post(
+                "/api/articles/generate",
+                json={
+                    "topic": "资讯引用测试",
+                    "article_type": "article",
+                    "word_count": 800,
+                    "image_count": 0,
+                    "news_ids": [news["id"]],
+                },
+            )
+
+        self.assertEqual(response.status_code, 201)
+        article = response.json()
+        specification = generate.call_args.args[0]
+        self.assertEqual(specification["news_ids"], [news["id"]])
+        self.assertIn("产品于七月更新", specification["news"])
+        self.assertIn("https://example.com/reference", specification["news"])
+        self.assertEqual(article["ai_result"]["news_ids"], [news["id"]])
+        with backend.db.connection() as conn:
+            linked = conn.execute(
+                "SELECT news_id FROM article_news WHERE article_id = ?",
+                (article["id"],),
+            ).fetchall()
+        self.assertEqual([row["news_id"] for row in linked], [news["id"]])
 
     @staticmethod
     def _notion_article(source_key, page_id, title):
