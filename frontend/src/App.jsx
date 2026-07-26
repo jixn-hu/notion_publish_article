@@ -142,7 +142,7 @@ function App () {
         <div className='brand'>
           <span className='brand-seal'>墨</span>
           <div>
-            <strong>墨舟</strong>
+            <strong>墨流</strong>
             <small>CONTENT DESK</small>
           </div>
         </div>
@@ -275,7 +275,7 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
         <div className='banner-copy'>
           <span className='section-number'>VOL. 01 / 今日编务</span>
           <h2>让内容先归档，<br /><em>再抵达每一个平台。</em></h2>
-          <p>Notion 是内容源，墨舟负责同步、编排、发布与留痕。</p>
+          <p>Notion 是内容源，墨流负责同步、编排、发布与留痕。</p>
         </div>
         <div className='banner-stamp'>
           <span>自动调度</span>

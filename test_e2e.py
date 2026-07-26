@@ -37,7 +37,7 @@ with sync_playwright() as playwright:
     platform_select.select_option("bilibili")
     assert page.get_by_role("button", name="查看账号").first.is_visible()
     assert page.get_by_role("button", name="＋ 添加Bilibili账号").is_visible()
-    account_screenshot = Path("artifacts/mozhou-publisher-accounts.png")
+    account_screenshot = Path("artifacts/moflow-accounts.png")
     account_screenshot.parent.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(account_screenshot), full_page=True)
 
@@ -57,7 +57,7 @@ with sync_playwright() as playwright:
     page.wait_for_selector(".settings-section h3")
     assert page.get_by_role("heading", name="自动发布").is_visible()
 
-    screenshot = Path("artifacts/mozhou-publisher-settings.png")
+    screenshot = Path("artifacts/moflow-settings.png")
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(screenshot), full_page=True)
     assert not browser_errors, browser_errors
