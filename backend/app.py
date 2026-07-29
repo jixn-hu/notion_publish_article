@@ -29,6 +29,13 @@ from backend.accounts import (
     update_account_proxy,
     update_wechat_account_settings,
 )
+from backend.canvases import (
+    create_canvas,
+    delete_canvas,
+    get_canvas,
+    list_canvases,
+    update_canvas,
+)
 from backend.db import init_db
 from backend.media import resolve_media_file, save_upload
 from backend.materials import (
@@ -222,6 +229,17 @@ class ArticleUpdatePayload(BaseModel):
     platform_accounts: dict[str, int] | None = None
     ai_result: dict[str, Any] | None = None
     status: str | None = None
+
+
+class CanvasPayload(BaseModel):
+    title: str = Field(default="未命名画布", max_length=120)
+    document: dict[str, Any] = Field(default_factory=dict)
+
+
+class CanvasUpdatePayload(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    document: dict[str, Any] | None = None
+    version: int | None = Field(default=None, ge=1)
 
 
 class MaterialNotePayload(BaseModel):
@@ -449,6 +467,35 @@ def media_post(file: UploadFile = File(...)):
 @app.get("/api/media/file")
 def media_file(path: str = Query(min_length=1, max_length=1000)):
     return FileResponse(api_call(resolve_media_file, path))
+
+
+@app.get("/api/canvases")
+def canvases_get():
+    return api_call(list_canvases)
+
+
+@app.post("/api/canvases", status_code=201)
+def canvases_post(payload: CanvasPayload):
+    return api_call(create_canvas, payload.model_dump())
+
+
+@app.get("/api/canvases/{canvas_id}")
+def canvas_get(canvas_id: int):
+    return api_call(get_canvas, canvas_id)
+
+
+@app.patch("/api/canvases/{canvas_id}")
+def canvas_patch(canvas_id: int, payload: CanvasUpdatePayload):
+    return api_call(
+        update_canvas,
+        canvas_id,
+        payload.model_dump(exclude_none=True),
+    )
+
+
+@app.delete("/api/canvases/{canvas_id}")
+def canvas_delete(canvas_id: int):
+    return api_call(delete_canvas, canvas_id)
 
 
 @app.get("/api/materials")

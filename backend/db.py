@@ -204,6 +204,15 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 UNIQUE(source_key, platform)
             );
+            CREATE TABLE IF NOT EXISTS canvases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                document_json TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
 
             CREATE INDEX IF NOT EXISTS idx_materials_kind
                 ON materials(kind, updated_at DESC);
@@ -219,6 +228,8 @@ def init_db():
                 ON publish_records(article_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_article_platform_states_status
                 ON article_platform_states(status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_canvases_updated
+                ON canvases(updated_at DESC);
             """
         )
         # 将旧发布记录迁移为平台状态，升级后也能避免重复发布。

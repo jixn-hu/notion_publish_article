@@ -3243,6 +3243,91 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(client._request_with_retry.call_count, 2)
         sleep.assert_called_once_with(0.01)
 
+    def test_canvas_crud_persists_document_and_version(self):
+        created = self.client.post(
+            "/api/canvases",
+            json={"title": "选题研究"},
+        )
+        self.assertEqual(created.status_code, 201)
+        canvas = created.json()
+        self.assertEqual(canvas["version"], 1)
+        self.assertEqual(canvas["document"]["nodes"], [])
+
+        document = {
+            "nodes": [
+                {
+                    "id": "note-1",
+                    "type": "note",
+                    "position": {"x": 120, "y": 80},
+                    "data": {"title": "核心问题", "content": "用户真正关心什么？"},
+                },
+                {
+                    "id": "news-1",
+                    "type": "resource",
+                    "position": {"x": 480, "y": 80},
+                    "data": {
+                        "resourceType": "news",
+                        "resourceId": 7,
+                        "title": "参考资讯",
+                    },
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-1",
+                    "source": "news-1",
+                    "target": "note-1",
+                    "label": "支撑",
+                }
+            ],
+            "viewport": {"x": 25, "y": -40, "zoom": 0.85},
+        }
+        updated = self.client.patch(
+            f"/api/canvases/{canvas['id']}",
+            json={"title": "选题研究图", "document": document, "version": 1},
+        )
+        self.assertEqual(updated.status_code, 200)
+        saved = updated.json()
+        self.assertEqual(saved["version"], 2)
+        self.assertEqual(saved["title"], "选题研究图")
+        self.assertEqual(len(saved["document"]["nodes"]), 2)
+        self.assertEqual(saved["document"]["edges"][0]["label"], "支撑")
+
+        listing = self.client.get("/api/canvases").json()
+        self.assertEqual(listing[0]["node_count"], 2)
+        self.assertEqual(listing[0]["edge_count"], 1)
+
+        conflict = self.client.patch(
+            f"/api/canvases/{canvas['id']}",
+            json={"title": "旧页面覆盖", "version": 1},
+        )
+        self.assertEqual(conflict.status_code, 400)
+        self.assertIn("其他位置更新", conflict.json()["detail"])
+
+        deleted = self.client.delete(f"/api/canvases/{canvas['id']}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/canvases").json(), [])
+
+    def test_canvas_rejects_edges_to_missing_nodes(self):
+        response = self.client.post(
+            "/api/canvases",
+            json={
+                "title": "无效画布",
+                "document": {
+                    "nodes": [],
+                    "edges": [
+                        {
+                            "id": "edge-1",
+                            "source": "missing-a",
+                            "target": "missing-b",
+                        }
+                    ],
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("不存在的节点", response.json()["detail"])
+
     @staticmethod
     def _notion_article(source_key, page_id, title):
         return {
