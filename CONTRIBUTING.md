@@ -18,7 +18,7 @@ cd ..
 ## 提交要求
 
 - 保持改动聚焦，不要在功能提交中混入无关重构或格式化。
-- 新增或修改后端行为时补充 `test_backend.py` 测试。
+- 新增或修改后端行为时补充 `test/test_backend.py` 测试。
 - 修改前端后至少执行一次生产构建；交互改动应在桌面和移动宽度下检查。
 - 平台自动化必须等待明确的页面状态，不要用固定短延时冒充成功检测。
 - 不要绕过验证码、扫码确认、内容审核或频率限制。
@@ -28,7 +28,7 @@ cd ..
 ## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v test_backend.py test_notion_utool.py
+.\.venv\Scripts\python.exe -m unittest -v test.test_backend test.test_notion_utool
 cd frontend
 npm run build
 cd ..

@@ -1,6 +1,7 @@
 import json
 import mimetypes
 import re
+import shutil
 import zipfile
 from pathlib import Path
 from uuid import uuid4
@@ -154,6 +155,50 @@ def create_note_material(values):
         material_id = cursor.lastrowid
     return get_material(material_id)
 
+
+def create_generated_image_material(generated, values):
+    source = Path(str(generated.get("path") or "")).resolve()
+    ai_directory = (media.MEDIA_DIR / "ai").resolve()
+    try:
+        source.relative_to(ai_directory)
+    except ValueError as exc:
+        raise ValueError("生成图片不在受信任的本地目录中") from exc
+    if not source.is_file():
+        raise ValueError("生成图片文件不存在")
+
+    directory = library_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{uuid4().hex}{source.suffix.lower()}"
+    shutil.move(str(source), str(target))
+    title = str(values.get("title") or "AI 生成图片").strip()[:120]
+    description = str(values.get("description") or "").strip()[:1000]
+    mime_type = mimetypes.guess_type(target.name)[0] or "image/png"
+    now = utc_now()
+    try:
+        with connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO materials (
+                    kind, title, path, content_md, description, tags_json,
+                    mime_type, size_bytes, created_at, updated_at
+                ) VALUES ('image', ?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    title or "AI 生成图片",
+                    str(target.resolve()),
+                    description,
+                    json.dumps(_clean_tags(values.get("tags")), ensure_ascii=False),
+                    mime_type,
+                    target.stat().st_size,
+                    now,
+                    now,
+                ),
+            )
+            material_id = cursor.lastrowid
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return get_material(material_id)
 
 def update_material(material_id, values):
     material = get_material(material_id)

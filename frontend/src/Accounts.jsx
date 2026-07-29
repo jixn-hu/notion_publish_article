@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Monitor, RadioTower, Settings2, Trash2, UserRoundCheck, X } from 'lucide-react'
 import { api } from './api'
 
 const STATUS_LABELS = {
@@ -26,10 +27,15 @@ const PROFILE_ID_LABELS = {
   wechat: '微信号',
   xiaohongshu: '小红书号',
   douyin: '抖音号',
-  channels: '视频号 ID'
+  channels: '视频号 ID',
+  bilibili: 'UID'
 }
 
 const PROFILE_METRICS = {
+  wechat: [
+    ['followers_count', '粉丝'],
+    ['new_followers_count', '昨日新增粉丝']
+  ],
   xiaohongshu: [
     ['following_count', '关注'],
     ['followers_count', '粉丝'],
@@ -46,6 +52,12 @@ const PROFILE_METRICS = {
     ['works_count', '作品'],
     ['likes_count', '获赞']
   ],
+  bilibili: [
+    ['following_count', '关注'],
+    ['followers_count', '粉丝'],
+    ['works_count', '视频'],
+    ['level', '等级']
+  ],
   csdn: [
     ['followers_count', '\u7c89\u4e1d'],
     ['works_count', '\u539f\u521b'],
@@ -58,6 +70,16 @@ const countLabel = value => {
   if (value === null || value === undefined) return '—'
   if (value >= 10000) return `${(value / 10000).toFixed(1).replace(/\.0$/, '')}万`
   return String(value)
+}
+const profileSyncedLabel = value => {
+  if (!value) return ''
+  return new Date(value).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
 }
 
 const profileMetrics = account => (
@@ -72,10 +94,16 @@ function Accounts ({ notify, onChanged }) {
   const [platform, setPlatform] = useState('xiaohongshu')
   const [name, setName] = useState('')
   const [busy, setBusy] = useState('')
-  const [proxyAccountId, setProxyAccountId] = useState(null)
+  const [settingsAccountId, setSettingsAccountId] = useState(null)
   const [selectedProxyId, setSelectedProxyId] = useState('')
   const [proxyName, setProxyName] = useState('')
   const [proxyAddress, setProxyAddress] = useState('')
+  const [wechatForm, setWechatForm] = useState({
+    publish_method: 'browser',
+    app_id: '',
+    app_secret: ''
+  })
+
 
   const load = async () => {
     const [accountResult, proxyResult] = await Promise.all([
@@ -124,22 +152,89 @@ function Accounts ({ notify, onChanged }) {
     }
   }
 
-  const editProxy = account => {
-    setProxyAccountId(account.id)
-    setSelectedProxyId(account.proxy_id ? String(account.proxy_id) : '')
+  const manageAccount = async account => {
+    setBusy(`manage-${account.id}`)
+    try {
+      const result = await api.loginAccount(account.id)
+      await load()
+      const isLogin = result.management_mode === 'login'
+      if (result.profile_error) {
+        notify(
+          `账号“${account.name}”状态有效，但资料采集失败：${result.profile_error}`,
+          'error'
+        )
+      } else {
+        notify(
+          isLogin
+            ? `账号“${account.name}”登录成功，会话与资料已保存`
+            : `账号“${account.name}”状态已检查，资料已刷新`
+        )
+      }
+    } catch (error) {
+      await load().catch(() => {})
+      notify(error.message, 'error')
+    } finally {
+      setBusy('')
+    }
   }
 
-  const saveProxy = async event => {
-    event.preventDefault()
-    const accountId = proxyAccountId
-    const proxyId = selectedProxyId ? Number(selectedProxyId) : null
-    setBusy(`proxy-${accountId}`)
+  const removeAccount = async account => {
+    const label = account.profile?.display_name || account.name
+    if (!window.confirm(
+      `确定删除账号“${label}”吗？本地浏览器登录会话和 API 配置将一并删除，且无法恢复。`
+    )) return
+    setBusy(`delete-account-${account.id}`)
     try {
-      await api.updateAccountProxy(accountId, proxyId)
+      const result = await api.deleteAccount(account.id)
+      if (settingsAccountId === account.id) setSettingsAccountId(null)
       await load()
-      setProxyAccountId(null)
-      setSelectedProxyId('')
-      notify(proxyId ? '账号代理设置已保存' : '账号已改为直连')
+      notify(
+        result.cleanup_warning
+          ? `账号已删除；${result.cleanup_warning}`
+          : `账号“${label}”已删除`
+      )
+    } catch (error) {
+      notify(error.message, 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const openAccountSettings = account => {
+    setSettingsAccountId(account.id)
+    setSelectedProxyId(account.proxy_id ? String(account.proxy_id) : '')
+    setWechatForm({
+      publish_method: account.wechat?.publish_method || 'browser',
+      app_id: account.wechat?.app_id || '',
+      app_secret: ''
+    })
+  }
+
+  const closeAccountSettings = () => {
+    setSettingsAccountId(null)
+    setSelectedProxyId('')
+    setWechatForm(current => ({ ...current, app_secret: '' }))
+  }
+
+  const saveAccountSettings = async event => {
+    event.preventDefault()
+    const account = accounts.find(item => item.id === settingsAccountId)
+    if (!account) return
+    const proxyId = selectedProxyId ? Number(selectedProxyId) : null
+    setBusy(`account-settings-${account.id}`)
+    try {
+      await api.updateAccountProxy(account.id, proxyId)
+      if (account.platform === 'wechat') {
+        const values = {
+          publish_method: wechatForm.publish_method,
+          app_id: wechatForm.app_id.trim()
+        }
+        if (wechatForm.app_secret) values.app_secret = wechatForm.app_secret
+        await api.updateWechatAccount(account.id, values)
+      }
+      await load()
+      closeAccountSettings()
+      notify(`账号“${account.name}”设置已保存`)
     } catch (error) {
       notify(error.message, 'error')
     } finally {
@@ -186,6 +281,35 @@ function Accounts ({ notify, onChanged }) {
       setBusy('')
     }
   }
+
+
+  const testWechat = async account => {
+    setBusy(`wechat-test-${account.id}`)
+    try {
+      const result = await api.testWechatAccount(account.id)
+      await load()
+      const available = [
+        result.capabilities?.draft && '草稿',
+        result.capabilities?.publish && '发布'
+      ].filter(Boolean)
+      notify(
+        available.length
+          ? `公众号 API 可用：${available.join('、')}`
+          : 'API 凭据有效，但草稿和发布接口尚未授权',
+        available.length ? 'success' : 'error'
+      )
+    } catch (error) {
+      await load().catch(() => {})
+      notify(error.message, 'error')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const setWechat = (key, value) => {
+    setWechatForm(current => ({ ...current, [key]: value }))
+  }
+  const settingsAccount = accounts.find(item => item.id === settingsAccountId) || null
 
   return (
     <div className='page enter accounts-page'>
@@ -236,154 +360,148 @@ function Accounts ({ notify, onChanged }) {
           ? (
             <div className='account-grid'>
               {accounts.map(account => (
-                <article key={account.id} className='account-card'>
-                  <div className={`account-avatar ${account.platform}`}>
-                    {account.profile?.avatar_cached
-                      ? (
-                        <img
-                          src={`/api/accounts/${account.id}/avatar?v=${encodeURIComponent(account.profile_synced_at || '')}`}
-                          alt={account.profile.display_name || account.name}
-                        />
-                        )
-                      : ACCOUNT_PLATFORMS[account.platform]?.mark || '?'}
-                  </div>
-                  <div className='account-meta'>
-                    <span>
-                      {ACCOUNT_PLATFORMS[account.platform]?.label || account.platform}
-                      {' · #'}{account.id}
+                <article
+                  key={account.id}
+                  className={'account-card ' + account.platform}
+                >
+                  <header className='account-card-head'>
+                    <div className={'account-avatar ' + account.platform}>
+                      {account.profile?.avatar_cached
+                        ? (
+                          <img
+                            src={'/api/accounts/' + account.id + '/avatar?v=' + encodeURIComponent(account.profile_synced_at || '')}
+                            alt={account.profile.display_name || account.name}
+                          />
+                          )
+                        : ACCOUNT_PLATFORMS[account.platform]?.mark || '?'}
+                    </div>
+
+                    <div className='account-identity'>
+                      <div className='account-kicker'>
+                        <span>{ACCOUNT_PLATFORMS[account.platform]?.label || account.platform}</span>
+                        <span>#{account.id}</span>
+                      </div>
+                      <h4>{account.profile?.display_name || account.name}</h4>
                       {account.profile?.display_name &&
-                        account.profile.display_name !== account.name
-                        ? ` · 备注 ${account.name}`
-                        : ''}
-                    </span>
-                    <h4>{account.profile?.display_name || account.name}</h4>
-                    {account.profile?.platform_user_id && (
-                      <small className='account-platform-id'>
-                        {PROFILE_ID_LABELS[account.platform] || '平台账号'}{' '}
-                        {account.profile.platform_user_id}
-                      </small>
-                    )}
-                    <p className={`account-status ${account.status}`}>
+                        account.profile.display_name !== account.name && (
+                          <p className='account-note'>备注 {account.name}</p>
+                      )}
+                      <div className='account-identifiers'>
+                        {account.profile?.platform_user_id && (
+                          <span>
+                            {PROFILE_ID_LABELS[account.platform] || '平台账号'}{' '}
+                            {account.profile.platform_user_id}
+                          </span>
+                        )}
+                        {account.platform === 'wechat' && account.wechat?.app_id && (
+                          <span>AppID {account.wechat.app_id}</span>
+                        )}
+                      </div>
+                    </div>
+
+                    <span className={'account-health ' + account.status}>
                       <i />
                       {STATUS_LABELS[account.status] || account.status}
-                    </p>
-                    <small className={`account-proxy ${account.proxy ? 'enabled' : ''}`}>
-                      {account.proxy ? `代理 ${account.proxy.name}` : '网络 直连'}
-                    </small>
-                    {account.last_error && (
-                      <small title={account.last_error}>{account.last_error}</small>
+                    </span>
+                  </header>
+
+                  <div className='account-facts'>
+                    {account.platform === 'wechat' && (
+                      <>
+                        <span className={'account-fact ' + (account.wechat?.api_status || 'pending')}>
+                          <RadioTower size={14} />
+                          <small>公众号 API</small>
+                          <b>{{
+                            pending: '未配置',
+                            valid: '凭据有效',
+                            invalid: '凭据无效'
+                          }[account.wechat?.api_status] || account.wechat?.api_status}</b>
+                        </span>
+                        <span className='account-fact'>
+                          <Monitor size={14} />
+                          <small>默认发布</small>
+                          <b>{account.wechat?.publish_method === 'api' ? '官方 API' : '浏览器'}</b>
+                        </span>
+                      </>
                     )}
-                    {profileMetrics(account).length > 0 && (
-                      <div className='account-metrics'>
-                        {profileMetrics(account).map(([key, label]) => (
-                          <span key={key}>
-                            <b>{countLabel(account.profile[key])}</b>
-                            {label}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    {account.profile_error && (
-                      <small title={account.profile_error}>{account.profile_error}</small>
-                    )}
+                    <span className={'account-fact ' + (account.proxy ? 'valid' : '')}>
+                      <small>网络</small>
+                      <b>{account.proxy ? account.proxy.name : '直连'}</b>
+                    </span>
+                    <span className='account-fact'>
+                      <small>资料更新</small>
+                      <b>{account.profile_synced_at
+                        ? profileSyncedLabel(account.profile_synced_at)
+                        : '尚未同步'}</b>
+                    </span>
                   </div>
-                  <div className='account-actions'>
+
+                  {profileMetrics(account).length > 0 && (
+                    <div className='account-metrics'>
+                      {profileMetrics(account).map(([key, label]) => (
+                        <span key={key}>
+                          <b>{countLabel(account.profile[key])}</b>
+                          <small>{label}</small>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {(account.last_error || account.profile_error) && (
+                    <div className='account-errors'>
+                      {account.last_error && (
+                        <small title={account.last_error}>{account.last_error}</small>
+                      )}
+                      {account.profile_error && (
+                        <small title={account.profile_error}>{account.profile_error}</small>
+                      )}
+                    </div>
+                  )}
+
+                  <footer className='account-actions'>
                     <button
                       className='button ghost'
                       disabled={Boolean(busy)}
+                      title='打开账号页面，浏览器由你手动关闭'
                       onClick={() => run(
-                        `browser-${account.id}`,
+                        'browser-' + account.id,
                         () => api.openAccountBrowser(account.id),
-                        `已打开“${account.name}”的账号浏览器`
+                        '已打开“' + account.name + '”的账号浏览器'
                       )}
                     >
-                      {busy === `browser-${account.id}` ? '正在打开…' : '查看账号'}
+                      <Monitor size={15} />
+                      {busy === 'browser-' + account.id ? '正在打开…' : '查看账号'}
                     </button>
                     <button
                       className='button ink'
                       disabled={Boolean(busy)}
-                      onClick={() => run(
-                        `login-${account.id}`,
-                        () => api.loginAccount(account.id),
-                        `账号“${account.name}”登录成功`
-                      )}
+                      title='登录账号、检查状态并刷新资料，完成后自动关闭'
+                      onClick={() => manageAccount(account)}
                     >
-                      {busy === `login-${account.id}` ? '等待浏览器登录…' : '打开浏览器登录'}
+                      <UserRoundCheck size={15} />
+                      {busy === 'manage-' + account.id ? '检查刷新中…' : '登录 / 检查 / 刷新'}
                     </button>
                     <button
                       className='button ghost'
                       disabled={Boolean(busy)}
-                      onClick={() => run(
-                        `check-${account.id}`,
-                        () => api.checkAccount(account.id),
-                        `账号“${account.name}”状态有效`
-                      )}
+                      title='配置代理、发布方式和平台 API'
+                      onClick={() => openAccountSettings(account)}
                     >
-                      {busy === `check-${account.id}` ? '检查中…' : '检查状态'}
+                      <Settings2 size={15} />
+                      设置
                     </button>
-                    {['wechat', 'xiaohongshu', 'douyin', 'channels', 'csdn'].includes(account.platform) && (
-                      <button
-                        className='button ghost'
-                        disabled={Boolean(busy) || account.status !== 'valid'}
-                        onClick={() => run(
-                          `profile-${account.id}`,
-                          () => api.refreshAccountProfile(account.id),
-                          `账号“${account.name}”资料已更新`
-                        )}
-                      >
-                        {busy === `profile-${account.id}` ? '同步中…' : '刷新资料'}
-                      </button>
-                    )}
                     <button
-                      className='button ghost'
+                      className='button danger account-delete'
                       disabled={Boolean(busy)}
-                      onClick={() => editProxy(account)}
+                      title='删除账号'
+                      aria-label={'删除账号 ' + (account.profile?.display_name || account.name)}
+                      onClick={() => removeAccount(account)}
                     >
-                      代理设置
+                      <Trash2 size={16} />
                     </button>
-                  </div>
-                  {proxyAccountId === account.id && (
-                    <form className='account-proxy-form' onSubmit={saveProxy}>
-                      <label className='field'>
-                        <span>账号专用代理</span>
-                        <select
-                          autoFocus
-                          value={selectedProxyId}
-                          onChange={event => setSelectedProxyId(event.target.value)}
-                        >
-                          <option value=''>直连（不使用代理）</option>
-                          {proxies.map(proxy => (
-                            <option key={proxy.id} value={proxy.id}>
-                              {proxy.name} · {PROXY_STATUS_LABELS[proxy.status] || proxy.status}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <div>
-                        <button
-                          className='button ink'
-                          disabled={Boolean(busy)}
-                        >
-                          {busy === `proxy-${account.id}` ? '保存中…' : '保存'}
-                        </button>
-                        <button
-                          type='button'
-                          className='button ghost'
-                          disabled={Boolean(busy)}
-                          onClick={() => {
-                            setProxyAccountId(null)
-                            setSelectedProxyId('')
-                          }}
-                        >
-                          取消
-                        </button>
-                      </div>
-                      <small>
-                        代理需要先在上方保存并测试；选择直连时不使用代理。
-                      </small>
-                    </form>
-                  )}
+                  </footer>
                 </article>
+
               ))}
             </div>
             )
@@ -394,6 +512,142 @@ function Accounts ({ notify, onChanged }) {
             </div>
             )}
       </section>
+
+      {settingsAccount && (
+        <div
+          className='modal-backdrop account-settings-backdrop'
+          onMouseDown={event => {
+            if (event.target === event.currentTarget && !busy) closeAccountSettings()
+          }}
+        >
+          <section
+            className='account-settings-modal'
+            role='dialog'
+            aria-modal='true'
+            aria-labelledby='account-settings-title'
+          >
+            <header>
+              <div>
+                <span>{ACCOUNT_PLATFORMS[settingsAccount.platform]?.label} · #{settingsAccount.id}</span>
+                <h3 id='account-settings-title'>
+                  {settingsAccount.profile?.display_name || settingsAccount.name}
+                </h3>
+              </div>
+              <button
+                type='button'
+                className='account-settings-close'
+                title='关闭'
+                aria-label='关闭账号设置'
+                disabled={Boolean(busy)}
+                onClick={closeAccountSettings}
+              >
+                <X size={18} />
+              </button>
+            </header>
+            <form className='account-settings-form' onSubmit={saveAccountSettings}>
+              <section className='account-settings-section'>
+                <header>
+                  <span>01</span>
+                  <div><b>网络代理</b><small>当前账号独立生效</small></div>
+                </header>
+                <label className='field'>
+                  <span>连接方式</span>
+                  <select
+                    autoFocus
+                    value={selectedProxyId}
+                    onChange={event => setSelectedProxyId(event.target.value)}
+                  >
+                    <option value=''>直连（不使用代理）</option>
+                    {proxies.map(proxy => (
+                      <option key={proxy.id} value={proxy.id}>
+                        {proxy.name} · {PROXY_STATUS_LABELS[proxy.status] || proxy.status}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </section>
+
+              {settingsAccount.platform === 'wechat' && (
+                <section className='account-settings-section wechat-account-settings'>
+                  <header>
+                    <span>02</span>
+                    <div><b>公众号发布</b><small>浏览器与官方 API 状态独立</small></div>
+                  </header>
+                  <div className='wechat-method-switch' role='group' aria-label='公众号发布方式'>
+                    <button
+                      type='button'
+                      className={wechatForm.publish_method === 'browser' ? 'active' : ''}
+                      onClick={() => setWechat('publish_method', 'browser')}
+                    >
+                      <Monitor size={15} />
+                      <span><b>浏览器</b><small>适合交互发布与账号资料同步</small></span>
+                    </button>
+                    <button
+                      type='button'
+                      className={wechatForm.publish_method === 'api' ? 'active' : ''}
+                      onClick={() => setWechat('publish_method', 'api')}
+                    >
+                      <RadioTower size={15} />
+                      <span><b>官方 API</b><small>无需浏览器登录，按接口权限发布</small></span>
+                    </button>
+                  </div>
+                  <div className='wechat-api-fields'>
+                    <label className='field'>
+                      <span>AppID</span>
+                      <input
+                        value={wechatForm.app_id}
+                        placeholder='公众号开发者 AppID'
+                        onChange={event => setWechat('app_id', event.target.value)}
+                      />
+                    </label>
+                    <label className='field'>
+                      <span>AppSecret</span>
+                      <input
+                        type='password'
+                        value={wechatForm.app_secret}
+                        autoComplete='new-password'
+                        placeholder={settingsAccount.wechat?.app_secret_configured
+                          ? '已配置，留空表示不修改'
+                          : '填写后加密保存在本机'}
+                        onChange={event => setWechat('app_secret', event.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div className='account-api-status'>
+                    <div className='wechat-capabilities'>
+                      <span className={settingsAccount.wechat?.api_capabilities?.credentials ? 'valid' : ''}>凭据</span>
+                      <span className={settingsAccount.wechat?.api_capabilities?.draft ? 'valid' : ''}>草稿</span>
+                      <span className={settingsAccount.wechat?.api_capabilities?.publish ? 'valid' : ''}>发布</span>
+                      {settingsAccount.wechat?.api_last_error && (
+                        <small title={settingsAccount.wechat.api_last_error}>
+                          {settingsAccount.wechat.api_last_error}
+                        </small>
+                      )}
+                    </div>
+                    <button
+                      type='button'
+                      className='button ghost'
+                      disabled={Boolean(busy) || !settingsAccount.wechat?.app_secret_configured}
+                      onClick={() => testWechat(settingsAccount)}
+                    >
+                      {busy === `wechat-test-${settingsAccount.id}` ? '检查中…' : '测试 API 权限'}
+                    </button>
+                  </div>
+                </section>
+              )}
+
+              <footer>
+                <button type='button' className='button ghost' disabled={Boolean(busy)} onClick={closeAccountSettings}>
+                  取消
+                </button>
+                <button className='button ink' disabled={Boolean(busy)}>
+                  {busy === `account-settings-${settingsAccount.id}` ? '保存中…' : '保存设置'}
+                </button>
+              </footer>
+            </form>
+          </section>
+        </div>
+      )}
 
       <aside className='browser-note'>
         <b>浏览器原则</b>

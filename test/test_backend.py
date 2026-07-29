@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import tempfile
@@ -17,9 +18,15 @@ import backend.app as app_module
 from backend.assets import get_platform_asset, save_platform_asset
 from backend.logging_config import redact_text, redact_url
 from backend.notion_client import NotionClient, page_metadata
-from backend.platforms.bilibili import BilibiliPublisher
+from backend.platforms.bilibili import (
+    BilibiliPublisher,
+    CREATOR_URL as BILIBILI_CREATOR_URL,
+    LOGIN_URL as BILIBILI_LOGIN_URL,
+    bilibili_account_url,
+)
 from backend.platforms.channels import (
     ChannelsPublisher,
+    _channels_api_profile,
     _channels_text_profile,
 )
 from backend.platforms.csdn import _csdn_profile_text
@@ -70,6 +77,135 @@ class BackendApiTests(unittest.TestCase):
         self.client = self.client_context.__enter__()
         self.addCleanup(self.client_context.__exit__, None, None, None)
 
+    def test_account_browser_reuses_active_context_for_same_account(self):
+        context = Mock()
+        account = {"id": 7}
+        backend.browser._account_browser_session.context = context
+        backend.browser._account_browser_session.account_id = 7
+        try:
+            with backend.browser.open_account_browser(account) as reused:
+                self.assertIs(reused, context)
+            with self.assertRaisesRegex(RuntimeError, "不能切换到其他账号"):
+                with backend.browser.open_account_browser({"id": 8}):
+                    pass
+        finally:
+            del backend.browser._account_browser_session.context
+            del backend.browser._account_browser_session.account_id
+
+    def test_bilibili_account_url_uses_login_until_account_is_valid(self):
+        self.assertEqual(
+            bilibili_account_url({"status": "pending"}),
+            BILIBILI_LOGIN_URL,
+        )
+        self.assertEqual(
+            bilibili_account_url({"status": "invalid"}),
+            BILIBILI_LOGIN_URL,
+        )
+        self.assertEqual(
+            bilibili_account_url({"status": "valid"}),
+            BILIBILI_CREATOR_URL,
+        )
+        _, target_url, _ = backend.accounts._account_management_runtime(
+            {"platform": "bilibili", "status": "invalid"}
+        )
+        self.assertEqual(target_url, BILIBILI_LOGIN_URL)
+
+    def test_first_login_collects_from_current_page_then_closes_automatically(self):
+        from contextlib import nullcontext
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "首次登录账号"},
+        ).json()
+        context = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+        page.wait_for_timeout.side_effect = [
+            None,
+            RuntimeError("用户在登录成功提示期间关闭了浏览器"),
+        ]
+        context.pages = [page]
+        profile = {"display_name": "首次登录账号", "followers_count": 12}
+        checker = Mock(side_effect=[False, True])
+
+        with (
+            patch(
+                "backend.accounts.open_account_browser",
+                return_value=nullcontext(context),
+            ) as browser_session,
+            patch(
+                "backend.accounts.get_or_create_page",
+                return_value=page,
+            ),
+            patch(
+                "backend.accounts._account_management_runtime",
+                return_value=(object(), "https://mp.csdn.net/", checker),
+            ),
+            patch(
+                "backend.accounts._fetch_account_profile",
+                return_value=profile,
+            ) as fetch_profile,
+        ):
+            response = self.client.post(f"/api/accounts/{account['id']}/login")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "valid")
+        self.assertEqual(response.json()["profile"], profile)
+        self.assertEqual(response.json()["management_mode"], "login")
+        browser_session.assert_called_once()
+        page.goto.assert_called_once_with(
+            "https://mp.csdn.net/",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        fetch_profile.assert_called_once_with(
+            unittest.mock.ANY,
+            page=page,
+        )
+        self.assertEqual(
+            [call.args[0] for call in page.wait_for_timeout.call_args_list],
+            [2500, 2000],
+        )
+
+    def test_logged_in_account_checks_profile_then_closes_automatically(self):
+        from contextlib import nullcontext
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "状态检查账号"},
+        ).json()
+        context = Mock()
+        page = Mock()
+        profile = {"display_name": "状态检查账号"}
+        checker = Mock(return_value=True)
+
+        with (
+            patch(
+                "backend.accounts.open_account_browser",
+                return_value=nullcontext(context),
+            ),
+            patch(
+                "backend.accounts.get_or_create_page",
+                return_value=page,
+            ),
+            patch(
+                "backend.accounts._account_management_runtime",
+                return_value=(object(), "https://mp.csdn.net/", checker),
+            ),
+            patch(
+                "backend.accounts._fetch_account_profile",
+                return_value=profile,
+            ),
+        ):
+            response = self.client.post(f"/api/accounts/{account['id']}/login")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["management_mode"], "check")
+        page.goto.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in page.wait_for_timeout.call_args_list],
+            [2500, 2000],
+        )
     def test_account_browser_view_uses_account_profile(self):
         account = self.client.post(
             "/api/accounts",
@@ -90,18 +226,22 @@ class BackendApiTests(unittest.TestCase):
             launcher.call_args.args[0]["profile_dir"],
             account["profile_dir"],
         )
-    def test_wechat_account_browser_opens_saved_dashboard(self):
+    def test_wechat_account_browser_opens_canonical_dashboard(self):
         from backend.platforms.wechat_browser import _save_session_url
 
         account = self.client.post(
             "/api/accounts",
             json={"platform": "wechat", "name": "公众号主账号"},
         ).json()
+        saved_url = (
+            "https://mp.weixin.qq.com/cgi-bin/safecenterstatus?"
+            "action=view&t=setting/safe-index&token=123456&lang=zh_CN"
+        )
         dashboard_url = (
             "https://mp.weixin.qq.com/cgi-bin/home?"
-            "t=home/index&lang=zh_CN&token=123456"
+            "t=home%2Findex&token=123456&lang=zh_CN"
         )
-        _save_session_url(account, dashboard_url)
+        _save_session_url(account, saved_url)
         with patch.object(
             backend.accounts,
             "open_account_dashboard",
@@ -116,6 +256,31 @@ class BackendApiTests(unittest.TestCase):
             unittest.mock.ANY,
             dashboard_url,
         )
+
+    def test_wechat_account_session_is_saved_as_dashboard(self):
+        from backend.platforms.wechat_browser import (
+            _load_session_url,
+            record_account_session,
+        )
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "公众号会话账号"},
+        ).json()
+        page = Mock()
+        page.url = (
+            "https://mp.weixin.qq.com/cgi-bin/safecenterstatus?"
+            "action=view&t=setting/safe-index&token=654321&lang=zh_CN"
+        )
+
+        record_account_session(account, page)
+
+        self.assertEqual(
+            _load_session_url(account),
+            "https://mp.weixin.qq.com/cgi-bin/home?"
+            "t=home%2Findex&token=654321&lang=zh_CN",
+        )
+
     def test_csdn_login_check_rejects_visible_login_entry(self):
         from backend.platforms.csdn import _is_logged_in
 
@@ -265,6 +430,48 @@ class BackendApiTests(unittest.TestCase):
             context = Context()
 
             def locator(self, selector):
+                return Locator()
+
+        self.assertTrue(_is_logged_in(Page()))
+
+    def test_wechat_login_check_accepts_backend_ui_when_cookies_change(self):
+        from backend.platforms.wechat_browser import _is_logged_in
+
+        class Locator:
+            def __init__(self, visible=False, text=""):
+                self._visible = visible
+                self._text = text
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return int(self._visible)
+
+            def is_visible(self):
+                return self._visible
+
+            def inner_text(self):
+                return self._text
+
+        class Context:
+            def cookies(self, url):
+                return [{"name": "bizuin"}]
+
+        class Page:
+            url = (
+                "https://mp.weixin.qq.com/cgi-bin/home?"
+                "t=home%2Findex&token=123456&lang=zh_CN"
+            )
+            frames = []
+            context = Context()
+
+            def locator(self, selector):
+                if selector == ".weui-desktop-layout__side":
+                    return Locator(True, "Content menu\nSettings")
+                if selector == "[class*='qrcode']":
+                    return Locator(True, "")
                 return Locator()
 
         self.assertTrue(_is_logged_in(Page()))
@@ -486,8 +693,23 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(
             _wechat_profile_text("账号信息\n微信号：demo_account"),
-            {"platform_user_id": "demo_account"},
+            {
+                "platform_user_id": "demo_account",
+                "followers_count": None,
+                "new_followers_count": None,
+            },
         )
+    def test_wechat_profile_text_extracts_follower_metrics(self):
+        from backend.platforms.wechat_browser import _wechat_profile_text
+
+        profile = _wechat_profile_text(
+            "昨日关键指标 "
+            "新关注人数 36 "
+            "累计关注人数 1.2万"
+        )
+
+        self.assertEqual(profile["followers_count"], 12000)
+        self.assertEqual(profile["new_followers_count"], 36)
     def test_health_and_platform_registry(self):
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
@@ -507,6 +729,101 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertTrue(all(item["implemented"] for item in platforms[:5]))
         self.assertTrue(platforms[5]["implemented"])
+        self.assertEqual(
+            {item["key"]: item["content_types"] for item in platforms},
+            {
+                "wechat": ["article", "image"],
+                "xiaohongshu": ["image", "video"],
+                "douyin": ["video"],
+                "channels": ["video"],
+                "bilibili": ["video"],
+                "csdn": ["article"],
+            },
+        )
+
+    def test_dashboard_sums_followers_across_accounts(self):
+        wechat = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "公众号"},
+        ).json()
+        csdn = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "CSDN"},
+        ).json()
+        self.client.post(
+            "/api/accounts",
+            json={"platform": "douyin", "name": "未同步资料"},
+        )
+        backend.accounts.update_account_profile(
+            wechat["id"],
+            {"followers_count": 1200, "new_followers_count": 8},
+        )
+        backend.accounts.update_account_profile(
+            csdn["id"],
+            {"followers_count": 345},
+        )
+
+        dashboard = self.client.get("/api/dashboard")
+
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.json()["total_followers"], 1545)
+        self.assertEqual(dashboard.json()["follower_accounts"], 2)
+
+    def test_publish_rejects_platform_that_does_not_support_content_type(self):
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "平台类型边界",
+                "article_type": "article",
+                "target_platforms": ["xiaohongshu"],
+                "platform_actions": {"xiaohongshu": "publish"},
+            },
+        ).json()
+
+        response = self.client.post(
+            f"/api/articles/{article['id']}/publish",
+            json={"platform_actions": None},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("不支持发布到：小红书", response.json()["detail"])
+
+    def test_auto_publish_skips_platforms_that_do_not_support_content_type(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "xiaohongshu", "name": "图文平台账号"},
+        ).json()
+        self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "auto_publish_enabled": True,
+                    "auto_publish_targets": {
+                        "xiaohongshu": {
+                            "enabled": True,
+                            "account_id": account["id"],
+                            "action": "publish",
+                        }
+                    },
+                }
+            },
+        )
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "自动发布类型过滤",
+                "article_type": "article",
+                "publish_mode": "automatic",
+            },
+        ).json()
+
+        response = self.client.post("/api/automation/publish")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["processed"], 0)
+        detail = self.client.get(f"/api/articles/{article['id']}").json()
+        self.assertEqual(detail["status"], "ready")
+        self.assertEqual(detail["platform_states"], [])
 
     def test_browser_video_platform_accounts_and_content_boundary(self):
         for key in ("xiaohongshu", "douyin", "channels", "bilibili"):
@@ -808,6 +1125,29 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(profile["followers_count"], 4654)
         self.assertEqual(profile["works_count"], 58)
         self.assertEqual(profile["likes_count"], 2406)
+
+    def test_channels_profile_api_metrics(self):
+        profile = _channels_api_profile({
+            "data": {
+                "finderUser": {
+                    "nickname": "视频号账号",
+                    "uniqId": "sph-demo-id",
+                    "headImgUrl": "https://example.com/avatar.png",
+                    "feedsCount": 58,
+                    "fansCount": 4654,
+                },
+            },
+        })
+
+        self.assertEqual(profile["display_name"], "视频号账号")
+        self.assertEqual(profile["platform_user_id"], "sph-demo-id")
+        self.assertEqual(
+            profile["avatar_url"],
+            "https://example.com/avatar.png",
+        )
+        self.assertEqual(profile["followers_count"], 4654)
+        self.assertEqual(profile["works_count"], 58)
+        self.assertIsNone(profile["likes_count"])
 
     def test_douyin_and_channels_profile_handlers_are_registered(self):
         self.assertIn(
@@ -1121,10 +1461,10 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_platform_action_can_save_a_draft(self):
+    def test_platform_publish_always_uses_the_main_draft(self):
         article = self.client.post(
             "/api/articles",
-            json={"title": "草稿测试", "content_md": "正文"},
+            json={"title": "主稿标题", "content_md": "主稿正文"},
         ).json()
         self.client.patch(
             f"/api/articles/{article['id']}",
@@ -1132,8 +1472,8 @@ class BackendApiTests(unittest.TestCase):
                 "ai_result": {
                     "platforms": {
                         "wechat": {
-                            "title": "公众号专用标题",
-                            "content_md": "公众号专用正文",
+                            "title": "历史公众号标题",
+                            "content_md": "历史公众号正文",
                             "tags": [],
                         }
                     }
@@ -1161,14 +1501,12 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "drafted")
         publisher.publish.assert_called_once()
+        published_article = publisher.publish.call_args.args[0]
+        self.assertEqual(published_article["title"], "主稿标题")
+        self.assertEqual(published_article["content_md"], "主稿正文")
         self.assertEqual(publisher.publish.call_args.kwargs["action"], "draft")
-        self.assertEqual(
-            publisher.publish.call_args.args[0]["title"],
-            "公众号专用标题",
-        )
         detail = self.client.get(f"/api/articles/{article['id']}").json()
         self.assertEqual(detail["publish_records"][0]["action"], "draft")
-
     def test_article_list_contains_latest_publish_error(self):
         article = self.client.post(
             "/api/articles",
@@ -1198,26 +1536,177 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(listed[0]["last_error"], "invalid ip, not in whitelist")
 
-    def test_ai_enrichment_stores_platform_variants(self):
+    def test_successful_article_platform_is_not_published_twice(self):
         article = self.client.post(
             "/api/articles",
-            json={"title": "AI 测试", "content_md": "原稿"},
+            json={"title": "幂等发布", "content_md": "正文"},
+        ).json()
+        publisher = Mock()
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.publish.return_value = {
+            "external_id": "draft-1",
+            "status": "drafted",
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"wechat": publisher},
+        ):
+            first = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json={"platform_actions": {"wechat": "draft"}},
+            )
+            second = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json={"platform_actions": {"wechat": "draft"}},
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        publisher.publish.assert_called_once()
+        self.assertTrue(second.json()["results"][0]["skipped"])
+        detail = self.client.get(f"/api/articles/{article['id']}").json()
+        self.assertEqual(detail["platform_states"][0]["status"], "drafted")
+        self.assertEqual(detail["platform_states"][0]["attempts"], 1)
+
+    def test_platform_failure_does_not_stop_following_platform(self):
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "平台隔离", "content_md": "正文"},
+        ).json()
+        failed = Mock()
+        failed.implemented = True
+        failed.is_enabled.return_value = True
+        failed.is_configured.return_value = True
+        failed.publish.side_effect = RuntimeError("公众号失败")
+        succeeded = Mock()
+        succeeded.implemented = True
+        succeeded.is_enabled.return_value = True
+        succeeded.is_configured.return_value = True
+        succeeded.publish.return_value = {
+            "external_id": "csdn-1",
+            "status": "drafted",
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"wechat": failed, "csdn": succeeded},
+        ):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json={
+                    "platform_actions": {
+                        "wechat": "draft",
+                        "csdn": "draft",
+                    }
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "partial")
+        failed.publish.assert_called_once()
+        succeeded.publish.assert_called_once()
+        states = {
+            item["platform"]: item
+            for item in self.client.get(
+                f"/api/articles/{article['id']}"
+            ).json()["platform_states"]
+        }
+        self.assertEqual(states["wechat"]["status"], "failed")
+        self.assertEqual(states["csdn"]["status"], "drafted")
+
+    def test_auto_publish_uses_selected_account_and_waits_for_failed_retry(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "自动发布账号"},
+        ).json()
+        saved = self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "auto_publish_enabled": True,
+                    "auto_publish_targets": {
+                        "csdn": {
+                            "enabled": True,
+                            "account_id": account["id"],
+                            "action": "draft",
+                        }
+                    },
+                }
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "自动发布失败重试",
+                "content_md": "正文",
+                "publish_mode": "automatic",
+            },
+        ).json()
+        publisher = Mock()
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.publish.side_effect = RuntimeError("暂时失败")
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            first = self.client.post("/api/automation/publish")
+            second = self.client.post("/api/automation/publish")
+
+        self.assertEqual(first.json()["processed"], 1)
+        self.assertEqual(second.json()["processed"], 0)
+        publisher.publish.assert_called_once()
+        published_article = publisher.publish.call_args.args[0]
+        self.assertEqual(
+            published_article["platform_accounts"]["csdn"],
+            account["id"],
+        )
+
+        publisher.publish.side_effect = None
+        publisher.publish.return_value = {
+            "external_id": "retry-draft",
+            "status": "drafted",
+            "account_id": account["id"],
+        }
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            retried = self.client.post(
+                f"/api/articles/{article['id']}/platforms/csdn/retry"
+            )
+
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json()["status"], "drafted")
+        state = self.client.get(
+            f"/api/articles/{article['id']}"
+        ).json()["platform_states"][0]
+        self.assertEqual(state["attempts"], 2)
+        self.assertEqual(state["status"], "drafted")
+    def test_ai_enrichment_recommends_title_and_limits_tags(self):
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "原始主稿标题",
+                "content_md": "原稿",
+                "tags": ["原有标签"],
+            },
         ).json()
         self.client.put(
             "/api/settings",
             json={"values": {"ai_enabled": True}},
         )
         ai_result = {
-            "tags": ["自动标签"],
+            "recommended_title": "AI 推荐标题",
+            "tags": ["标签1", "标签2", "标签3", "标签4", "标签5", "标签6"],
             "summary": "文章摘要",
             "editor_notes": "",
-            "platforms": {
-                "wechat": {
-                    "title": "公众号标题",
-                    "content_md": "公众号正文",
-                    "tags": [],
-                }
-            },
         }
         with patch(
             "backend.services.AIContentService.enrich",
@@ -1227,12 +1716,35 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         enriched = response.json()
-        self.assertIn("自动标签", enriched["tags"])
+        self.assertEqual(enriched["title"], "原始主稿标题")
+        self.assertEqual(enriched["tags"], ["标签1", "标签2", "标签3", "标签4", "标签5"])
         self.assertEqual(
-            enriched["ai_result"]["platforms"]["wechat"]["title"],
-            "公众号标题",
+            enriched["ai_result"]["recommended_title"],
+            "AI 推荐标题",
         )
+        self.assertNotIn("platforms", enriched["ai_result"])
 
+    def test_ai_enrichment_requires_one_to_five_tags(self):
+        from backend.ai_service import AIContentService
+
+        result = AIContentService._validate_result(
+            {
+                "recommended_title": "推荐标题",
+                "tags": ["A", "A", "B", "C", "D", "E", "F"],
+                "summary": "",
+                "editor_notes": "",
+            }
+        )
+        self.assertEqual(result["tags"], ["A", "B", "C", "D", "E"])
+        with self.assertRaisesRegex(RuntimeError, "未生成有效标签"):
+            AIContentService._validate_result(
+                {
+                    "recommended_title": "",
+                    "tags": [],
+                    "summary": "",
+                    "editor_notes": "",
+                }
+            )
     def test_same_notion_source_overwrites_instead_of_inserting(self):
         first = self._notion_article("unique:100", "page-a", "第一版")
         action, article_id = _upsert_synced_article(first, "manual")
@@ -1317,7 +1829,7 @@ class BackendApiTests(unittest.TestCase):
             "url": "https://notion.so/custom-page",
             "properties": {
                 "Name": {"type": "title", "title": [{"plain_text": "自定义标题"}]},
-                "Format": {"type": "select", "select": {"name": "Gallery"}},
+                "Format": {"type": "select", "select": {"name": "图文"}},
                 "Byline": {"type": "select", "select": {"name": "作者甲"}},
                 "Cover": {"type": "url", "url": "https://example.com/cover.png"},
                 "Source": {"type": "url", "url": "https://example.com"},
@@ -1340,14 +1852,66 @@ class BackendApiTests(unittest.TestCase):
             page,
             unique_property="",
             field_mapping=mapping,
-            article_value="Post",
-            image_value="Gallery",
         )
 
         self.assertEqual(metadata["title"], "自定义标题")
         self.assertEqual(metadata["article_type"], "image")
         self.assertEqual(metadata["author"], "作者甲")
 
+    def test_notion_rejects_unsupported_article_type(self):
+        page = {
+            "id": "unsupported-type",
+            "properties": {
+                "标题": {"type": "title", "title": [{"plain_text": "测试"}]},
+                "文章类型": {
+                    "type": "select",
+                    "select": {"name": "视频"},
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "仅支持.*文章.*图文"):
+            page_metadata(page)
+
+    def test_notion_sync_marks_successful_pages_as_synced(self):
+        page = {
+            "id": "sync-page",
+            "url": "https://notion.so/sync-page",
+            "properties": {
+                "标题": {
+                    "type": "title",
+                    "title": [{"plain_text": "待同步图文"}],
+                },
+                "文章类型": {
+                    "type": "select",
+                    "select": {"name": "图文"},
+                },
+            },
+        }
+        client = Mock()
+        client.query_pages.return_value = [page]
+        client.get_page_markdown.return_value = "# 正文"
+        client.update_status.return_value = {"id": page["id"]}
+
+        with patch("backend.services.notion_client", return_value=client):
+            response = self.client.post("/api/sync/notion")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["marked_synced"], 1)
+        self.assertEqual(result["errors"], [])
+        client.query_pages.assert_called_once_with(
+            "待同步",
+            status_field="状态",
+        )
+        client.update_status.assert_called_once_with(
+            page["id"],
+            status_field="状态",
+            status="已同步",
+        )
+        article = self.client.get("/api/articles").json()[0]
+        self.assertEqual(article["article_type"], "image")
     def test_custom_status_field_is_used_for_query_and_writeback(self):
         client = NotionClient("token", "database", data_source_id="source")
         response = Mock()
@@ -1390,6 +1954,163 @@ class BackendApiTests(unittest.TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-cache")
+
+    def test_assistant_previews_and_saves_article(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        draft = {
+            "title": "助手生成的文章",
+            "summary": "文章摘要",
+            "content_md": """## 正文
+
+这是助手生成的内容。""",
+            "tags": ["助手", "内容"],
+            "image_plan": [],
+        }
+        with patch(
+            "backend.assistant.AIContentService.generate_article",
+            return_value=draft,
+        ) as generate:
+            preview = self.client.post(
+                "/api/assistant/preview",
+                json={
+                    "target": "article",
+                    "instruction": "写一篇内容工作流文章",
+                    "article_type": "article",
+                    "word_count": 1000,
+                    "image_count": 0,
+                },
+            )
+
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["draft"]["title"], draft["title"])
+        generate.assert_called_once()
+
+        saved = self.client.post(
+            "/api/assistant/execute",
+            json={
+                "target": "article",
+                "draft": preview.json()["draft"],
+                "article_type": "article",
+                "image_count": 0,
+                "references": preview.json()["references"],
+            },
+        )
+        self.assertEqual(saved.status_code, 201)
+        self.assertEqual(saved.json()["destination"], "articles")
+        self.assertEqual(saved.json()["item"]["title"], draft["title"])
+        self.assertEqual(saved.json()["item"]["ai_result"]["source"], "assistant")
+        self.assertEqual(len(self.client.get("/api/articles").json()), 1)
+
+    def test_assistant_saves_news_note_and_generated_image(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        note_draft = {
+            "title": "选题卡片",
+            "summary": "用于后续写作",
+            "content_md": """## 核心观点
+
+内容应先归档。""",
+            "tags": ["选题"],
+            "source_name": "",
+            "image_prompt": "",
+        }
+        with patch(
+            "backend.assistant.AIContentService.generate_assistant_item",
+            return_value=note_draft,
+        ):
+            preview = self.client.post(
+                "/api/assistant/preview",
+                json={"target": "note", "instruction": "整理一张选题卡片"},
+            )
+        note = self.client.post(
+            "/api/assistant/execute",
+            json={"target": "note", "draft": preview.json()["draft"]},
+        )
+        self.assertEqual(note.status_code, 201)
+        self.assertEqual(note.json()["item"]["kind"], "note")
+
+        oversized_note = {
+            **note_draft,
+            "summary": "摘要" * 100,
+            "content_md": "单一知识点" * 300,
+            "tags": [f"标签{index}" for index in range(8)],
+        }
+        guarded_note = self.client.post(
+            "/api/assistant/execute",
+            json={"target": "note", "draft": oversized_note},
+        ).json()["item"]
+        self.assertEqual(len(guarded_note["content_md"]), 1000)
+        self.assertEqual(len(guarded_note["description"]), 120)
+        self.assertEqual(len(guarded_note["tags"]), 5)
+
+        news_draft = {
+            "title": "行业资讯",
+            "summary": "一条待核实的行业资讯",
+            "content_md": """## 已知信息
+
+仅整理用户提供的内容。""",
+            "tags": ["行业"],
+            "source_name": "示例来源",
+            "image_prompt": "",
+        }
+        news = self.client.post(
+            "/api/assistant/execute",
+            json={
+                "target": "news",
+                "draft": news_draft,
+                "source_url": "https://example.com/news/assistant",
+            },
+        )
+        self.assertEqual(news.status_code, 201)
+        self.assertEqual(news.json()["destination"], "news")
+        self.assertEqual(
+            self.client.get("/api/news").json()["items"][0]["source_name"],
+            "示例来源",
+        )
+
+        image_bytes = bytes([137, 80, 78, 71, 13, 10, 26, 10]) + b"assistant"
+        image_dir = backend.media.MEDIA_DIR / "ai"
+        image_dir.mkdir(parents=True)
+        generated_path = image_dir / "assistant.png"
+        generated_path.write_bytes(image_bytes)
+        image_draft = {
+            "title": "内容工作流插图",
+            "summary": "用于文章配图",
+            "content_md": "",
+            "tags": ["插图"],
+            "source_name": "",
+            "image_prompt": "明亮的编辑工作台，高质量摄影风格",
+        }
+        generated = {
+            "position": "material:1",
+            "alt": image_draft["title"],
+            "purpose": image_draft["summary"],
+            "prompt": image_draft["image_prompt"],
+            "path": str(generated_path.resolve()),
+        }
+        with patch(
+            "backend.assistant.AIImageService.generate_images",
+            return_value=[generated],
+        ):
+            image = self.client.post(
+                "/api/assistant/execute",
+                json={"target": "image", "draft": image_draft},
+            )
+
+        self.assertEqual(image.status_code, 201)
+        material = image.json()["item"]
+        self.assertEqual(material["kind"], "image")
+        self.assertFalse(generated_path.exists())
+        self.assertTrue(Path(material["path"]).is_file())
+        preview_file = self.client.get(
+            f"/api/materials/{material['id']}/file"
+        )
+        self.assertEqual(preview_file.content, image_bytes)
 
     def test_generate_article_creates_local_image_draft(self):
         self.client.put(
@@ -1434,7 +2155,7 @@ class BackendApiTests(unittest.TestCase):
             ),
             patch(
                 "backend.services.AIImageService.generate_images",
-                return_value=images,
+                side_effect=[[images[0]], [images[1]]],
             ),
         ):
             response = self.client.post(
@@ -1448,7 +2169,14 @@ class BackendApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 201)
-        article = response.json()
+        draft = response.json()
+        self.assertEqual(
+            draft["ai_result"]["image_generation"]["status"],
+            "queued",
+        )
+        article = self.client.get(
+            f"/api/articles/{draft['id']}"
+        ).json()
         self.assertEqual(article["article_type"], "image")
         self.assertEqual(article["media_paths"], [str(first.resolve()), str(second.resolve())])
         self.assertEqual(article["cover_url"], str(first.resolve()))
@@ -1456,6 +2184,95 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("<!-- image:", article["content_md"])
         self.assertEqual(article["ai_result"]["source"], "generated")
 
+    def test_generate_article_keeps_draft_when_an_image_fails(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        image_dir = backend.media.MEDIA_DIR / "ai"
+        image_dir.mkdir(parents=True)
+        cover = image_dir / "partial-cover.png"
+        detail = image_dir / "partial-detail.png"
+        cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+        detail.write_bytes(b"\x89PNG\r\n\x1a\ndetail")
+        generated = {
+            "title": "部分图片失败也保留",
+            "summary": "生成摘要",
+            "content_md": "正文\n\n<!-- image:1 -->\n\n<!-- image:2 -->",
+            "tags": ["AI"],
+            "image_plan": [
+                {
+                    "position": "image:1",
+                    "alt": "封面",
+                    "prompt": "封面提示词",
+                    "purpose": "封面",
+                },
+                {
+                    "position": "image:2",
+                    "alt": "详情",
+                    "prompt": "详情提示词",
+                    "purpose": "正文",
+                },
+            ],
+        }
+        cover_result = {
+            **generated["image_plan"][0],
+            "path": str(cover.resolve()),
+        }
+        detail_result = {
+            **generated["image_plan"][1],
+            "path": str(detail.resolve()),
+        }
+
+        with (
+            patch(
+                "backend.services.AIContentService.generate_article",
+                return_value=generated,
+            ),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                side_effect=[[cover_result], RuntimeError("图片服务超时")],
+            ),
+        ):
+            response = self.client.post(
+                "/api/articles/generate",
+                json={
+                    "topic": "部分失败测试",
+                    "article_type": "image",
+                    "word_count": 700,
+                    "image_count": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 201)
+        draft = response.json()
+        saved = self.client.get(f"/api/articles/{draft['id']}").json()
+        generation = saved["ai_result"]["image_generation"]
+        self.assertEqual(generation["status"], "partial")
+        self.assertEqual(generation["succeeded"], 1)
+        self.assertEqual(generation["failed"], 1)
+        self.assertEqual(saved["media_paths"], [str(cover.resolve())])
+        self.assertIn("<!-- image:2 -->", saved["content_md"])
+
+        with patch(
+            "backend.services.AIImageService.generate_images",
+            return_value=[detail_result],
+        ):
+            retried = self.client.post(
+                f"/api/articles/{draft['id']}/images/1/regenerate"
+            )
+
+        self.assertEqual(retried.status_code, 200)
+        completed = retried.json()
+        self.assertEqual(
+            completed["ai_result"]["image_generation"]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            completed["media_paths"],
+            [str(cover.resolve()), str(detail.resolve())],
+        )
+        self.assertNotIn("<!-- image:", completed["content_md"])
     def test_material_library_file_note_edit_and_bulk_download(self):
         image_response = self.client.post(
             "/api/materials/files",
@@ -1686,6 +2503,9 @@ class BackendApiTests(unittest.TestCase):
         def generated_images(plans):
             self.assertEqual(len(plans), 1)
             self.assertIn("全套统一视觉规范", plans[0]["prompt"])
+            self.assertEqual(plans[0]["content_kind"], "image_post")
+            self.assertIn("不是给文章配一张装饰插图", plans[0]["prompt"])
+            self.assertIn("信息表达优先", plans[0]["prompt"])
             return [{**plans[0], "path": str(cover.resolve())}]
 
         with (
@@ -1799,13 +2619,30 @@ class BackendApiTests(unittest.TestCase):
                 "ai_api_key": "secret",
                 "ai_image_model": "image-model",
                 "ai_image_size": "1024x1024",
+                "ai_image_post_size": "1024x1536",
                 "ai_proxy_url": "",
             }
         )
-        with patch.object(service.session, "post", return_value=response):
+        with patch.object(
+            service.session,
+            "post",
+            return_value=response,
+        ) as post:
             images = service.generate_images(
                 [{"position": "image:1", "alt": "测试图", "prompt": "一张测试图"}]
             )
+            service.generate_images(
+                [{
+                    "position": "image:1",
+                    "alt": "图文卡片",
+                    "prompt": "一张图文信息卡",
+                    "content_kind": "image_post",
+                }]
+
+            )
+
+        self.assertEqual(post.call_args_list[0].kwargs["json"]["size"], "1024x1024")
+        self.assertEqual(post.call_args_list[1].kwargs["json"]["size"], "1024x1536")
 
         path = Path(images[0]["path"])
         self.assertEqual(path.parent, (backend.media.MEDIA_DIR / "ai").resolve())
@@ -1852,6 +2689,143 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertIn("至少需要生成 1 张图片", invalid.json()["detail"])
 
+    def test_rss_scheduler_runs_only_when_interval_is_due(self):
+        from backend.scheduler import AutomationScheduler
+
+        scheduled = AutomationScheduler()
+        settings = {
+            "notion_sync_enabled": False,
+            "rss_enabled": True,
+            "rss_scan_interval_minutes": 60,
+            "auto_publish_enabled": False,
+        }
+        with (
+            patch("backend.scheduler.get_settings", return_value=settings),
+            patch(
+                "backend.scheduler.scan_rss_feeds",
+                return_value={"created": 1},
+            ) as scan,
+        ):
+            asyncio.run(scheduled._tick())
+            asyncio.run(scheduled._tick())
+
+        scan.assert_called_once_with()
+        self.assertIsNotNone(scheduled.last_rss_scan_at)
+        self.assertIsNotNone(
+            scheduled.status()["last_rss_scan_at"]
+        )
+    def test_rss_scan_imports_rss_and_atom_entries_incrementally(self):
+        rss_url = "https://feeds.example.com/daily.xml"
+        atom_url = "https://feeds.example.com/atom.xml"
+        rss_payload = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>AI 每日资讯</title>
+    <item>
+      <title>模型发布新版本</title>
+      <link>https://example.com/news/model-v2</link>
+      <description><![CDATA[新版本提升了推理效率。]]></description>
+      <content:encoded><![CDATA[<p>新版本提升了推理效率。</p><p>详细指标待核实。</p>]]></content:encoded>
+      <dc:creator>编辑部</dc:creator>
+      <pubDate>Sun, 27 Jul 2026 08:00:00 GMT</pubDate>
+      <category>AI</category>
+    </item>
+  </channel>
+</rss>""".encode()
+        atom_payload = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>效率工具更新</title>
+  <entry>
+    <title>应用新增自动整理能力</title>
+    <link rel="alternate" href="https://example.com/news/app-update" />
+    <summary type="html">&lt;p&gt;应用上线了新的整理能力。&lt;/p&gt;</summary>
+    <content type="html">&lt;p&gt;应用上线了新的整理能力。&lt;/p&gt;</content>
+    <published>2026-07-27T09:30:00+08:00</published>
+    <author><name>产品团队</name></author>
+    <category term="效率工具" />
+  </entry>
+</feed>""".encode()
+        settings_response = self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "rss_feed_urls": [rss_url, atom_url, rss_url],
+                    "rss_enabled": True,
+                    "rss_scan_interval_minutes": 30,
+                }
+            },
+        )
+        self.assertEqual(settings_response.status_code, 200)
+        self.assertEqual(
+            settings_response.json()["values"]["rss_feed_urls"],
+            [rss_url, atom_url],
+        )
+
+        def feed_response(url):
+            if "daily" in url:
+                return rss_payload, rss_url
+            return atom_payload, atom_url
+
+        with patch("backend.rss._fetch_feed", side_effect=feed_response):
+            first = self.client.post("/api/rss/scan")
+            second = self.client.post("/api/rss/scan")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["created"], 2)
+        self.assertEqual(first.json()["existing"], 0)
+        self.assertEqual(second.json()["created"], 0)
+        self.assertEqual(second.json()["existing"], 2)
+
+        listing = self.client.get("/api/news").json()
+        self.assertEqual(listing["counts"]["all"], 2)
+        by_title = {item["title"]: item for item in listing["items"]}
+        self.assertEqual(
+            by_title["模型发布新版本"]["source_name"],
+            "AI 每日资讯",
+        )
+        self.assertIn("详细指标待核实", by_title["模型发布新版本"]["content_md"])
+        self.assertEqual(by_title["模型发布新版本"]["author"], "编辑部")
+        self.assertEqual(
+            by_title["应用新增自动整理能力"]["tags"],
+            ["效率工具"],
+        )
+        health = self.client.get("/api/health").json()
+        self.assertIsNotNone(health["scheduler"]["last_rss_scan_at"])
+
+    def test_rss_scan_keeps_other_feeds_when_one_fails(self):
+        good_url = "https://feeds.example.com/good.xml"
+        bad_url = "https://feeds.example.com/bad.xml"
+        payload = """<rss version="2.0"><channel><title>可用订阅</title>
+<item><title>一条资讯</title><link>https://example.com/news/available</link>
+<description>正文</description></item></channel></rss>""".encode()
+
+        def feed_response(url):
+            if "bad" in url:
+                raise RuntimeError("订阅源暂时不可用")
+            return payload, good_url
+
+        with patch("backend.rss._fetch_feed", side_effect=feed_response):
+
+            self.client.put(
+                "/api/settings",
+                json={"values": {"rss_feed_urls": [
+                    "not-a-feed", bad_url, good_url
+                ]}},
+            )
+            response = self.client.post("/api/rss/scan")
+
+        result = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertEqual(result["errors"][0]["url"], "not-a-feed")
+        self.assertEqual(result["errors"][1]["url"], bad_url)
+        self.assertEqual(
+            self.client.get("/api/news").json()["counts"]["all"],
+            1,
+        )
     def test_news_library_crud_and_duplicate_url(self):
         created = self.client.post(
             "/api/news",
@@ -1999,6 +2973,275 @@ class BackendApiTests(unittest.TestCase):
                 (article["id"],),
             ).fetchall()
         self.assertEqual([row["news_id"] for row in linked], [news["id"]])
+
+    def test_delete_article_cascades_records_and_keeps_shared_ai_media(self):
+        media_root = Path(self.temp_dir.name) / "media"
+        ai_root = media_root / "ai"
+        ai_root.mkdir(parents=True)
+        exclusive = ai_root / "exclusive.png"
+        shared = ai_root / "shared.png"
+        exclusive.write_bytes(b"exclusive")
+        shared.write_bytes(b"shared")
+        with patch.object(backend.services, "MEDIA_DIR", media_root):
+            first = self.client.post(
+                "/api/articles",
+                json={
+                    "title": "待删除稿件",
+                    "media_paths": [str(exclusive), str(shared)],
+                    "cover_url": str(exclusive),
+                },
+            ).json()
+            second = self.client.post(
+                "/api/articles",
+                json={
+                    "title": "保留稿件",
+                    "media_paths": [str(shared)],
+                    "cover_url": str(shared),
+                },
+            ).json()
+            with backend.db.connection() as conn:
+                conn.execute(
+                    "INSERT INTO publish_records "
+                    "(article_id, platform, action, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (first["id"], "wechat", "draft", "success", backend.db.utc_now()),
+                )
+
+            response = self.client.delete(f"/api/articles/{first['id']}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deleted"])
+        self.assertEqual(response.json()["cleanup_warning"], "")
+        self.assertFalse(exclusive.exists())
+        self.assertTrue(shared.exists())
+        self.assertEqual(
+            self.client.get(f"/api/articles/{first['id']}").status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(f"/api/articles/{second['id']}").status_code,
+            200,
+        )
+        with backend.db.connection() as conn:
+            record_count = conn.execute(
+                "SELECT COUNT(*) FROM publish_records WHERE article_id = ?",
+                (first["id"],),
+            ).fetchone()[0]
+        self.assertEqual(record_count, 0)
+        missing = self.client.delete(f"/api/articles/{first['id']}")
+        self.assertEqual(missing.status_code, 404)
+
+    def test_delete_account_cleans_private_state_and_article_selection(self):
+        profile_root = Path(self.temp_dir.name) / "browser_profiles"
+        with patch.object(backend.accounts, "PROFILE_ROOT", profile_root):
+            account = self.client.post(
+                "/api/accounts",
+                json={"platform": "wechat", "name": "待删除公众号"},
+            ).json()
+            other = self.client.post(
+                "/api/accounts",
+                json={"platform": "wechat", "name": "保留公众号"},
+            ).json()
+            self.client.put(
+                f"/api/accounts/{account['id']}/wechat",
+                json={
+                    "publish_method": "api",
+                    "app_id": "wx-delete",
+                    "app_secret": "delete-secret",
+                },
+            )
+            profile_dir = Path(account["profile_dir"])
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "Cookies").write_text("session", encoding="utf-8")
+            avatar = backend.accounts.account_avatar_path(account)
+            avatar.parent.mkdir(parents=True)
+            avatar.write_bytes(b"avatar")
+            article = self.client.post(
+                "/api/articles",
+                json={
+                    "title": "账号引用清理",
+                    "platform_accounts": {"wechat": account["id"]},
+                },
+            ).json()
+
+            response = self.client.delete(f"/api/accounts/{account['id']}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deleted"])
+        self.assertEqual(response.json()["cleanup_warning"], "")
+        self.assertFalse(profile_dir.exists())
+        self.assertFalse(avatar.exists())
+        remaining = self.client.get("/api/accounts?platform=wechat").json()
+        self.assertEqual([item["id"] for item in remaining], [other["id"]])
+        refreshed = self.client.get(f"/api/articles/{article['id']}").json()
+        self.assertNotIn("wechat", refreshed["platform_accounts"])
+        with backend.db.connection() as conn:
+            settings_count = conn.execute(
+                "SELECT COUNT(*) FROM wechat_account_settings WHERE account_id = ?",
+                (account["id"],),
+            ).fetchone()[0]
+        self.assertEqual(settings_count, 0)
+        missing = self.client.delete(f"/api/accounts/{account['id']}")
+        self.assertEqual(missing.status_code, 404)
+
+    def test_wechat_account_api_settings_are_account_scoped_and_masked(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-api"},
+        ).json()
+        response = self.client.put(
+            f"/api/accounts/{account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "app_id": "wx-test-app",
+                "app_secret": "secret-value",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        config = response.json()["wechat"]
+        self.assertEqual(config["publish_method"], "api")
+        self.assertEqual(config["app_id"], "wx-test-app")
+        self.assertTrue(config["app_secret_configured"])
+        self.assertNotIn("app_secret_encrypted", response.json())
+        credentials = backend.accounts.get_wechat_api_credentials(account["id"])
+        self.assertEqual(credentials["app_secret"], "secret-value")
+        with backend.db.connection() as conn:
+            encrypted = conn.execute(
+                "SELECT app_secret_encrypted FROM wechat_account_settings "
+                "WHERE account_id = ?",
+                (account["id"],),
+            ).fetchone()[0]
+        self.assertNotEqual(encrypted, "secret-value")
+
+    def test_wechat_api_test_records_independent_capabilities(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-capabilities"},
+        ).json()
+        self.client.put(
+            f"/api/accounts/{account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "app_id": "wx-test-app",
+                "app_secret": "secret-value",
+            },
+        )
+        client = Mock()
+        client._get_access_token.return_value = "token"
+        client._request_with_retry.side_effect = [{}, {}]
+        with patch(
+            "backend.platforms.wechat.WechatApiPublisher._client",
+            return_value=client,
+        ):
+            response = self.client.post(
+                f"/api/accounts/{account['id']}/wechat/test"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["capabilities"],
+            {"credentials": True, "draft": True, "publish": True},
+        )
+        refreshed = self.client.get("/api/accounts?platform=wechat").json()[0]
+        self.assertEqual(refreshed["wechat"]["api_status"], "valid")
+
+    def test_wechat_dispatcher_allows_api_only_account(self):
+        from backend.platforms.wechat import WechatApiPublisher, WechatPublisher
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "api-only"},
+        ).json()
+        self.client.put(
+            f"/api/accounts/{account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "app_id": "wx-test-app",
+                "app_secret": "secret-value",
+            },
+        )
+        article = {
+            "platform_accounts": {"wechat": account["id"]},
+            "title": "test",
+        }
+        with patch.object(
+            WechatApiPublisher,
+            "publish",
+            return_value={"status": "drafted", "external_id": "draft-id"},
+        ) as publish:
+            output = WechatPublisher({"wechat_enabled": True}).publish(
+                article,
+                "draft",
+            )
+        self.assertEqual(output["external_id"], "draft-id")
+        publish.assert_called_once()
+
+    def test_wechat_dispatcher_rejects_direct_publish_without_api_permission(self):
+        from backend.platforms.wechat import WechatApiPublisher, WechatPublisher
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "draft-only-api"},
+        ).json()
+        self.client.put(
+            f"/api/accounts/{account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "app_id": "wx-test-app",
+                "app_secret": "secret-value",
+            },
+        )
+        backend.accounts.update_wechat_api_status(
+            account["id"],
+            "valid",
+            {"credentials": True, "draft": True, "publish": False},
+        )
+        article = {
+            "platform_accounts": {"wechat": account["id"]},
+            "title": "test",
+        }
+
+        with (
+            patch.object(WechatApiPublisher, "publish") as publish,
+            self.assertRaisesRegex(ValueError, "没有直接发布权限"),
+        ):
+            WechatPublisher({"wechat_enabled": True}).publish(
+                article,
+                "publish",
+            )
+        publish.assert_not_called()
+
+    def test_ai_image_modes_resolve_automatic_counts(self):
+        from backend.services import resolve_ai_image_count
+
+        self.assertEqual(resolve_ai_image_count("article", "auto", 1200), 2)
+        self.assertEqual(resolve_ai_image_count("image", "auto", 700), 5)
+        self.assertEqual(resolve_ai_image_count("article", "cover", 3000), 1)
+        self.assertEqual(resolve_ai_image_count("article", "none", 3000), 0)
+        with self.assertRaises(ValueError):
+            resolve_ai_image_count("image", "none", 700)
+
+    def test_wechat_api_publish_waits_until_async_job_succeeds(self):
+        from publish_gzh import WechatArticlePublisher
+
+        client = Mock()
+        client._get_access_token.return_value = "token"
+        client._request_with_retry.side_effect = [
+            {"publish_status": 1},
+            {"publish_status": 0, "article_id": "article-id"},
+        ]
+        publisher = WechatArticlePublisher(client)
+        with patch("publish_gzh.time.sleep") as sleep:
+            article_id = publisher.wait_for_publish_result(
+                "publish-id",
+                timeout_seconds=10,
+                interval_seconds=0.01,
+            )
+
+        self.assertEqual(article_id, "article-id")
+        self.assertEqual(client._request_with_retry.call_count, 2)
+        sleep.assert_called_once_with(0.01)
 
     @staticmethod
     def _notion_article(source_key, page_id, title):

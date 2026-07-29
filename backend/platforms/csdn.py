@@ -145,26 +145,32 @@ def extract_csdn_profile(page):
     return profile
 
 
-def fetch_csdn_profile(account):
-    with open_account_browser(account) as context:
-        page = get_or_create_page(context)
-        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(2500)
-        if not _is_logged_in(page):
-            raise RuntimeError("CSDN login status has expired; please log in again")
-        profile = extract_csdn_profile(page)
-        avatar = page.locator(f"{PROFILE_CARD_SELECTOR} img").first
-        try:
-            if not avatar.count() or not avatar.is_visible():
-                raise RuntimeError("CSDN account avatar was not found")
-            avatar_path = account_avatar_path(account)
-            avatar_path.parent.mkdir(parents=True, exist_ok=True)
-            avatar.screenshot(path=str(avatar_path))
-            profile["avatar_cached"] = True
-        except Exception:
-            profile["avatar_cached"] = False
-        return profile
+def fetch_csdn_profile(account, page=None):
+    if page is None:
+        with open_account_browser(account) as context:
+            active_page = get_or_create_page(context)
+            active_page.goto(
+                HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            active_page.wait_for_timeout(2500)
+            return fetch_csdn_profile(account, page=active_page)
 
+    if not _is_logged_in(page):
+        raise RuntimeError("CSDN login status has expired; please log in again")
+    profile = extract_csdn_profile(page)
+    avatar = page.locator(f"{PROFILE_CARD_SELECTOR} img").first
+    try:
+        if not avatar.count() or not avatar.is_visible():
+            raise RuntimeError("CSDN account avatar was not found")
+        avatar_path = account_avatar_path(account)
+        avatar_path.parent.mkdir(parents=True, exist_ok=True)
+        avatar.screenshot(path=str(avatar_path))
+        profile["avatar_cached"] = True
+    except Exception:
+        profile["avatar_cached"] = False
+    return profile
 
 def _html(markdown_text):
     return markdown.markdown(markdown_text or "")
@@ -521,6 +527,7 @@ class CsdnPublisher(PlatformPublisher):
     key = "csdn"
     name = "CSDN"
     implemented = True
+    content_types = ("article",)
 
     def is_configured(self):
         return any(account["status"] == "valid" for account in list_accounts(self.key))

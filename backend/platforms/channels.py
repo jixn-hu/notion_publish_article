@@ -13,6 +13,7 @@ from backend.platforms.profile_utils import (
     first_visible_image,
     first_visible_text,
     metric_from_text,
+    parse_compact_count,
 )
 from backend.platforms.browser_video import (
     BrowserVideoPublisher,
@@ -36,6 +37,27 @@ PROFILE_AVATAR_SELECTORS = (
     "[class*='avatar'] img",
     "img[class*='avatar']",
 )
+PROFILE_API_SCRIPT = """
+async () => {
+  const response = await fetch(
+    '/cgi-bin/mmfinderassistant-bin/auth/auth_data',
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        timestamp: String(Date.now()),
+        rawKeyBuff: '',
+        pluginSessionId: null,
+        scene: 7,
+        reqScene: 7
+      })
+    }
+  )
+  if (!response.ok) return {}
+  return await response.json()
+}
+"""
 
 
 def _is_logged_in(page):
@@ -92,22 +114,66 @@ def _channels_text_profile(text):
     }
 
 
+def _channels_api_profile(payload):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    user = data.get("finderUser") if isinstance(data, dict) else None
+    if not isinstance(user, dict):
+        user = {}
+    return {
+        "display_name": str(user.get("nickname") or "").strip(),
+        "platform_user_id": str(
+            user.get("uniqId") or user.get("finderUsername") or ""
+        ).strip(),
+        "avatar_url": str(user.get("headImgUrl") or "").strip(),
+        "followers_count": parse_compact_count(user.get("fansCount")),
+        "works_count": parse_compact_count(user.get("feedsCount")),
+        "likes_count": parse_compact_count(
+            user.get("totalLikeCount")
+            if user.get("totalLikeCount") is not None
+            else user.get("likeCount")
+        ),
+    }
+
+
 def extract_channels_profile(page):
     body_text = page.locator("html > body").first.inner_text()
-    profile = _channels_text_profile(body_text)
-    profile.update(
-        {
-            "display_name": first_visible_text(
-                page,
-                PROFILE_NAME_SELECTORS,
-            ),
-            "avatar_url": "",
-            "following_count": None,
-        }
-    )
+    text_profile = _channels_text_profile(body_text)
+    try:
+        api_profile = _channels_api_profile(page.evaluate(PROFILE_API_SCRIPT))
+    except Exception:
+        api_profile = _channels_api_profile({})
+    profile = {
+        "display_name": api_profile["display_name"] or first_visible_text(
+            page,
+            PROFILE_NAME_SELECTORS,
+        ),
+        "platform_user_id": (
+            api_profile["platform_user_id"]
+            or text_profile["platform_user_id"]
+        ),
+        "avatar_url": api_profile["avatar_url"],
+        "following_count": None,
+        "followers_count": (
+            api_profile["followers_count"]
+            if api_profile["followers_count"] is not None
+            else text_profile["followers_count"]
+        ),
+        "works_count": (
+            api_profile["works_count"]
+            if api_profile["works_count"] is not None
+            else text_profile["works_count"]
+        ),
+        "likes_count": (
+            api_profile["likes_count"]
+            if api_profile["likes_count"] is not None
+            else text_profile["likes_count"]
+        ),
+    }
     avatar = first_visible_image(page, PROFILE_AVATAR_SELECTORS)
     if avatar is not None:
-        profile["avatar_url"] = avatar.get_attribute("src") or ""
+        profile["avatar_url"] = (
+            profile["avatar_url"] or avatar.get_attribute("src") or ""
+        )
         if not profile["display_name"]:
             profile["display_name"] = (
                 avatar.get_attribute("alt") or ""
@@ -117,26 +183,32 @@ def extract_channels_profile(page):
     return profile
 
 
-def fetch_channels_profile(account):
-    with open_account_browser(account) as context:
-        page = get_or_create_page(context)
-        page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(3500)
-        if not _is_logged_in(page):
-            raise RuntimeError("视频号登录状态已失效，请重新登录")
-        profile = extract_channels_profile(page)
-        avatar = first_visible_image(page, PROFILE_AVATAR_SELECTORS)
-        try:
-            if avatar is None:
-                raise RuntimeError("未找到视频号账号头像")
-            avatar_path = account_avatar_path(account)
-            avatar_path.parent.mkdir(parents=True, exist_ok=True)
-            avatar.screenshot(path=str(avatar_path))
-            profile["avatar_cached"] = True
-        except Exception:
-            profile["avatar_cached"] = False
-        return profile
+def fetch_channels_profile(account, page=None):
+    if page is None:
+        with open_account_browser(account) as context:
+            active_page = get_or_create_page(context)
+            active_page.goto(
+                PROFILE_URL,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            active_page.wait_for_timeout(3500)
+            return fetch_channels_profile(account, page=active_page)
 
+    if not _is_logged_in(page):
+        raise RuntimeError("视频号登录状态已失效，请重新登录")
+    profile = extract_channels_profile(page)
+    avatar = first_visible_image(page, PROFILE_AVATAR_SELECTORS)
+    try:
+        if avatar is None:
+            raise RuntimeError("未找到视频号账号头像")
+        avatar_path = account_avatar_path(account)
+        avatar_path.parent.mkdir(parents=True, exist_ok=True)
+        avatar.screenshot(path=str(avatar_path))
+        profile["avatar_cached"] = True
+    except Exception:
+        profile["avatar_cached"] = False
+    return profile
 
 def _find_upload_input(page, timeout_seconds=60):
     deadline = time.monotonic() + timeout_seconds

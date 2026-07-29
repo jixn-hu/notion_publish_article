@@ -1,0 +1,117 @@
+.background-tasks {
+  position: fixed;
+  z-index: 46;
+  top: 94px;
+  right: 24px;
+  width: min(370px, calc(100vw - var(--sidebar) - 48px));
+  overflow: hidden;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(29, 29, 31, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 16px 42px rgba(20, 20, 18, 0.15);
+  backdrop-filter: blur(20px) saturate(150%);
+  animation: background-tasks-in 180ms ease both;
+}
+
+@keyframes background-tasks-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.background-tasks > header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 6px;
+  min-height: 54px;
+  padding: 7px 9px 7px 13px;
+}
+
+.background-tasks-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.background-tasks-summary > svg { flex: 0 0 auto; color: #168653; }
+.background-tasks:has(.background-task.running) .background-tasks-summary > svg { color: var(--red); }
+.background-tasks-summary span,
+.background-tasks-summary b,
+.background-tasks-summary small { display: block; min-width: 0; }
+.background-tasks-summary b { margin-bottom: 2px; font-size: 12px; }
+.background-tasks-summary small { overflow: hidden; font-size: 10px; color: #6e6e73; text-overflow: ellipsis; white-space: nowrap; }
+
+.background-tasks .background-tasks-toggle {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #6e6e73;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  place-items: center;
+}
+
+.background-tasks .background-tasks-toggle:hover { color: var(--ink); background: #f0f0f2; }
+
+.background-task-list {
+  max-height: min(340px, 46dvh);
+  overflow-y: auto;
+  border-top: 1px solid rgba(29, 29, 31, 0.09);
+}
+
+.background-task {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 26px 26px;
+  align-items: center;
+  gap: 7px;
+  min-height: 70px;
+  padding: 10px 9px 10px 13px;
+}
+
+.background-task + .background-task { border-top: 1px solid rgba(29, 29, 31, 0.07); }
+.background-task.running { grid-template-columns: 24px minmax(0, 1fr); background: rgba(159, 53, 44, 0.045); }
+.background-task-icon { display: grid; color: #168653; place-items: center; }
+.background-task.running .background-task-icon,
+.background-task.failed .background-task-icon { color: var(--red); }
+.background-task > div { min-width: 0; }
+.background-task b,
+.background-task small,
+.background-task time { display: block; }
+.background-task b { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.background-task small { margin-top: 3px; overflow-wrap: anywhere; font-size: 9px; line-height: 1.4; color: #6e6e73; }
+.background-task time { margin-top: 4px; font-family: "IBM Plex Mono", monospace; font-size: 8px; color: #98989d; }
+
+.background-task-open,
+.background-task-dismiss {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: #6e6e73;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  place-items: center;
+}
+
+.background-task-open:hover,
+.background-task-dismiss:hover { color: var(--ink); background: #eeeeef; }
+
+@media (max-width: 760px) {
+  .background-tasks {
+    top: 82px;
+    right: 12px;
+    width: calc(100vw - 24px);
+  }
+}

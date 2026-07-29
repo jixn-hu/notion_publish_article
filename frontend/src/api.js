@@ -14,6 +14,12 @@ async function request (path, options = {}) {
   return data
 }
 
+function publishingRequest (path, options) {
+  const result = request(path, options)
+  window.dispatchEvent(new Event('moflow:publish-progress'))
+  return result
+}
+
 export const api = {
   health: () => request('/health'),
   dashboard: () => request('/dashboard'),
@@ -34,6 +40,7 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ url })
   }),
+  scanRss: () => request('/rss/scan', { method: 'POST' }),
   createNews: values => request('/news', {
     method: 'POST',
     body: JSON.stringify(values)
@@ -74,6 +81,7 @@ export const api = {
     }
     return response.blob()
   },  article: id => request(`/articles/${id}`),
+  deleteArticle: id => request(`/articles/${id}`, { method: 'DELETE' }),
   createArticle: values => request('/articles', {
     method: 'POST',
     body: JSON.stringify(values)
@@ -86,23 +94,35 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(values)
   }),
+  previewAssistant: values => request('/assistant/preview', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  executeAssistant: values => request('/assistant/execute', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
   regenerateArticleImage: (id, imageIndex) =>
     request('/articles/' + id + '/images/' + imageIndex + '/regenerate', { method: 'POST' }),  updateArticle: (id, values) => request(`/articles/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(values)
   }),
-  publishArticle: (id, platformActions = null) => request(`/articles/${id}/publish`, {
+  publishArticle: (id, platformActions = null) => publishingRequest(`/articles/${id}/publish`, {
     method: 'POST',
     body: JSON.stringify({ platform_actions: platformActions })
   }),
+  retryArticlePlatform: (id, platform) =>
+    publishingRequest(`/articles/${id}/platforms/${platform}/retry`, { method: 'POST' }),
   enrichArticle: id => request(`/articles/${id}/enrich`, { method: 'POST' }),
   syncNotion: () => request('/sync/notion', { method: 'POST' }),
-  runAutomation: () => request('/automation/publish', { method: 'POST' }),
+  runAutomation: () => publishingRequest('/automation/publish', { method: 'POST' }),
+  publishProgress: () => request('/publish-progress'),
   accounts: (platform = '') => request(`/accounts${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`),
   createAccount: values => request('/accounts', {
     method: 'POST',
     body: JSON.stringify(values)
   }),
+  deleteAccount: id => request(`/accounts/${id}`, { method: 'DELETE' }),
   openAccountBrowser: id => request(`/accounts/${id}/browser`, { method: 'POST' }),
   loginAccount: id => request(`/accounts/${id}/login`, { method: 'POST' }),
   checkAccount: id => request(`/accounts/${id}/check`, { method: 'POST' }),
@@ -112,6 +132,13 @@ export const api = {
     body: JSON.stringify({ proxy_id: proxyId })
   }),
   proxies: () => request('/proxies'),
+  updateWechatAccount: (id, values) => request(`/accounts/${id}/wechat`, {
+    method: 'PUT',
+    body: JSON.stringify(values)
+  }),
+  testWechatAccount: id => request(`/accounts/${id}/wechat/test`, {
+    method: 'POST'
+  }),
   createProxy: values => request('/proxies', {
     method: 'POST',
     body: JSON.stringify(values)

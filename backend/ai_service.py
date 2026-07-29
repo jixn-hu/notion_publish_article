@@ -4,13 +4,6 @@ import re
 import requests
 
 
-PLATFORM_GUIDANCE = {
-    "wechat": "微信公众号：结构完整、标题克制、段落清晰，适合深度阅读。",
-    "xiaohongshu": "小红书：标题有吸引力，正文短段落、重点前置，可给出话题标签。",
-    "csdn": "CSDN：技术表达准确，保留代码和步骤，标题便于搜索。",
-}
-
-
 class AIContentService:
     def __init__(self, settings):
         self.base_url = settings["ai_base_url"].rstrip("/")
@@ -43,46 +36,29 @@ class AIContentService:
 
     def enrich(self, article):
         self.validate()
-        targets = article.get("target_platforms") or ["wechat"]
-        guidance = "\n".join(
-            PLATFORM_GUIDANCE[key]
-            for key in targets
-            if key in PLATFORM_GUIDANCE
-        )
         prompt = f"""
-你是一名严谨的中文内容编辑。请加工下面的原稿，但不得虚构事实、数据、
-经历或引用。信息不足时保留原意，不自行补造。
+你是一名严谨的中文内容编辑。请审阅下面的主稿，但不得改写正文，也不得
+虚构事实、数据、经历或引用。
 
 任务：
-1. 提取 3-8 个准确标签；
-2. 写一段不超过 120 字的摘要；
-3. 给编辑留下需要人工确认的事项；
-4. 针对目标平台分别生成标题和 Markdown 正文。可以优化结构、语气、
-   开头和小标题，但必须保留原稿事实。
-
-平台要求：
-{guidance}
+1. 提取 1-5 个准确、简洁的标签，标签不能为空；
+2. 推荐一个可选标题，用户会自行决定是否采用；
+3. 写一段不超过 120 字的摘要；
+4. 给编辑留下需要人工确认的事项。
 
 {self.custom_prompt}
 
 仅返回一个 JSON 对象，不要 Markdown 代码围栏：
 {{
+  "recommended_title": "推荐标题",
   "tags": ["标签"],
   "summary": "摘要",
-  "editor_notes": "人工确认事项，没有则为空字符串",
-  "platforms": {{
-    "wechat": {{
-      "title": "平台标题",
-      "content_md": "平台 Markdown 正文",
-      "tags": ["平台标签"]
-    }}
-  }}
+  "editor_notes": "人工确认事项，没有则为空字符串"
 }}
 
-原稿标题：{article["title"]}
+主稿标题：{article["title"]}
 作者：{article.get("author", "")}
-目标平台：{", ".join(targets)}
-原稿 Markdown：
+主稿 Markdown：
 {article["content_md"]}
 """.strip()
 
@@ -95,7 +71,9 @@ class AIContentService:
                 "messages": [
                     {
                         "role": "system",
-                        "content": "你只输出合法 JSON，是一名不虚构事实的内容编辑。",
+                        "content": (
+                            "你只输出合法 JSON，是一名不虚构事实的内容编辑。"
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -109,7 +87,7 @@ class AIContentService:
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("AI 响应缺少 choices[0].message.content") from exc
         result = self._parse_json(content)
-        return self._validate_result(result, targets)
+        return self._validate_result(result)
 
     def generate_article(self, specification):
         self.validate()
@@ -199,11 +177,120 @@ class AIContentService:
             image_count,
         )
 
+    def generate_assistant_item(self, target, instruction, source_url=""):
+        self.validate()
+        target_guidance = {
+            "note": (
+                "生成一张原子化 Markdown 卡片笔记。整张卡片只介绍一个概念、"
+                "一个事实、一个结论或一个操作点；标题必须直接命名这个小点。"
+                "如果用户输入包含多个主题，只选择最核心的一个，不罗列其余主题。"
+                "正文控制在 150-500 字，最多三个短段落，不扩写行业背景、相关概念、"
+                "延伸阅读或泛化总结；标签 1-5 个。"
+            ),
+            "news": (
+                "整理为资讯资料卡。只使用用户提供的信息，不补造新闻事实、"
+                "数据、时间或引语；信息不足时明确写出待核实项。"
+            ),
+            "image": (
+                "设计一张可进入素材库的图片。image_prompt 要具体描述主体、"
+                "场景、构图、光线和风格，且要求画面中不要生成文字或水印。"
+            ),
+        }
+        if target not in target_guidance:
+            raise ValueError("助手目标类型无效")
+        prompt = f"""
+用户希望通过内容助手创建一项资料。
+
+目标：{target}
+用户要求：
+{instruction}
+来源链接：{source_url or "未提供"}
+
+任务要求：
+{target_guidance[target]}
+标题简洁明确；摘要/说明保持简短；标签数量服从对应目标要求。
+Markdown 正文使用清晰的小标题和列表，不要重复一级标题。
+{self.custom_prompt}
+
+只返回合法 JSON 对象，不要代码围栏或解释：
+{{
+  "title": "标题",
+  "summary": "摘要或素材说明",
+  "content_md": "Markdown 正文；图片目标可为空",
+  "tags": ["标签"],
+  "source_name": "资讯来源名称；非资讯留空",
+  "image_prompt": "图片生成提示词；非图片留空"
+}}
+""".strip()
+        response = self.session.post(
+            f"{self.base_url}/chat/completions",
+            headers=self._headers(),
+            json={
+                "model": self.model,
+                "temperature": 0.55,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是墨流内容助手，只输出合法 JSON，"
+                            "不虚构用户未提供的事实。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=180,
+        )
+        self._raise(response)
+        payload = response.json()
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("AI 响应缺少 choices[0].message.content") from exc
+        return self.validate_assistant_item(
+            target,
+            self._parse_json(content),
+        )
+
+    @staticmethod
+    def validate_assistant_item(target, result):
+        if target not in {"note", "news", "image"}:
+            raise ValueError("助手目标类型无效")
+        if not isinstance(result, dict):
+            raise RuntimeError("AI 助手结果必须是 JSON 对象")
+
+        def clean(value, limit):
+            return str(value or "").strip()[:limit]
+
+        title = clean(result.get("title"), 200 if target == "news" else 120)
+        if not title:
+            raise RuntimeError("AI 助手结果缺少标题")
+        content_limit = {"news": 50000, "note": 1000}.get(target, 20000)
+        content_md = clean(result.get("content_md"), content_limit)
+        image_prompt = clean(result.get("image_prompt"), 3000)
+        if target in {"note", "news"} and not content_md:
+            raise RuntimeError("AI 助手结果缺少正文")
+        if target == "image" and not image_prompt:
+            raise RuntimeError("AI 助手结果缺少图片提示词")
+        tags = result.get("tags")
+        tags = tags if isinstance(tags, list) else []
+        return {
+            "title": title,
+            "summary": clean(result.get("summary"), 120 if target == "note" else 1000),
+            "content_md": content_md,
+            "tags": [
+                clean(tag, 30) for tag in tags if clean(tag, 30)
+            ][: 5 if target == "note" else 12],
+            "source_name": clean(result.get("source_name"), 120),
+            "image_prompt": image_prompt,
+        }
     def generate_image_storyboard(self, specification):
         self.validate()
         page_count = int(specification.get("image_count") or 5)
         prompt = f"""
-请为中文图文帖子设计可直接出图的分镜脚本。
+请为中文图文帖子设计可直接出图、可脱离发布文案独立阅读的分镜脚本。
+
+这里的“图文”不是文章配图：读者主要通过逐页图片获取内容，图片必须承担完整的信息表达。
 
 主题：{specification["topic"]}
 目标读者：{specification.get("audience") or "由你根据主题判断"}
@@ -216,12 +303,14 @@ class AIContentService:
 {specification.get("news") or "未选择参考资讯"}
 
 要求：
-1. 第 1 页必须是 cover，标题短而有记忆点；其余页面为 content，最后一页可为 ending。
-2. 每页只讲一个重点，headline 适合大字展示，body 要短、具体、可读。
-3. visual 描述主体、场景和关键视觉元素，layout 描述标题、正文、留白和视觉焦点的位置。
-4. visual_style 是所有页面共享的设计系统，具体描述色板、字体气质、图形语言和版式规则。
-5. caption_md 是图片之外的发布文案，不重复逐页文案，结尾可自然引导互动。
-6. 不虚构数据、案例、经历或引用；避免平台 Logo、用户 ID、水印、手机边框和无关文字。
+1. 第 1 页必须是 cover，标题短而有记忆点，并在 body 中给出一句副标题；其余页面为 content，最后一页可为 ending。
+2. 每页只讲一个重点，但必须讲完整。headline 适合大字展示；body 是必须原样放进图片的可见正文，内容页建议 40-140 个中文字符，可使用 2-5 条短列表、步骤、对比或结论，不能只写一句空泛口号。
+3. 相邻页面要形成清楚的阅读顺序，避免重复观点。仅看所有图片、不看 caption_md，读者也应能理解主题并获得完整信息。
+4. visual 只描述辅助信息理解的主体、场景、图标、图表或关键视觉元素，不要用视觉装饰替代正文内容。
+5. layout 必须明确本页的信息结构，例如“标题 + 三条要点 + 底部结论”“左右对比”“三步流程”，并确保信息区是页面主体、视觉元素是辅助。
+6. visual_style 是所有页面共享的设计系统，具体描述色板、字体气质、图形语言和版式规则。
+7. caption_md 是图片之外的发布文案，不重复逐页文案，结尾可自然引导互动。
+8. 不虚构数据、案例、经历或引用；避免平台 Logo、用户 ID、水印、手机边框和无关文字。
 
 只返回合法 JSON，不要代码围栏或解释：
 {{
@@ -348,16 +437,21 @@ class AIContentService:
         plans = []
         for page in storyboard["pages"]:
             role_guidance = {
-                "cover": "封面：主标题占据视觉主位，瞬间传达主题，背景可以更有冲击力。",
-                "content": "内容页：信息层级清楚，正文适合手机阅读，重点有明确视觉强调。",
-                "ending": "收尾页：总结或行动引导突出，画面有完整、收束的感觉。",
+                "cover": "封面页：准确呈现主标题和副标题，标题占据视觉主位，瞬间传达主题；视觉负责吸引，但不能遮挡文字。",
+                "content": "内容页：这是知识信息卡，不是插画。文字信息区应占主要版面，完整呈现本页观点、步骤或列表；视觉元素只用于解释和强调。",
+                "ending": "收尾页：完整呈现总结、清单或行动建议，信息仍然可独立阅读，画面有明确的收束感。",
             }[page["role"]]
             prompt = f"""
-生成一张高质量中文图文页面，竖版 3:4，画面铺满，不要白边和手机边框。
+生成一张高质量中文信息卡片页面，竖版 3:4，画面铺满，不要白边和手机边框。
+
+这是一组以图片为主要阅读载体的图文内容，不是给文章配一张装饰插图。页面必须先把信息讲清楚，再考虑视觉美感。
 
 当前页面：P{page['index'] + 1} / {len(storyboard['pages'])}，{page['role']}
-必须准确呈现的中文主标题：{page['headline']}
-必须准确呈现的中文正文：{page['body'] or '无正文，不要自行添加文字'}
+必须逐字、完整、清晰呈现的中文主标题：{page['headline']}
+必须逐字、完整、清晰呈现的中文正文（保留换行和列表层级）：
+---
+{page['body'] or '无正文，不要自行添加文字'}
+---
 视觉内容：{page['visual']}
 构图要求：{page['layout'] or '保证文字清晰、视觉焦点明确、留白合理'}
 页面规则：{role_guidance}
@@ -376,6 +470,11 @@ class AIContentService:
 完整分镜：
 {outline}
 
+硬性排版要求：
+- 信息表达优先，内容页的标题和正文区域合计占页面视觉权重的 60%-80%，插画、摄影或装饰不得喧宾夺主。
+- 标题、正文、列表必须有明确字号层级和足够对比度，适合手机直接阅读；正文不能缩成小字，也不能被裁切、遮挡或改写。
+- 可以使用分区、序号、项目符号、流程线、对比栏和小图标组织内容，不要生成只有一句标题的大幅氛围图。
+
 所有页面必须像同一位设计师完成的同一套作品。中文必须清晰、完整、方向正确，除指定标题和正文外不要生成其他文字。不要平台 Logo、用户 ID、水印、二维码或签名。
 """.strip()
             plans.append(
@@ -384,6 +483,7 @@ class AIContentService:
                     "alt": page["headline"],
                     "purpose": page["role"],
                     "prompt": prompt,
+                    "content_kind": "image_post",
                 }
             )
         return plans
@@ -469,31 +569,26 @@ class AIContentService:
             raise RuntimeError("AI 没有返回合法 JSON，请重试或调整模型") from exc
 
     @staticmethod
-    def _validate_result(result, targets):
+    def _validate_result(result):
         if not isinstance(result, dict):
             raise RuntimeError("AI 结果必须是 JSON 对象")
         tags = result.get("tags", [])
-        platforms = result.get("platforms", {})
-        if not isinstance(tags, list) or not isinstance(platforms, dict):
-            raise RuntimeError("AI 结果中的 tags 或 platforms 格式不正确")
-        clean_platforms = {}
-        for key in targets:
-            value = platforms.get(key)
-            if not isinstance(value, dict):
-                continue
-            clean_platforms[key] = {
-                "title": str(value.get("title", "")).strip(),
-                "content_md": str(value.get("content_md", "")).strip(),
-                "tags": [
-                    str(tag).strip()
-                    for tag in value.get("tags", [])
-                    if str(tag).strip()
-                ],
-            }
+        if not isinstance(tags, list):
+            raise RuntimeError("AI 结果中的 tags 格式不正确")
+        clean_tags = list(
+            dict.fromkeys(
+                str(tag).strip()
+                for tag in tags
+                if str(tag).strip()
+            )
+        )[:5]
+        if not clean_tags:
+            raise RuntimeError("AI 未生成有效标签，请重试或调整模型")
         return {
-            "tags": [str(tag).strip() for tag in tags if str(tag).strip()],
+            "recommended_title": str(
+                result.get("recommended_title", "")
+            ).strip(),
+            "tags": clean_tags,
             "summary": str(result.get("summary", "")).strip(),
             "editor_notes": str(result.get("editor_notes", "")).strip(),
-            "platforms": clean_platforms,
         }
-

@@ -4,7 +4,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -15,16 +15,19 @@ from backend.logging_config import configure_logging
 
 
 from backend.ai_service import AIContentService
+from backend.assistant import execute_assistant, preview_assistant
 from backend.accounts import (
     account_avatar_path,
     check_account,
     create_account,
+    delete_account,
     get_account,
     list_accounts,
     login_account,
     open_account_view,
     refresh_account_profile,
     update_account_proxy,
+    update_wechat_account_settings,
 )
 from backend.db import init_db
 from backend.media import resolve_media_file, save_upload
@@ -47,24 +50,30 @@ from backend.news import (
     update_news,
 )
 from backend.platforms import get_platforms
+from backend.publish_progress import publish_progress
+from backend.platforms.wechat import test_wechat_api_account
 from backend.proxies import (
     create_proxy,
     delete_proxy,
     list_proxies,
     test_proxy,
 )
+from backend.rss import scan_rss_feeds
 from backend.scheduler import AutomationScheduler
 from backend.services import (
     create_article,
+    delete_article,
     dashboard_summary,
     enrich_article,
     generate_ai_article,
+    generate_ai_article_images,
     generate_ai_storyboard,
     get_article,
     list_articles,
     notion_client,
     publish_article,
     regenerate_ai_image,
+    retry_article_platform,
     run_auto_publish,
     sync_from_notion,
     update_article,
@@ -114,7 +123,8 @@ async def request_log(request, call_next):
         )
         raise
     elapsed_ms = (time.perf_counter() - started) * 1000
-    log = logger.debug if request.url.path == "/api/health" else logger.info
+    quiet_paths = {"/api/health", "/api/publish-progress"}
+    log = logger.debug if request.url.path in quiet_paths else logger.info
     log(
         "HTTP 请求完成 method=%s path=%s status=%s elapsed_ms=%.1f",
         request.method,
@@ -162,9 +172,39 @@ class AIGeneratePayload(BaseModel):
     requirements: str = Field(default="", max_length=2000)
     word_count: int = Field(default=1200, ge=300, le=5000)
     image_count: int = Field(default=1, ge=0, le=9)
+    image_mode: str | None = None
     storyboard: dict[str, Any] | None = None
     material_ids: list[int] = Field(default_factory=list, max_length=20)
     news_ids: list[int] = Field(default_factory=list, max_length=20)
+
+
+class AssistantPreviewPayload(BaseModel):
+    target: str
+    instruction: str = Field(min_length=2, max_length=4000)
+    article_type: str = "article"
+    author: str = Field(default="", max_length=50)
+    audience: str = Field(default="", max_length=200)
+    style: str = Field(default="", max_length=100)
+    requirements: str = Field(default="", max_length=2000)
+    word_count: int = Field(default=1200, ge=300, le=5000)
+    image_count: int = Field(default=1, ge=0, le=9)
+    image_mode: str = "auto"
+    source_url: str = Field(default="", max_length=2000)
+    source_name: str = Field(default="", max_length=120)
+    material_ids: list[int] = Field(default_factory=list, max_length=20)
+    news_ids: list[int] = Field(default_factory=list, max_length=20)
+
+
+class AssistantExecutePayload(BaseModel):
+    target: str
+    draft: dict[str, Any]
+    article_type: str = "article"
+    author: str = Field(default="", max_length=50)
+    image_count: int = Field(default=0, ge=0, le=9)
+    source_url: str = Field(default="", max_length=2000)
+    image_mode: str = "auto"
+    source_name: str = Field(default="", max_length=120)
+    references: dict[str, list[int]] = Field(default_factory=dict)
 
 
 class ArticleUpdatePayload(BaseModel):
@@ -238,6 +278,13 @@ class AccountPayload(BaseModel):
 
 class AccountProxyPayload(BaseModel):
     proxy_id: int | None = None
+
+
+class WechatAccountSettingsPayload(BaseModel):
+    publish_method: str = "browser"
+    app_id: str | None = Field(default=None, max_length=128)
+    app_secret: str | None = Field(default=None, max_length=256)
+
 
 
 class ProxyPayload(BaseModel):
@@ -319,6 +366,10 @@ def accounts_post(payload: AccountPayload):
 
 
 
+@app.delete("/api/accounts/{account_id}")
+def account_delete(account_id: int):
+    return api_call(delete_account, account_id)
+
 @app.post("/api/accounts/{account_id}/browser")
 def account_browser(account_id: int):
     return api_call(open_account_view, account_id)
@@ -342,6 +393,24 @@ def account_profile(account_id: int):
 def account_proxy(account_id: int, payload: AccountProxyPayload):
     return api_call(update_account_proxy, account_id, payload.proxy_id)
 
+
+@app.put("/api/accounts/{account_id}/wechat")
+def account_wechat_settings(
+    account_id: int,
+    payload: WechatAccountSettingsPayload,
+):
+    return api_call(
+        update_wechat_account_settings,
+        account_id,
+        payload.publish_method,
+        payload.app_id,
+        payload.app_secret,
+    )
+
+
+@app.post("/api/accounts/{account_id}/wechat/test")
+def account_wechat_test(account_id: int):
+    return api_call(test_wechat_api_account, account_id, get_settings())
 
 @app.get("/api/proxies")
 def proxies_get():
@@ -454,6 +523,13 @@ def news_collect_post(payload: NewsCollectPayload):
     return api_call(collect_news, payload.url)
 
 
+@app.post("/api/rss/scan")
+def rss_scan():
+    result = api_call(scan_rss_feeds)
+    scheduler.mark_rss_scan()
+    return result
+
+
 @app.get("/api/news/{news_id}")
 def news_get(news_id: int):
     return api_call(get_news, news_id)
@@ -467,6 +543,16 @@ def news_patch(news_id: int, payload: NewsUpdatePayload):
 @app.delete("/api/news/{news_id}")
 def news_delete(news_id: int):
     return api_call(delete_news, news_id)
+
+@app.post("/api/assistant/preview")
+def assistant_preview(payload: AssistantPreviewPayload):
+    return api_call(preview_assistant, payload.model_dump())
+
+
+@app.post("/api/assistant/execute", status_code=201)
+def assistant_execute(payload: AssistantExecutePayload):
+    return api_call(execute_assistant, payload.model_dump())
+
 
 @app.get("/api/articles")
 def articles_get(
@@ -495,13 +581,27 @@ def articles_generate_storyboard(payload: AIGeneratePayload):
 
 
 @app.post("/api/articles/generate", status_code=201)
-def articles_generate(payload: AIGeneratePayload):
-    return api_call(generate_ai_article, payload.model_dump())
+def articles_generate(
+    payload: AIGeneratePayload,
+    background_tasks: BackgroundTasks,
+):
+    article = api_call(generate_ai_article, payload.model_dump())
+    generation = article.get("ai_result", {}).get("image_generation") or {}
+    if generation.get("status") == "queued":
+        background_tasks.add_task(
+            generate_ai_article_images,
+            article["id"],
+        )
+    return article
 
 @app.get("/api/articles/{article_id}")
 def article_get(article_id: int):
     return api_call(get_article, article_id)
 
+
+@app.delete("/api/articles/{article_id}")
+def article_delete(article_id: int):
+    return api_call(delete_article, article_id)
 
 @app.patch("/api/articles/{article_id}")
 def article_patch(article_id: int, payload: ArticleUpdatePayload):
@@ -518,6 +618,10 @@ def article_publish(article_id: int, payload: PublishPayload):
     return api_call(publish_article, article_id, payload.platform_actions)
 
 
+@app.post("/api/articles/{article_id}/platforms/{platform}/retry")
+def article_platform_retry(article_id: int, platform: str):
+    return api_call(retry_article_platform, article_id, platform)
+
 @app.post("/api/articles/{article_id}/enrich")
 def article_enrich(article_id: int):
     return api_call(enrich_article, article_id)
@@ -531,6 +635,11 @@ def sync_notion():
 @app.post("/api/automation/publish")
 def automation_publish():
     return api_call(run_auto_publish)
+
+
+@app.get("/api/publish-progress")
+def publish_progress_get():
+    return {"operation": publish_progress.snapshot()}
 
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

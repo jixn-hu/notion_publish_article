@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Check,
   ExternalLink,
   FileSearch,
   Link2,
@@ -486,10 +487,15 @@ export function NewsPicker ({ selected = [], onChange }) {
               key={item.id}
               onClick={() => toggle(item.id)}
             >
-              <Newspaper size={14} />
-              <span>
+              <span className='reference-item-icon news'>
+                <Newspaper size={17} />
+              </span>
+              <span className='reference-item-copy'>
                 <b>{item.title}</b>
                 <small>{item.source_name || sourceFromUrl(item.source_url)}</small>
+              </span>
+              <span className='reference-item-check'>
+                {active && <Check size={14} />}
               </span>
             </button>
           )

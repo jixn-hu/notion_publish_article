@@ -22,6 +22,9 @@ class AIImageService:
         )
         self.model = str(settings.get("ai_image_model") or "").strip()
         self.size = str(settings.get("ai_image_size") or "1024x1024").strip()
+        self.image_post_size = str(
+            settings.get("ai_image_post_size") or "1024x1536"
+        ).strip()
         self.session = requests.Session()
         self.session.trust_env = False
         proxy_url = str(settings.get("ai_proxy_url") or "").strip()
@@ -52,13 +55,18 @@ class AIImageService:
         return generated
 
     def _generate_one(self, plan):
+        size = (
+            self.image_post_size
+            if plan.get("content_kind") == "image_post"
+            else self.size
+        )
         response = self.session.post(
             f"{self.base_url}/images/generations",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.model,
                 "prompt": plan["prompt"],
-                "size": self.size,
+                "size": size,
                 "n": 1,
                 "response_format": "b64_json",
             },

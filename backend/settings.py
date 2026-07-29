@@ -4,7 +4,11 @@ from backend.db import connection, utc_now
 
 
 SECRET_MASK = "••••••••"
-DEPRECATED_SETTING_KEYS = {"notion_field_published_platforms"}
+DEPRECATED_SETTING_KEYS = {
+    "notion_field_published_platforms",
+    "notion_value_article",
+    "notion_value_image",
+}
 
 SETTING_DEFINITIONS = {
     "notion_token": {"default": "", "secret": True, "group": "notion"},
@@ -27,7 +31,12 @@ SETTING_DEFINITIONS = {
         "group": "notion",
     },
     "notion_pending_status": {
-        "default": "待发布",
+        "default": "待同步",
+        "secret": False,
+        "group": "notion",
+    },
+    "notion_synced_status": {
+        "default": "已同步",
         "secret": False,
         "group": "notion",
     },
@@ -55,17 +64,7 @@ SETTING_DEFINITIONS = {
     },
     "notion_field_tags": {"default": "标签", "secret": False, "group": "notion"},
     "notion_field_status": {"default": "状态", "secret": False, "group": "notion"},
-    "notion_value_article": {
-        "default": "图文",
-        "secret": False,
-        "group": "notion",
-    },
-    "notion_value_image": {
-        "default": "图片",
-        "secret": False,
-        "group": "notion",
-    },
-    "wechat_enabled": {"default": False, "secret": False, "group": "wechat"},
+"wechat_enabled": {"default": False, "secret": False, "group": "wechat"},
     "wechat_app_id": {"default": "", "secret": False, "group": "wechat"},
     "wechat_app_secret": {"default": "", "secret": True, "group": "wechat"},
     "wechat_proxy_url": {"default": "", "secret": False, "group": "wechat"},
@@ -105,6 +104,20 @@ SETTING_DEFINITIONS = {
         "group": "xiaohongshu",
     },
     "csdn_enabled": {"default": False, "secret": False, "group": "csdn"},
+    "rss_feed_urls": {
+        "default": [
+            "https://justlovemaki.github.io/CloudFlare-AI-Insight-Daily/rss.xml",
+            "http://feeds-origin.appinn.com/appinns",
+        ],
+        "secret": False,
+        "group": "rss",
+    },
+    "rss_enabled": {"default": False, "secret": False, "group": "rss"},
+    "rss_scan_interval_minutes": {
+        "default": 60,
+        "secret": False,
+        "group": "rss",
+    },
     "auto_publish_enabled": {
         "default": False,
         "secret": False,
@@ -115,7 +128,11 @@ SETTING_DEFINITIONS = {
         "secret": False,
         "group": "automation",
     },
-    "default_publish_mode": {
+    "auto_publish_targets": {
+        "default": {},
+        "secret": False,
+        "group": "automation",
+    },    "default_publish_mode": {
         "default": "manual",
         "secret": False,
         "group": "automation",
@@ -139,6 +156,7 @@ SETTING_DEFINITIONS = {
     "ai_image_api_key": {"default": "", "secret": True, "group": "ai"},
     "ai_image_model": {"default": "", "secret": False, "group": "ai"},
     "ai_image_size": {"default": "1024x1024", "secret": False, "group": "ai"},
+    "ai_image_post_size": {"default": "1024x1536", "secret": False, "group": "ai"},
 }
 
 
@@ -153,6 +171,19 @@ def _decode(value):
 def ensure_defaults():
     now = utc_now()
     with connection() as conn:
+        workflow_migration_needed = conn.execute(
+            "SELECT 1 FROM settings WHERE key = 'notion_synced_status'"
+        ).fetchone() is None
+        if workflow_migration_needed:
+            migrations = {
+                "notion_pending_status": ("待发布", "待同步"),
+            }
+            for key, (old_value, new_value) in migrations.items():
+                conn.execute(
+                    "UPDATE settings SET value = ?, updated_at = ? "
+                    "WHERE key = ? AND value = ?",
+                    (_encode(new_value), now, key, _encode(old_value)),
+                )
         for key in DEPRECATED_SETTING_KEYS:
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         for key, definition in SETTING_DEFINITIONS.items():
@@ -234,6 +265,60 @@ def update_settings(values):
                 raise ValueError(f"{key} 必须是大于 0 的整数")
             if expected_type is str and not isinstance(value, str):
                 raise ValueError(f"{key} 必须是字符串")
+            if expected_type is list:
+                if not isinstance(value, list) or any(
+                    not isinstance(item, str) for item in value
+                ):
+                    raise ValueError(f"{key} 必须是字符串列表")
+                cleaned = []
+                for item in value:
+                    item = item.strip()
+                    if item and item not in cleaned:
+                        cleaned.append(item[:2000])
+                if len(cleaned) > 50:
+                    raise ValueError("RSS 订阅源最多配置 50 个")
+                value = cleaned
+            if expected_type is dict:
+                if not isinstance(value, dict):
+                    raise ValueError(f"{key} 必须是对象")
+                if key == "auto_publish_targets":
+                    from backend.accounts import get_account
+
+                    cleaned = {}
+                    valid_platforms = {
+                        "wechat", "xiaohongshu", "douyin", "channels",
+                        "bilibili", "csdn",
+                    }
+                    for platform, target in value.items():
+                        if platform not in valid_platforms:
+                            raise ValueError(f"未知自动发布平台: {platform}")
+                        if not isinstance(target, dict):
+                            raise ValueError("自动发布平台配置必须是对象")
+                        enabled = target.get("enabled", False)
+                        account_id = target.get("account_id")
+                        action = target.get("action", "publish")
+                        if not isinstance(enabled, bool):
+                            raise ValueError("自动发布平台启用状态必须是布尔值")
+                        if enabled and (
+                            not isinstance(account_id, int)
+                            or isinstance(account_id, bool)
+                            or account_id < 1
+                        ):
+                            raise ValueError("已启用平台必须选择发布账号")
+                        if action not in {"draft", "publish"}:
+                            raise ValueError("自动发布动作必须是 draft 或 publish")
+                        if platform not in {"wechat", "csdn"} and action == "draft":
+                            raise ValueError("该平台暂不支持保存草稿")
+                        if account_id is not None:
+                            account = get_account(account_id)
+                            if account["platform"] != platform:
+                                raise ValueError("所选账号与自动发布平台不匹配")
+                        cleaned[platform] = {
+                            "enabled": enabled,
+                            "account_id": account_id,
+                            "action": action,
+                        }
+                    value = cleaned
             current[key] = value
             conn.execute(
                 """

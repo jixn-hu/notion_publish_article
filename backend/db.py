@@ -78,6 +78,24 @@ def init_db():
                 FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS article_platform_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                action TEXT NOT NULL,
+                account_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                external_id TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL,
+                UNIQUE(article_id, platform)
+            );
             CREATE TABLE IF NOT EXISTS proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -105,6 +123,20 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(proxy_id) REFERENCES proxies(id),
                 UNIQUE(platform, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS wechat_account_settings (
+                account_id INTEGER PRIMARY KEY,
+                publish_method TEXT NOT NULL DEFAULT 'browser',
+                app_id TEXT NOT NULL DEFAULT '',
+                app_secret_encrypted TEXT NOT NULL DEFAULT '',
+                api_status TEXT NOT NULL DEFAULT 'pending',
+                api_capabilities_json TEXT NOT NULL DEFAULT '{}',
+                api_last_error TEXT NOT NULL DEFAULT '',
+                api_last_checked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS materials (
@@ -185,7 +217,45 @@ def init_db():
                 ON articles(status);
             CREATE INDEX IF NOT EXISTS idx_publish_records_article
                 ON publish_records(article_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_article_platform_states_status
+                ON article_platform_states(status, updated_at);
             """
+        )
+        # 将旧发布记录迁移为平台状态，升级后也能避免重复发布。
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO article_platform_states (
+                article_id, platform, action, account_id, status, attempts,
+                external_id, last_error, started_at, completed_at,
+                created_at, updated_at
+            )
+            SELECT
+                r.article_id,
+                r.platform,
+                r.action,
+                NULL,
+                r.status,
+                (
+                    SELECT COUNT(*) FROM publish_records counted
+                    WHERE counted.article_id = r.article_id
+                      AND counted.platform = r.platform
+                ),
+                COALESCE(r.external_id, ''),
+                r.error,
+                NULL,
+                r.published_at,
+                r.created_at,
+                ?
+            FROM publish_records r
+            WHERE r.id = (
+                SELECT MAX(latest.id) FROM publish_records latest
+                WHERE latest.article_id = r.article_id
+                  AND latest.platform = r.platform
+            )
+              AND r.status IN ('drafted', 'published', 'failed')
+            """,
+            (now,),
         )
         _ensure_columns(
             conn,

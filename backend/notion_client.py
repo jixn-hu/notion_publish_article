@@ -3,8 +3,13 @@ import time
 
 import requests
 
+from backend.markdown_utils import normalize_notion_markdown
+
 
 logger = logging.getLogger("mozhou.notion")
+
+NETWORK_ATTEMPTS = 3
+NETWORK_RETRY_DELAYS = (1, 2)
 
 
 class NotionClient:
@@ -41,22 +46,55 @@ class NotionClient:
     def _request(self, method, path, **kwargs):
         started = time.perf_counter()
         logger.debug("Notion 请求开始 method=%s path=%s", method, path)
-        try:
-            response = self.session.request(
-                method,
-                f"{self.API_BASE}{path}",
-                headers=self.headers,
-                timeout=self.timeout,
-                **kwargs,
-            )
-        except requests.RequestException:
-            logger.exception(
-                "Notion 网络请求失败 method=%s path=%s elapsed_ms=%.1f",
-                method,
-                path,
-                (time.perf_counter() - started) * 1000,
-            )
-            raise
+        for attempt in range(1, NETWORK_ATTEMPTS + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    f"{self.API_BASE}{path}",
+                    headers=self.headers,
+                    timeout=self.timeout,
+                    **kwargs,
+                )
+                break
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt < NETWORK_ATTEMPTS:
+                    delay = NETWORK_RETRY_DELAYS[attempt - 1]
+                    logger.warning(
+                        "Notion 网络请求中断，准备重试 method=%s path=%s "
+                        "attempt=%s/%s delay_seconds=%s error_type=%s",
+                        method,
+                        path,
+                        attempt,
+                        NETWORK_ATTEMPTS,
+                        delay,
+                        type(exc).__name__,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(
+                    "Notion 网络请求失败 method=%s path=%s attempts=%s "
+                    "elapsed_ms=%.1f error_type=%s",
+                    method,
+                    path,
+                    NETWORK_ATTEMPTS,
+                    (time.perf_counter() - started) * 1000,
+                    type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "Notion 网络连接失败，已重试 3 次，请检查网络或代理设置"
+                ) from exc
+            except requests.RequestException as exc:
+                logger.error(
+                    "Notion 网络请求无法发送 method=%s path=%s "
+                    "elapsed_ms=%.1f error_type=%s",
+                    method,
+                    path,
+                    (time.perf_counter() - started) * 1000,
+                    type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "Notion 网络请求无法发送，请检查网络或代理设置"
+                ) from exc
         logger.debug(
             "Notion 请求完成 method=%s path=%s status=%s elapsed_ms=%.1f",
             method,
@@ -179,7 +217,7 @@ class NotionClient:
         if data.get("truncated"):
             count = len(data.get("unknown_block_ids", []))
             raise RuntimeError(f"页面内容不完整，仍有 {count} 个 Block 未加载")
-        markdown = data["markdown"]
+        markdown = normalize_notion_markdown(data["markdown"])
         logger.debug(
             "Notion Markdown 读取完成 page_id=%s chars=%s",
             page_id,
@@ -187,24 +225,36 @@ class NotionClient:
         )
         return markdown
 
+    def update_status(
+        self,
+        page_id,
+        status_field="状态",
+        status="已同步",
+    ):
+        logger.info(
+            "回写 Notion 状态 page_id=%s status=%s",
+            page_id,
+            status,
+        )
+        properties = {
+            status_field: {"status": {"name": status}},
+        }
+        return self._request(
+            "PATCH",
+            f"/pages/{page_id}",
+            json={"properties": properties},
+        )
+
     def mark_published(
         self,
         page_id,
         status_field="状态",
         published_status="已发布",
     ):
-        logger.info(
-            "回写 Notion 发布状态 page_id=%s status=%s",
+        return self.update_status(
             page_id,
-            published_status,
-        )
-        properties = {
-            status_field: {"status": {"name": published_status}},
-        }
-        return self._request(
-            "PATCH",
-            f"/pages/{page_id}",
-            json={"properties": properties},
+            status_field=status_field,
+            status=published_status,
         )
 
 
@@ -236,8 +286,6 @@ def page_metadata(
     page,
     unique_property="唯一ID",
     field_mapping=None,
-    article_value="图文",
-    image_value="图片",
 ):
     properties = page["properties"]
     fields = {**DEFAULT_FIELD_MAPPING, **(field_mapping or {})}
@@ -259,7 +307,16 @@ def page_metadata(
     source_url = (
         _property(properties, fields["source_url"], "url", required=False) or ""
     )
-    notion_type = type_value["name"] if type_value else article_value
+    notion_type = type_value["name"] if type_value else ""
+    type_mapping = {
+        "文章": "article",
+        "图文": "image",
+    }
+    if notion_type not in type_mapping:
+        raise ValueError(
+            f"页面 {page['id']} 的文章类型“{notion_type or '空'}”无效，"
+            "仅支持“文章”和“图文”"
+        )
 
     return {
         "source_key": _page_source_key(page, properties, unique_property),
@@ -267,7 +324,7 @@ def page_metadata(
         "notion_url": page.get("url", ""),
         "title": title,
         "author": author_value["name"] if author_value else "",
-        "article_type": "image" if notion_type == image_value else "article",
+        "article_type": type_mapping[notion_type],
         "cover_url": cover_url,
         "source_url": source_url,
         "tags": [item["name"] for item in tags_value],

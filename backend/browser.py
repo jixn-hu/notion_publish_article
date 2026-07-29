@@ -3,7 +3,7 @@ from pathlib import Path
 import random
 import socket
 import subprocess
-from threading import Lock
+from threading import Lock, local
 import time
 from urllib.request import urlopen
 
@@ -12,6 +12,7 @@ from backend.settings import get_settings
 
 
 _browser_lock = Lock()
+_account_browser_session = local()
 FORBIDDEN_BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-blink-features=AutomationControlled",
@@ -142,6 +143,14 @@ def open_account_dashboard(account, target_url=None):
 
 @contextmanager
 def open_account_browser(account):
+    active_context = getattr(_account_browser_session, "context", None)
+    if active_context is not None:
+        active_account_id = getattr(_account_browser_session, "account_id", None)
+        if active_account_id != account.get("id"):
+            raise RuntimeError("同一浏览器任务不能切换到其他账号")
+        yield active_context
+        return
+
     if not _browser_lock.acquire(blocking=False):
         raise RuntimeError("已有浏览器登录或发布任务正在执行")
     try:
@@ -182,13 +191,16 @@ def open_account_browser(account):
                 raise RuntimeError(
                     "无法启动或连接 Chrome/Edge，请检查浏览器路径和账号配置目录"
                 ) from exc
+            _account_browser_session.context = context
+            _account_browser_session.account_id = account.get("id")
             try:
                 yield context
             finally:
+                del _account_browser_session.context
+                del _account_browser_session.account_id
                 _close_native_browser(browser, context, process)
     finally:
         _browser_lock.release()
-
 
 def get_or_create_page(context):
     pages = [page for page in context.pages if not page.is_closed()]

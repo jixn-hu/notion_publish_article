@@ -10,19 +10,29 @@ if not exist ".venv\Scripts\activate.bat" (
         pause
         exit /b 1
     )
+)
 
-    call ".venv\Scripts\activate.bat"
-    echo Installing Python dependencies...
+call ".venv\Scripts\activate.bat"
+
+set "INSTALL_PYTHON_DEPS="
+python -c "import hashlib,pathlib,sys; req=pathlib.Path('requirements.txt'); stamp=pathlib.Path(r'.venv\.requirements.sha256'); expected=hashlib.sha256(req.read_bytes()).hexdigest(); sys.exit(0 if stamp.exists() and stamp.read_text(encoding='ascii').strip() == expected else 1)"
+if errorlevel 1 set "INSTALL_PYTHON_DEPS=1"
+
+if not defined INSTALL_PYTHON_DEPS (
+    python -c "import bs4,cryptography,fastapi,markdown,multipart,patchright,pygments,requests,socks,uvicorn"
+    if errorlevel 1 set "INSTALL_PYTHON_DEPS=1"
+)
+
+if defined INSTALL_PYTHON_DEPS (
+    echo Installing or updating Python dependencies...
     python -m pip install -r requirements.txt
     if errorlevel 1 (
         echo Failed to install Python dependencies.
         pause
         exit /b 1
     )
-) else (
-    call ".venv\Scripts\activate.bat"
+    python -c "import hashlib,pathlib; req=pathlib.Path('requirements.txt'); pathlib.Path(r'.venv\.requirements.sha256').write_text(hashlib.sha256(req.read_bytes()).hexdigest(), encoding='ascii')"
 )
-
 where npm >nul 2>nul
 if errorlevel 1 (
     echo npm was not found. Install Node.js 20 or later.

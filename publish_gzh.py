@@ -502,5 +502,40 @@ class WechatArticlePublisher:
             raise Exception(f"发布失败: {data}")
 
         publish_id = data['publish_id']
-        logger.info(f"发布成功, publish_id: {publish_id}")
-        return publish_id
+        logger.info(f"发布任务已提交, publish_id: {publish_id}")
+        return self.wait_for_publish_result(publish_id)
+
+    def wait_for_publish_result(
+            self,
+            publish_id: str,
+            timeout_seconds: int = 180,
+            interval_seconds: int = 2,
+    ) -> str:
+        token = self.client._get_access_token()
+        endpoint = f"freepublish/get?access_token={token}"
+        deadline = time.monotonic() + timeout_seconds
+        failure_labels = {
+            2: "原创声明失败",
+            3: "常规发布失败",
+            4: "平台审核不通过",
+            5: "发布成功后文章被删除",
+            6: "发布成功后文章被系统封禁",
+        }
+        while time.monotonic() < deadline:
+            data = self.client._request_with_retry(
+                'POST',
+                endpoint,
+                json={"publish_id": publish_id},
+                headers={'Content-Type': 'application/json'},
+            )
+            status = int(data.get("publish_status", 1))
+            if status == 0:
+                logger.info("文章发布完成, publish_id: %s", publish_id)
+                return str(data.get("article_id") or publish_id)
+            if status != 1:
+                reason = failure_labels.get(status, f"未知状态 {status}")
+                raise RuntimeError(f"微信公众号发布失败：{reason}")
+            time.sleep(interval_seconds)
+        raise RuntimeError(
+            "微信公众号发布任务仍在处理中，请稍后在公众号后台查看结果"
+        )

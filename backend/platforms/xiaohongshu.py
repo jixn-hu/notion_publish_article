@@ -117,26 +117,32 @@ def extract_xiaohongshu_profile(page):
     return profile
 
 
-def fetch_xiaohongshu_profile(account):
-    with open_account_browser(account) as context:
-        page = get_or_create_page(context)
-        page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(2500)
-        if not _is_logged_in(page):
-            raise RuntimeError("小红书登录状态已失效，请重新登录")
-        profile = extract_xiaohongshu_profile(page)
-        avatar = page.locator(
-            "[class*='personal'] img[src*='/avatar/']"
-        ).first
-        try:
-            avatar_path = account_avatar_path(account)
-            avatar_path.parent.mkdir(parents=True, exist_ok=True)
-            avatar.screenshot(path=str(avatar_path))
-            profile["avatar_cached"] = True
-        except Exception:
-            profile["avatar_cached"] = False
-        return profile
+def fetch_xiaohongshu_profile(account, page=None):
+    if page is None:
+        with open_account_browser(account) as context:
+            active_page = get_or_create_page(context)
+            active_page.goto(
+                PROFILE_URL,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            active_page.wait_for_timeout(2500)
+            return fetch_xiaohongshu_profile(account, page=active_page)
 
+    if not _is_logged_in(page):
+        raise RuntimeError("小红书登录状态已失效，请重新登录")
+    profile = extract_xiaohongshu_profile(page)
+    avatar = page.locator(
+        "[class*='personal'] img[src*='/avatar/']"
+    ).first
+    try:
+        avatar_path = account_avatar_path(account)
+        avatar_path.parent.mkdir(parents=True, exist_ok=True)
+        avatar.screenshot(path=str(avatar_path))
+        profile["avatar_cached"] = True
+    except Exception:
+        profile["avatar_cached"] = False
+    return profile
 
 def _plain_text(markdown_text):
     html = markdown.markdown(markdown_text or "")
@@ -157,6 +163,7 @@ class XiaohongshuPublisher(PlatformPublisher):
     key = "xiaohongshu"
     name = "小红书"
     implemented = True
+    content_types = ("image", "video")
 
     def is_configured(self):
         return any(

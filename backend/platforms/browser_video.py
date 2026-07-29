@@ -28,6 +28,7 @@ def normalized_tags(values, limit=10):
 
 class BrowserVideoPublisher(PlatformPublisher):
     implemented = True
+    content_types = ("video",)
 
     def is_configured(self):
         return any(

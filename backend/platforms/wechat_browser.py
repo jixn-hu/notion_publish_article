@@ -22,10 +22,11 @@ from backend.browser import (
 )
 from backend.media import IMAGE_EXTENSIONS
 from backend.platforms.base import PlatformPublisher
-from backend.platforms.profile_utils import first_visible_image
+from backend.platforms.profile_utils import first_visible_image, metric_from_text
 
 
 HOME_URL = "https://mp.weixin.qq.com/"
+DASHBOARD_URL = "https://mp.weixin.qq.com/cgi-bin/home?t=home/index"
 ARTICLE_URL = "https://mp.weixin.qq.com/cgi-bin/appmsg"
 NEW_ARTICLE_URL = (
     f"{ARTICLE_URL}?t=media/appmsg_edit_v2&action=edit"
@@ -46,6 +47,7 @@ COVER_FROM_CONTENT_SELECTOR = "a.js_selectCoverFromContent"
 COVER_IMAGE_SELECTOR = ".card_mask_global.apmsg_content_img_mask"
 IMAGE_UPLOAD_TIMEOUT_SECONDS = 3 * 60
 DRAFT_SAVE_TIMEOUT_SECONDS = 2 * 60
+PUBLISH_TIMEOUT_SECONDS = 5 * 60
 SESSION_FILE_NAME = "wechat_session.json"
 AUTH_COOKIE_NAMES = {"slave_sid", "slave_user", "bizuin"}
 LOGIN_FRAME_URL_PARTS = (
@@ -130,6 +132,13 @@ def _save_session_url(account, url):
     )
 
 
+def record_account_session(account, page):
+    dashboard_url = _url_with_backend_token(page.url, DASHBOARD_URL)
+    if not dashboard_url:
+        raise RuntimeError("公众号后台会话地址无效，请重新登录")
+    _save_session_url(account, dashboard_url)
+
+
 def _load_session_url(account):
     path = _session_path(account)
     try:
@@ -143,12 +152,14 @@ def _load_session_url(account):
 
 
 def wechat_dashboard_url(account):
-    return _load_session_url(account) or HOME_URL
+    return (
+        _url_with_backend_token(_load_session_url(account), DASHBOARD_URL)
+        or HOME_URL
+    )
 
 
-def _authenticated_url(account, target_url):
-    session_url = _load_session_url(account)
-    if not session_url:
+def _url_with_backend_token(session_url, target_url):
+    if not _has_backend_token(session_url):
         return ""
     token = parse_qs(urlparse(session_url).query)["token"][0]
     parsed = urlparse(target_url)
@@ -158,6 +169,11 @@ def _authenticated_url(account, target_url):
     return urlunparse(
         parsed._replace(query=urlencode(query, doseq=True))
     )
+
+
+def _authenticated_url(account, target_url):
+    return _url_with_backend_token(_load_session_url(account), target_url)
+
 
 def _has_backend_token(url):
     parsed = urlparse(str(url or ""))
@@ -183,12 +199,16 @@ def _is_logged_in(page):
             return False
     except Exception:
         return False
+    has_backend_ui = any(
+        _visible_text(page, selector)
+        for selector in AUTHENTICATED_SELECTORS + PROFILE_NAME_SELECTORS
+    )
+    if _has_backend_token(url) and has_backend_ui:
+        return True
     if any(_visible(page, selector) for selector in LOGIN_SELECTORS):
         return False
-    if not _has_authenticated_session(page):
-        return False
-    return _has_backend_token(url) or any(
-        _visible_text(page, selector) for selector in AUTHENTICATED_SELECTORS
+    return _has_authenticated_session(page) and (
+        _has_backend_token(url) or has_backend_ui
     )
 
 
@@ -199,7 +219,7 @@ def login_wechat_account(account, timeout_seconds=300):
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if _is_logged_in(page):
-                _save_session_url(account, page.url)
+                record_account_session(account, page)
                 page.wait_for_timeout(2000)
                 return
             page.wait_for_timeout(1500)
@@ -210,8 +230,8 @@ def login_wechat_account(account, timeout_seconds=300):
 
 
 def check_wechat_account(account):
-    target_url = _load_session_url(account)
-    if not target_url:
+    target_url = wechat_dashboard_url(account)
+    if target_url == HOME_URL:
         return False
     with open_account_browser(account) as context:
         page = get_or_create_page(context)
@@ -223,6 +243,23 @@ def _wechat_profile_text(text):
     match = re.search(r"微信号\s*[:：]\s*([^\s]+)", str(text or ""))
     return {
         "platform_user_id": match.group(1).strip() if match else "",
+        "followers_count": metric_from_text(
+            text,
+            (
+                "累计关注人数",
+                "总用户数",
+                "用户总数",
+                "关注用户数",
+            ),
+        ),
+        "new_followers_count": metric_from_text(
+            text,
+            (
+                "新关注人数",
+                "昨日新增关注",
+                "新增关注人数",
+            ),
+        ),
     }
 
 
@@ -258,29 +295,35 @@ def extract_wechat_profile(page):
     return profile
 
 
-def fetch_wechat_profile(account):
-    target_url = _load_session_url(account)
-    if not target_url:
-        raise RuntimeError("缺少公众号后台会话，请重新登录")
-    with open_account_browser(account) as context:
-        page = get_or_create_page(context)
-        page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-        page.wait_for_timeout(3000)
-        if not _is_logged_in(page):
-            raise RuntimeError("微信公众号登录状态已失效，请重新登录")
-        profile = extract_wechat_profile(page)
-        avatar = first_visible_image(page, PROFILE_AVATAR_SELECTORS)
-        try:
-            if avatar is None:
-                raise RuntimeError("未找到公众号账号头像")
-            avatar_path = account_avatar_path(account)
-            avatar_path.parent.mkdir(parents=True, exist_ok=True)
-            avatar.screenshot(path=str(avatar_path))
-            profile["avatar_cached"] = True
-        except Exception:
-            profile["avatar_cached"] = False
-        return profile
+def fetch_wechat_profile(account, page=None):
+    if page is None:
+        target_url = wechat_dashboard_url(account)
+        if target_url == HOME_URL:
+            raise RuntimeError("缺少公众号后台会话，请重新登录")
+        with open_account_browser(account) as context:
+            active_page = get_or_create_page(context)
+            active_page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            active_page.wait_for_timeout(3000)
+            return fetch_wechat_profile(account, page=active_page)
 
+    if not _is_logged_in(page):
+        raise RuntimeError("微信公众号登录状态已失效，请重新登录")
+    profile = extract_wechat_profile(page)
+    avatar = first_visible_image(page, PROFILE_AVATAR_SELECTORS)
+    try:
+        if avatar is None:
+            raise RuntimeError("未找到公众号账号头像")
+        avatar_path = account_avatar_path(account)
+        avatar_path.parent.mkdir(parents=True, exist_ok=True)
+        avatar.screenshot(path=str(avatar_path))
+        profile["avatar_cached"] = True
+    except Exception:
+        profile["avatar_cached"] = False
+    return profile
 
 def _plain_text(markdown_text):
     html = markdown.markdown(markdown_text or "")
@@ -512,6 +555,50 @@ def _save_wechat_draft(page):
         page.wait_for_timeout(500)
     raise RuntimeError("公众号未确认草稿保存成功，请在浏览器中检查必填项")
 
+
+def _publish_wechat_article(page):
+    publish = _first_visible(
+        page.get_by_role(
+            "button",
+            name=re.compile(r"^(\u53d1\u8868|\u53d1\u5e03)$"),
+        ),
+        30,
+    )
+    publish.click()
+    interaction_pause(page, 800, 1300)
+
+    dialog = page.locator(".weui-desktop-dialog:visible")
+    if dialog.count():
+        confirm = dialog.get_by_role(
+            "button",
+            name=re.compile(r"^(\u53d1\u8868|\u786e\u8ba4\u53d1\u5e03|\u786e\u8ba4)$"),
+        )
+        try:
+            if confirm.count() == 1 and confirm.is_visible():
+                confirm.click()
+        except Exception:
+            pass
+
+    success = page.get_by_text(
+        re.compile(r"\u53d1\u8868\u6210\u529f|\u53d1\u5e03\u6210\u529f|\u5df2\u53d1\u8868"),
+        exact=False,
+    )
+    deadline = time.monotonic() + PUBLISH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            if success.count() and success.first.is_visible():
+                page.wait_for_timeout(3000)
+                return page.url
+        except Exception:
+            pass
+        error = _visible_publish_error(page)
+        if error:
+            raise RuntimeError(f"\u516c\u4f17\u53f7\u53d1\u8868\u5931\u8d25\uff1a{error}")
+        page.wait_for_timeout(1000)
+    raise RuntimeError(
+        "\u516c\u4f17\u53f7\u53d1\u8868\u5c1a\u672a\u5b8c\u6210\uff0c\u8bf7\u5728\u6253\u5f00\u7684\u6d4f\u89c8\u5668\u4e2d\u626b\u7801\u9a8c\u8bc1\u5e76\u786e\u8ba4\u7ed3\u679c"
+    )
+
 class WechatPublisher(PlatformPublisher):
     key = "wechat"
     name = "微信公众号"
@@ -529,8 +616,8 @@ class WechatPublisher(PlatformPublisher):
         return {"name": self.name, "message": f"账号“{accounts[0]['name']}”登录状态有效"}
 
     def publish(self, article, action="draft"):
-        if action != "draft":
-            raise ValueError("微信公众号浏览器发布仅支持保存草稿")
+        if action not in {"draft", "publish"}:
+            raise ValueError("公众号动作必须是 draft 或 publish")
         account_id = (article.get("platform_accounts") or {}).get(self.key)
         account = resolve_publish_account(self.key, account_id)
         with open_account_browser(account) as context:
@@ -553,9 +640,13 @@ class WechatPublisher(PlatformPublisher):
             if uploaded_images:
                 _select_wechat_cover(page)
             external_url = _save_wechat_draft(page)
+            status = "drafted"
+            if action == "publish":
+                external_url = _publish_wechat_article(page)
+                status = "published"
             page.wait_for_timeout(3000)
             return {
-                "status": "drafted",
+                "status": status,
                 "external_id": external_url,
                 "account_id": account["id"],
             }

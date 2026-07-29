@@ -9,10 +9,10 @@
 
 - **内容库**：统一管理文章、图文和视频稿件，保存标签、摘要、媒体、发布目标与结果。
 - **Markdown 编辑器**：CodeMirror 编辑、实时预览、图片插入和平台内容版本管理。
-- **AI 创作**：使用 OpenAI-compatible 接口生成文章、摘要、标签、平台版本和图文分镜；支持独立图片生成接口，生成图片保存到本地。
+- **AI 创作**：使用 OpenAI-compatible 接口生成文章、标题建议、摘要、标签和图文分镜；支持独立图片生成接口，生成图片保存到本地。
 - **素材库**：管理图片、视频和卡片笔记，支持搜索、标签、稿件引用和批量 ZIP 下载。
-- **资讯库**：从公开网页采集或手动录入资讯，保留来源信息，并作为 AI 生成的参考资料。
-- **Notion 同步**：手动或定时同步待发布内容，可配置字段映射、状态和去重键。
+- **资讯库**：从公开网页采集、手动录入或定时扫描 RSS/Atom 订阅源，按原文链接增量去重，并作为 AI 生成的参考资料。
+- **Notion 同步**：手动或定时同步状态为“待同步”的内容，并在成功后回写“已同步”，可配置字段映射、状态和去重键。
 - **账号管理**：每个平台账号使用独立浏览器目录，可检查登录状态、查看账号和同步资料。
 - **代理管理**：集中维护代理并分配给账号，也可为 Notion、AI 等连接单独配置代理。
 - **自动化**：设置同步、AI 加工和发布周期，记录每个平台的成功结果与失败原因。
@@ -34,7 +34,7 @@
 
 ```text
 Notion ──> 同步与去重 ──┐
-资讯库 ──> AI 参考 ─────┼──> SQLite 内容库 ──> 发布调度 ──> 平台浏览器
+网页 / RSS ──> 资讯库 ──> AI 参考 ──┼──> SQLite 内容库 ──> 发布调度 ──> 平台浏览器
 素材库 ──> 媒体与笔记 ──┘
 
 React + Vite 管理界面 <── HTTP API ──> FastAPI 后端
@@ -53,6 +53,7 @@ backend/
 ├── ai_generation.py       # AI 图片生成与本地保存
 ├── materials.py           # 素材库
 ├── news.py                # 资讯采集与资讯库
+├── rss.py                 # RSS/Atom 解析、增量扫描与入库
 ├── accounts.py            # 平台账号与资料
 ├── browser.py             # Patchright 持久浏览器
 ├── db.py                  # SQLite 数据结构
@@ -87,7 +88,7 @@ cd notion_publish_article
 
 启动脚本会：
 
-1. 在 `.venv` 不存在时创建 Python 虚拟环境并安装依赖；已存在则直接复用。
+1. 创建或复用 `.venv`，并在依赖缺失或 `requirements.txt` 变化时自动安装依赖。
 2. 在 `frontend/node_modules` 不存在时执行 `npm ci`。
 3. 在前端未构建或源码比构建结果更新时自动执行 `npm run build`。
 4. 启动 FastAPI，并由后端同时提供 API 和前端页面。
@@ -109,7 +110,22 @@ cd ..
 python main.py
 ```
 
-如果系统没有可用的 Chrome/Edge，可运行 `patchright install chrome`。开发前端时使用 `npm run dev` 可获得热更新；正式页面仍由 `npm run build` 的结果提供。
+如果系统没有可用的 Chrome/Edge，可运行 `patchright install chrome`。
+
+### 本地开发
+
+首次运行 `启动.cmd` 完成依赖安装后，可双击：
+
+```powershell
+.\开发启动.cmd
+```
+
+开发模式会启动两个服务：
+
+- <http://127.0.0.1:8021>：FastAPI，修改 `backend/` 下的 Python 文件后自动重载。
+- <http://127.0.0.1:5173>：Vite 前端，修改 React 或 CSS 后自动热更新。
+
+本地开发请打开 <http://127.0.0.1:5173>。结束时关闭“墨流后端 - 自动重载”和“墨流前端 - 热更新”两个窗口。正式使用仍运行 `启动.cmd`，由后端提供构建后的前端页面。
 
 ## 初次配置
 
@@ -120,13 +136,14 @@ python main.py
 3. **浏览器平台**：启用需要的平台；自动识别失败时填写 Chrome/Edge 可执行文件路径。
 4. **代理**：先在代理管理中新增并测试，再分配给对应账号；留空表示直连。
 5. **账号**：新增平台账号，点击“打开浏览器登录”，等待系统确认后台账号信息。
+6. **RSS**：在设置页每行填写一个 RSS/Atom 地址，可立即扫描；在自动化页启用定时扫描并设置分钟间隔。
 
 每个账号的浏览器数据位于 `data/browser_profiles/<platform>/<account_id>`。系统不保存账号密码，也不会把 Cookie 返回给前端。删除该目录会同时丢失对应登录会话。
 
 ## 推荐工作流
 
 1. 从 Notion 同步稿件，或直接在内容库创建文章、图文或视频。
-2. 在资讯库采集公开资料，在素材库整理自己的图片、视频和卡片笔记。
+2. 在资讯库采集公开资料，或通过 RSS/Atom 定时收集新增资讯；在素材库整理自己的图片、视频和卡片笔记。
 3. 创建或 AI 生成稿件时选择参考资讯和素材，在 Markdown 编辑器中校对结果。
 4. 选择目标平台、账号以及草稿/直发动作，先用一篇测试稿验证流程。
 5. 确认账号、页面选择器和内容格式稳定后，再开启自动同步或自动发布。
@@ -140,13 +157,15 @@ AI 生成内容仅作为草稿。请核实事实、版权、引用和平台规�
 | 字段 | Notion 类型 | 必填 |
 | --- | --- | --- |
 | 标题 | Title | 是 |
-| 文章类型 | Select（默认值：图文/图片） | 是 |
+| 文章类型 | Select（仅支持：文章/图文） | 是 |
 | 作者 | Select | 否 |
 | 封面图片 | URL | 视内容而定 |
 | 阅读原文 | URL | 否 |
 | 标签 | Multi-select | 否 |
 | 状态 | Status | 是 |
 | 唯一ID | Unique ID | 推荐 |
+
+Notion 只会提取状态为“待同步”的页面；写入墨流成功后立即回写为“已同步”。文章类型只接受“文章”和“图文”，其他值会保留原状态并记录同步错误。
 
 Notion Integration 必须有读取、更新权限，目标数据库也必须共享给该 Integration。系统优先使用配置的唯一字段去重，否则使用稳定的 `page_id`。旧版 `config.py` 存在时，首次启动会迁移其中的 Notion 和公众号配置；新安装无需创建该文件。
 
@@ -173,7 +192,7 @@ Docker 适合运行 API、内容管理、Notion 同步和 AI 功能。当前浏�
 ## 开发与测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v test_backend.py test_notion_utool.py
+.\.venv\Scripts\python.exe -m unittest -v test.test_backend test.test_notion_utool
 cd frontend
 npm run build
 ```
@@ -181,7 +200,7 @@ npm run build
 端到端测试需要先启动应用，并确保本机存在测试脚本指定的浏览器：
 
 ```powershell
-.\.venv\Scripts\python.exe test_e2e.py
+.\.venv\Scripts\python.exe -m test.test_e2e
 ```
 
 后端日志默认写入 `data/backend.log`。可通过 `LOG_LEVEL` 和 `LOG_FILE` 调整：

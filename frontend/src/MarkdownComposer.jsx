@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { EditorState } from '@codemirror/state'
 import {
   drawSelection,
@@ -47,9 +47,7 @@ import {
   Strikethrough,
   Undo2
 } from 'lucide-react'
-import DOMPurify from 'dompurify'
-import { marked } from 'marked'
-import { mediaPreviewUrl } from './api'
+import MarkdownPreview from './MarkdownPreview'
 
 const editorTheme = EditorView.theme({
   '&': {
@@ -124,43 +122,6 @@ function ToolButton ({ icon: Icon, label, onClick, disabled = false }) {
     >
       <Icon size={15} strokeWidth={1.8} />
     </button>
-  )
-}
-
-function prepareMarkdown (markdownText, mediaPaths) {
-  let source = (markdownText || '').replace(/<empty-block\s*\/?>/gi, '')
-  for (const path of mediaPaths || []) {
-    if (!path || /^(https?:|data:|blob:)/i.test(path)) continue
-    const previewUrl = mediaPreviewUrl(path)
-    source = source.split(path).join(previewUrl)
-    source = source.split(path.replace(/\\/g, '/')).join(previewUrl)
-  }
-  return source
-}
-
-export function MarkdownPreview ({ markdown: markdownText, mediaPaths = [] }) {
-  const html = useMemo(() => {
-    const source = prepareMarkdown(markdownText, mediaPaths)
-    return DOMPurify.sanitize(marked.parse(source, {
-      breaks: true,
-      gfm: true
-    }))
-  }, [markdownText, mediaPaths])
-
-  if (!(markdownText || '').trim()) {
-    return (
-      <div className='markdown-preview empty'>
-        <span>PREVIEW</span>
-        <p>正文为空，切换到编辑模式开始写作。</p>
-      </div>
-    )
-  }
-
-  return (
-    <article
-      className='markdown-preview'
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
   )
 }
 

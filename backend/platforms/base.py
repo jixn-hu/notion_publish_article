@@ -5,6 +5,7 @@ class PlatformPublisher(ABC):
     key = ""
     name = ""
     implemented = False
+    content_types = ()
 
     def __init__(self, settings):
         self.settings = settings
@@ -16,7 +17,11 @@ class PlatformPublisher(ABC):
             "implemented": self.implemented,
             "enabled": self.is_enabled(),
             "configured": self.is_configured(),
+            "content_types": list(self.content_types),
         }
+
+    def supports_content_type(self, article_type):
+        return article_type in self.content_types
 
     def is_enabled(self):
         return bool(self.settings.get(f"{self.key}_enabled", False))

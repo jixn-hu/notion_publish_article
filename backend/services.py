@@ -1,11 +1,13 @@
 import json
 import logging
+import math
 from pathlib import Path
 import threading
 import time
 
 from backend.ai_generation import AIImageService
 from backend.ai_service import AIContentService
+from backend.accounts import list_accounts
 from backend.assets import sync_article_assets
 from backend.db import connection, row_to_article, utc_now
 from backend.media import MEDIA_DIR
@@ -14,6 +16,8 @@ from backend.materials import (
     get_material_references,
     link_article_materials,
 )
+from backend.logging_config import redact_text
+from backend.markdown_utils import normalize_notion_markdown
 from backend.news import (
     format_news_context,
     get_news_references,
@@ -21,10 +25,11 @@ from backend.news import (
 )
 from backend.notion_client import NotionClient, page_metadata
 from backend.platforms import get_platforms
+from backend.publish_progress import publish_progress
 from backend.settings import get_settings
 
 
-operation_lock = threading.Lock()
+operation_lock = threading.RLock()
 logger = logging.getLogger("mozhou.services")
 
 
@@ -78,6 +83,7 @@ def sync_from_notion():
             "total": len(pages),
             "created": 0,
             "updated": 0,
+            "marked_synced": 0,
             "ai_enriched": 0,
             "errors": [],
             "ai_errors": [],
@@ -97,8 +103,6 @@ def sync_from_notion():
                     page,
                     unique_property=settings["notion_unique_property"],
                     field_mapping=notion_field_mapping(settings),
-                    article_value=settings["notion_value_article"],
-                    image_value=settings["notion_value_image"],
                 )
                 logger.info(
                     "Notion 页面元数据已解析 index=%s/%s page_id=%s title=%r "
@@ -111,7 +115,9 @@ def sync_from_notion():
                     metadata["source_key"],
                     len(metadata["tags"]),
                 )
-                metadata["content_md"] = client.get_page_markdown(page["id"])
+                metadata["content_md"] = normalize_notion_markdown(
+                    client.get_page_markdown(page["id"])
+                )
                 action, article_id = _upsert_synced_article(
                     metadata, settings["default_publish_mode"]
                 )
@@ -120,7 +126,13 @@ def sync_from_notion():
                     metadata["content_md"],
                     metadata["cover_url"],
                 )
+                client.update_status(
+                    page["id"],
+                    status_field=settings["notion_field_status"],
+                    status=settings["notion_synced_status"],
+                )
                 result[action] += 1
+                result["marked_synced"] += 1
                 logger.info(
                     "Notion 页面同步成功 page_id=%s article_id=%s action=%s "
                     "content_chars=%s assets=%s elapsed_ms=%.1f",
@@ -159,11 +171,12 @@ def sync_from_notion():
                     }
                 )
         logger.info(
-            "Notion 同步结束 matched=%s created=%s updated=%s errors=%s "
-            "ai_enriched=%s ai_errors=%s elapsed_ms=%.1f",
+            "Notion 同步结束 matched=%s created=%s updated=%s marked_synced=%s "
+            "errors=%s ai_enriched=%s ai_errors=%s elapsed_ms=%.1f",
             result["total"],
             result["created"],
             result["updated"],
+            result["marked_synced"],
             len(result["errors"]),
             result["ai_enriched"],
             len(result["ai_errors"]),
@@ -306,7 +319,25 @@ def list_articles(status=None, query=None, article_type=None):
             """,
             params,
         ).fetchall()
-    return [row_to_article(row) for row in rows]
+    articles = [_normalize_synced_markdown(row_to_article(row)) for row in rows]
+    article_ids = [article["id"] for article in articles]
+    states_by_article = {article_id: [] for article_id in article_ids}
+    if article_ids:
+        placeholders = ",".join("?" for _ in article_ids)
+        with connection() as conn:
+            states = conn.execute(
+                f"""
+                SELECT * FROM article_platform_states
+                WHERE article_id IN ({placeholders})
+                ORDER BY platform
+                """,
+                article_ids,
+            ).fetchall()
+        for state in states:
+            states_by_article[state["article_id"]].append(dict(state))
+    for article in articles:
+        article["platform_states"] = states_by_article[article["id"]]
+    return articles
 
 
 def create_article(values):
@@ -370,7 +401,7 @@ def get_article(article_id, include_records=True):
         ).fetchone()
         if not row:
             raise LookupError("文章不存在")
-        article = row_to_article(row)
+        article = _normalize_synced_markdown(row_to_article(row), conn)
         if include_records:
             records = conn.execute(
                 """
@@ -381,8 +412,113 @@ def get_article(article_id, include_records=True):
                 (article_id,),
             ).fetchall()
             article["publish_records"] = [dict(record) for record in records]
+            states = conn.execute(
+                """
+                SELECT * FROM article_platform_states
+                WHERE article_id = ?
+                ORDER BY platform
+                """,
+                (article_id,),
+            ).fetchall()
+            article["platform_states"] = [dict(state) for state in states]
         return article
 
+
+def _normalize_synced_markdown(article, conn=None):
+    if not article.get("notion_page_id"):
+        return article
+    normalized = normalize_notion_markdown(article.get("content_md"))
+    if normalized == article.get("content_md"):
+        return article
+    article["content_md"] = normalized
+    if conn is not None:
+        conn.execute(
+            "UPDATE articles SET content_md = ? WHERE id = ?",
+            (normalized, article["id"]),
+        )
+    else:
+        with connection() as write_conn:
+            write_conn.execute(
+                "UPDATE articles SET content_md = ? WHERE id = ?",
+                (normalized, article["id"]),
+            )
+    return article
+
+def _article_media_paths(article):
+    paths = set(article.get("media_paths") or [])
+    if article.get("cover_url"):
+        paths.add(article["cover_url"])
+    for image in (article.get("ai_result") or {}).get("generated_images") or []:
+        if image.get("path"):
+            paths.add(image["path"])
+    return paths
+
+
+def _resolved_media_path(value):
+    path = Path(str(value or "")).expanduser()
+    if not path.is_absolute():
+        path = MEDIA_DIR / path
+    return path.resolve()
+
+
+def delete_article(article_id):
+    if not operation_lock.acquire(blocking=False):
+        raise RuntimeError("已有同步或发布任务正在执行，请稍后再删除")
+    try:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM articles WHERE id = ?",
+                (article_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("文章不存在")
+            article = row_to_article(row)
+            candidates = {
+                _resolved_media_path(path)
+                for path in _article_media_paths(article)
+                if path
+            }
+            used_paths = set()
+            other_rows = conn.execute(
+                "SELECT * FROM articles WHERE id != ?",
+                (article_id,),
+            ).fetchall()
+            for other_row in other_rows:
+                other = row_to_article(other_row)
+                used_paths.update(
+                    _resolved_media_path(path)
+                    for path in _article_media_paths(other)
+                    if path
+                )
+            material_rows = conn.execute(
+                "SELECT path FROM materials WHERE path != ''"
+            ).fetchall()
+            used_paths.update(
+                _resolved_media_path(item["path"])
+                for item in material_rows
+                if item["path"]
+            )
+            conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+
+        cleanup_errors = []
+        ai_root = (MEDIA_DIR / "ai").resolve()
+        for path in candidates - used_paths:
+            try:
+                path.relative_to(ai_root)
+            except ValueError:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+        return {
+            "deleted": True,
+            "id": article_id,
+            "title": article["title"],
+            "cleanup_warning": "；".join(cleanup_errors),
+        }
+    finally:
+        operation_lock.release()
 
 def update_article(article_id, values):
     allowed = {
@@ -471,10 +607,141 @@ def update_article(article_id, values):
     return article
 
 
-def publish_article(article_id, requested_actions=None):
+def _get_platform_states(article_id):
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM article_platform_states
+            WHERE article_id = ?
+            ORDER BY platform
+            """,
+            (article_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _set_platform_state(
+    article_id,
+    platform,
+    action,
+    account_id,
+    status,
+    *,
+    external_id="",
+    error="",
+    increment_attempt=False,
+):
+    now = utc_now()
+    completed_at = now if status in {"drafted", "published", "failed"} else None
+    started_at = now if status == "publishing" else None
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO article_platform_states (
+                article_id, platform, action, account_id, status, attempts,
+                external_id, last_error, started_at, completed_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_id, platform) DO UPDATE SET
+                action = excluded.action,
+                account_id = excluded.account_id,
+                status = excluded.status,
+                attempts = article_platform_states.attempts + ?,
+                external_id = excluded.external_id,
+                last_error = excluded.last_error,
+                started_at = COALESCE(excluded.started_at, article_platform_states.started_at),
+                completed_at = excluded.completed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                article_id,
+                platform,
+                action,
+                account_id,
+                status,
+                1 if increment_attempt else 0,
+                external_id,
+                error,
+                started_at,
+                completed_at,
+                now,
+                now,
+                1 if increment_attempt else 0,
+            ),
+        )
+
+
+def _state_matches_target(state, action, account_id):
+    if not state or state["action"] != action:
+        return False
+    return (
+        account_id is None
+        or state["account_id"] is None
+        or state["account_id"] == account_id
+    )
+
+
+def _finalize_article_platform_status(article_id, platforms):
+    states = {
+        state["platform"]: state
+        for state in _get_platform_states(article_id)
+        if state["platform"] in platforms
+    }
+    selected = [states.get(platform) for platform in platforms]
+    statuses = {state["status"] if state else "pending" for state in selected}
+    successful = statuses <= {"drafted", "published"}
+    if successful:
+        if statuses == {"drafted"}:
+            final_status = "drafted"
+        elif statuses == {"published"}:
+            final_status = "published"
+        else:
+            final_status = "completed"
+        error = ""
+    elif statuses & {"drafted", "published"}:
+        final_status = "partial"
+        error = "部分平台发布失败或等待重试"
+    elif "publishing" in statuses:
+        final_status = "publishing"
+        error = ""
+    elif "failed" in statuses:
+        final_status = "failed"
+        errors = [
+            state["last_error"] for state in selected
+            if state and state["status"] == "failed" and state["last_error"]
+        ]
+        error = "；".join(errors) or "平台发布失败"
+    else:
+        final_status = "ready"
+        error = ""
+    _set_article_status(article_id, final_status, error)
+    return final_status
+
+
+def publish_article(
+    article_id,
+    requested_actions=None,
+    requested_accounts=None,
+    retry_failed=True,
+    operation_id=None,
+    operation_kind="manual",
+):
     if not operation_lock.acquire(blocking=False):
         logger.warning("文章发布被跳过：操作锁正在占用 article_id=%s", article_id)
         raise RuntimeError("已有同步或发布任务正在执行")
+    owns_operation = operation_id is None
+    if owns_operation:
+        operation_id = publish_progress.begin(
+            operation_kind,
+            f"稿件 #{article_id}",
+            article_id=article_id,
+        )
+    publish_progress.event(
+        operation_id,
+        "正在读取稿件与发布配置",
+        stage="prepare",
+        article_id=article_id,
+    )
     started = time.perf_counter()
     try:
         article = get_article(article_id, include_records=False)
@@ -487,6 +754,9 @@ def publish_article(article_id, requested_actions=None):
                 )
                 for key in article["target_platforms"]
             }
+        accounts = dict(article.get("platform_accounts") or {})
+        if requested_accounts is not None:
+            accounts.update(requested_accounts)
         platforms = list(actions)
         if not platforms:
             raise ValueError("请至少选择一个发布平台")
@@ -498,47 +768,131 @@ def publish_article(article_id, requested_actions=None):
         unknown = set(platforms) - set(publishers)
         if unknown:
             raise ValueError(f"未知平台: {', '.join(sorted(unknown))}")
+        unsupported = [
+            key for key in platforms
+            if not publishers[key].supports_content_type(article["article_type"])
+        ]
+        if unsupported:
+            names = "、".join(publishers[key].name for key in unsupported)
+            raise ValueError(
+                f"当前稿件类型不支持发布到：{names}"
+            )
 
+        if owns_operation:
+            publish_progress.configure(
+                operation_id,
+                title=article["title"],
+                total=len(platforms),
+                article_id=article_id,
+            )
+        publish_progress.event(
+            operation_id,
+            f"稿件《{article['title']}》开始处理，共 {len(platforms)} 个平台",
+            stage="prepare",
+            article_id=article_id,
+            article_title=article["title"],
+        )
+
+        article = dict(article)
+        article["platform_accounts"] = accounts
+        existing_states = {
+            state["platform"]: state for state in _get_platform_states(article_id)
+        }
         logger.info(
-            "文章发布开始 article_id=%s title=%r article_type=%s "
-            "publish_mode=%s actions=%s",
+            "文章发布开始 article_id=%s title=%r actions=%s accounts=%s",
             article_id,
             article["title"],
-            article["article_type"],
-            article["publish_mode"],
             actions,
+            accounts,
         )
         _set_article_status(article_id, "publishing", "")
         results = []
         for platform_key in platforms:
             publisher = publishers[platform_key]
             platform_action = actions[platform_key]
-            platform_started = time.perf_counter()
-            try:
-                logger.info(
-                    "平台发布开始 article_id=%s platform=%s action=%s "
-                    "implemented=%s enabled=%s configured=%s",
-                    article_id,
-                    platform_key,
-                    platform_action,
-                    publisher.implemented,
-                    publisher.is_enabled(),
-                    publisher.is_configured(),
+            account_id = accounts.get(platform_key)
+            state = existing_states.get(platform_key)
+            state_matches = _state_matches_target(
+                state, platform_action, account_id
+            )
+            if state_matches and state["status"] in {"drafted", "published"}:
+                results.append(
+                    {
+                        "platform": platform_key,
+                        "action": platform_action,
+                        "status": state["status"],
+                        "external_id": state["external_id"],
+                        "account_id": state["account_id"],
+                        "skipped": True,
+                        "message": "该稿件在此平台已处理，已跳过重复发布",
+                    }
                 )
+                publish_progress.event(
+                    operation_id,
+                    f"{publisher.name} 已处理过，跳过重复发布",
+                    level="success",
+                    stage="skipped",
+                    article_id=article_id,
+                    article_title=article["title"],
+                    platform=platform_key,
+                    advance=1,
+                )
+                continue
+            if state_matches and state["status"] == "failed" and not retry_failed:
+                results.append(
+                    {
+                        "platform": platform_key,
+                        "action": platform_action,
+                        "status": "failed",
+                        "account_id": state["account_id"],
+                        "error": state["last_error"],
+                        "skipped": True,
+                        "message": "上次发布失败，等待用户重试",
+                    }
+                )
+                publish_progress.event(
+                    operation_id,
+                    f"{publisher.name} 上次发布失败，等待手动重试",
+                    level="warning",
+                    stage="skipped",
+                    article_id=article_id,
+                    article_title=article["title"],
+                    platform=platform_key,
+                    advance=1,
+                )
+                continue
+
+            platform_started = time.perf_counter()
+            _set_platform_state(
+                article_id,
+                platform_key,
+                platform_action,
+                account_id,
+                "publishing",
+                increment_attempt=True,
+            )
+            action_label = "保存草稿" if platform_action == "draft" else "直接发布"
+            publish_progress.event(
+                operation_id,
+                f"{publisher.name}：正在{action_label}",
+                stage="publishing",
+                article_id=article_id,
+                article_title=article["title"],
+                platform=platform_key,
+            )
+            try:
                 if not publisher.implemented:
                     raise NotImplementedError(f"{publisher.name}发布能力尚未实现")
                 if not publisher.is_enabled():
                     raise RuntimeError(f"{publisher.name}尚未启用")
                 if not publisher.is_configured():
                     raise RuntimeError(f"{publisher.name}配置不完整")
-                output = publisher.publish(
-                    _article_for_platform(article, platform_key),
-                    action=platform_action,
-                )
+                output = publisher.publish(article, action=platform_action)
                 result_status = output.get(
                     "status",
                     "drafted" if platform_action == "draft" else "published",
                 )
+                resolved_account_id = output.get("account_id") or account_id
                 _record_publish(
                     article_id,
                     platform_key,
@@ -547,13 +901,21 @@ def publish_article(article_id, requested_actions=None):
                     output.get("external_id", ""),
                     "",
                 )
+                _set_platform_state(
+                    article_id,
+                    platform_key,
+                    platform_action,
+                    resolved_account_id,
+                    result_status,
+                    external_id=output.get("external_id", ""),
+                )
                 results.append(
                     {
                         "platform": platform_key,
                         "action": platform_action,
                         "status": result_status,
                         "external_id": output.get("external_id", ""),
-                        "account_id": output.get("account_id"),
+                        "account_id": resolved_account_id,
                     }
                 )
                 logger.info(
@@ -565,61 +927,64 @@ def publish_article(article_id, requested_actions=None):
                     result_status,
                     (time.perf_counter() - platform_started) * 1000,
                 )
+                result_label = (
+                    "草稿已保存" if result_status == "drafted" else "发布成功"
+                )
+                publish_progress.event(
+                    operation_id,
+                    f"{publisher.name}：{result_label}",
+                    level="success",
+                    stage="completed",
+                    article_id=article_id,
+                    article_title=article["title"],
+                    platform=platform_key,
+                    advance=1,
+                )
             except Exception as exc:
                 logger.exception(
-                    "平台发布失败 article_id=%s platform=%s action=%s "
-                    "elapsed_ms=%.1f",
+                    "平台发布失败 article_id=%s platform=%s action=%s",
                     article_id,
                     platform_key,
                     platform_action,
-                    (time.perf_counter() - platform_started) * 1000,
                 )
                 _record_publish(
+                    article_id, platform_key, platform_action, "failed", "", str(exc)
+                )
+                _set_platform_state(
                     article_id,
                     platform_key,
                     platform_action,
+                    account_id,
                     "failed",
-                    "",
-                    str(exc),
+                    error=str(exc),
                 )
                 results.append(
                     {
                         "platform": platform_key,
                         "action": platform_action,
                         "status": "failed",
+                        "account_id": account_id,
                         "error": str(exc),
                     }
                 )
+                publish_progress.event(
+                    operation_id,
+                    f"{publisher.name}：失败，{redact_text(exc)}",
+                    level="error",
+                    stage="failed",
+                    article_id=article_id,
+                    article_title=article["title"],
+                    platform=platform_key,
+                    advance=1,
+                )
 
-        successful = [
-            item for item in results if item["status"] in {"published", "drafted"}
-        ]
-        if len(successful) == len(results):
-            success_statuses = {item["status"] for item in successful}
-            if success_statuses == {"drafted"}:
-                final_status = "drafted"
-            elif success_statuses == {"published"}:
-                final_status = "published"
-            else:
-                final_status = "completed"
-            error = ""
-        elif successful:
-            final_status = "partial"
-            error = "部分平台发布失败"
-        else:
-            final_status = "failed"
-            error = "; ".join(item["error"] for item in results)
-        _set_article_status(article_id, final_status, error)
+        final_status = _finalize_article_platform_status(article_id, platforms)
         logger.info(
-            "文章发布结束 article_id=%s final_status=%s success=%s total=%s "
-            "elapsed_ms=%.1f",
+            "文章发布结束 article_id=%s final_status=%s elapsed_ms=%.1f",
             article_id,
             final_status,
-            len(successful),
-            len(results),
             (time.perf_counter() - started) * 1000,
         )
-
         if final_status == "published" and article.get("notion_page_id"):
             try:
                 notion_client(settings).mark_published(
@@ -629,9 +994,8 @@ def publish_article(article_id, requested_actions=None):
                 )
             except Exception as exc:
                 logger.exception(
-                    "发布成功但 Notion 状态回写失败 article_id=%s page_id=%s",
+                    "发布成功但 Notion 状态回写失败 article_id=%s",
                     article_id,
-                    article["notion_page_id"],
                 )
                 results.append(
                     {
@@ -640,22 +1004,45 @@ def publish_article(article_id, requested_actions=None):
                         "error": f"发布成功，但 Notion 状态回写失败: {exc}",
                     }
                 )
-        return {"article_id": article_id, "status": final_status, "results": results}
+                publish_progress.event(
+                    operation_id,
+                    f"Notion 状态回写失败：{redact_text(exc)}",
+                    level="warning",
+                    stage="warning",
+                    article_id=article_id,
+                    article_title=article["title"],
+                    platform="notion",
+                )
+        if owns_operation:
+            progress_status = (
+                "failed" if final_status == "failed"
+                else "partial" if final_status == "partial"
+                else "completed"
+            )
+            publish_progress.finish(
+                operation_id,
+                progress_status,
+                "发布失败" if final_status == "failed" else "发布任务已完成",
+            )
+        return {
+            "article_id": article_id,
+            "status": final_status,
+            "results": results,
+            "operation_id": operation_id,
+        }
+    except Exception as exc:
+        publish_progress.event(
+            operation_id,
+            f"任务中止：{redact_text(exc)}",
+            level="error",
+            stage="failed",
+            article_id=article_id,
+        )
+        if owns_operation:
+            publish_progress.finish(operation_id, "failed", redact_text(exc))
+        raise
     finally:
         operation_lock.release()
-
-
-def _article_for_platform(article, platform_key):
-    variant = article.get("ai_result", {}).get("platforms", {}).get(platform_key, {})
-    if not variant:
-        return article
-    platform_article = dict(article)
-    if variant.get("title"):
-        platform_article["title"] = variant["title"]
-    if variant.get("content_md"):
-        platform_article["content_md"] = variant["content_md"]
-    return platform_article
-
 
 def _insert_generated_images(markdown, images):
     content = str(markdown or "").strip()
@@ -673,12 +1060,48 @@ def _insert_generated_images(markdown, images):
         content = "\n\n".join([content, *appended]).strip()
     return content
 
+AI_IMAGE_MODES = {"auto", "cover", "none"}
+
+
+def resolve_ai_image_count(
+    article_type,
+    image_mode="auto",
+    word_count=1200,
+):
+    article_type = str(article_type or "article").strip()
+    image_mode = str(image_mode or "auto").strip()
+    if image_mode not in AI_IMAGE_MODES:
+        raise ValueError("\u914d\u56fe\u6a21\u5f0f\u5fc5\u987b\u662f auto\u3001cover \u6216 none")
+    if image_mode == "none":
+        if article_type == "image":
+            raise ValueError("\u56fe\u6587\u5185\u5bb9\u4e0d\u80fd\u9009\u62e9\u4e0d\u914d\u56fe")
+        return 0
+    if image_mode == "cover":
+        return 1
+    words = max(300, int(word_count or 1200))
+    if article_type == "image":
+        return max(3, min(9, math.ceil(words / 150)))
+    return max(1, min(4, math.ceil(words / 700)))
+
+
+def resolve_requested_ai_image_count(values, article_type, default_word_count):
+    image_mode = values.get("image_mode")
+    if image_mode is not None:
+        return resolve_ai_image_count(
+            article_type,
+            image_mode,
+            values.get("word_count", default_word_count),
+        )
+    image_count = int(values.get("image_count", 1))
+    if article_type == "image" and image_count < 1:
+        raise ValueError("图文至少需要生成 1 张图片")
+    return image_count
 
 def generate_ai_storyboard(values, settings=None):
     settings = settings or get_settings()
     if not settings["ai_enabled"]:
         raise RuntimeError("AI 内容生成尚未启用")
-    page_count = int(values.get("image_count") or 5)
+    page_count = resolve_requested_ai_image_count(values, "image", 700)
     if page_count < 1 or page_count > 9:
         raise ValueError("图文分镜页数必须在 1-9 之间")
     material_ids = values.get("material_ids") or []
@@ -710,11 +1133,15 @@ def generate_ai_article(values, settings=None):
     if not settings["ai_enabled"]:
         raise RuntimeError("AI 内容生成尚未启用")
     article_type = values.get("article_type", "article")
-    image_count = int(values.get("image_count") or 0)
     if article_type not in {"article", "image"}:
         raise ValueError("AI 生成仅支持 article 或 image")
-    if article_type == "image" and image_count < 1:
-        raise ValueError("图文内容至少需要生成 1 张图片")
+    storyboard_value = values.get("storyboard")
+    if article_type == "image" and isinstance(storyboard_value, dict):
+        image_count = len(storyboard_value.get("pages") or [])
+    else:
+        image_count = resolve_requested_ai_image_count(
+            values, article_type, 1200
+        )
 
     material_ids = values.get("material_ids") or []
     references = get_material_references(material_ids)
@@ -769,41 +1196,50 @@ def generate_ai_article(values, settings=None):
     else:
         generated = AIContentService(settings).generate_article(specification)
 
-    images = AIImageService(settings).generate_images(generated["image_plan"])
-    content_md = _insert_generated_images(generated["content_md"], images)
-    media_paths = [image["path"] for image in images]
+    image_plan = generated["image_plan"]
+    generated_images = [
+        {
+            **plan,
+            "path": "",
+            "status": "pending",
+            "error": "",
+        }
+        for plan in image_plan
+    ]
+    generation_status = "queued" if image_plan else "completed"
     ai_result = {
         "source": "generated",
         "summary": generated["summary"],
         "editor_notes": "AI 生成初稿，请在发布前核对事实、图片与平台要求。",
         "tags": generated["tags"],
-        "image_plan": generated["image_plan"],
-        "generated_images": images,
+        "image_mode": values.get("image_mode") or "manual",
+        "image_count": image_count,
+        "image_plan": image_plan,
+        "generated_images": generated_images,
+        "image_generation": _image_generation_summary(
+            generated_images,
+            status=generation_status,
+        ),
         "material_ids": [material["id"] for material in references],
         "news_ids": [item["id"] for item in news_references],
         "platforms": {},
     }
     if storyboard:
         ai_result["storyboard"] = storyboard
-    try:
-        article = create_article(
-            {
-                "title": generated["title"],
-                "author": str(values.get("author") or "").strip(),
-                "article_type": article_type,
-                "content_md": content_md,
-                "cover_url": media_paths[0] if media_paths else "",
-                "tags": generated["tags"],
-                "media_paths": media_paths,
-                "publish_mode": "manual",
-                "target_platforms": ["wechat"],
-                "platform_actions": {"wechat": "draft"},
-            }
-        )
-    except Exception:
-        for image in images:
-            Path(image["path"]).unlink(missing_ok=True)
-        raise
+    article = create_article(
+        {
+            "title": generated["title"],
+            "author": str(values.get("author") or "").strip(),
+            "article_type": article_type,
+            "content_md": generated["content_md"],
+            "cover_url": "",
+            "tags": generated["tags"],
+            "media_paths": [],
+            "publish_mode": "manual",
+            "target_platforms": ["wechat"],
+            "platform_actions": {"wechat": "draft"},
+        }
+    )
 
     link_article_materials(article["id"], material_ids)
     link_article_news(article["id"], news_ids)
@@ -823,13 +1259,207 @@ def generate_ai_article(values, settings=None):
             ),
         )
     logger.info(
-        "AI 文章生成完成 article_id=%s type=%s images=%s elapsed_ms=%.1f",
+        "AI 文稿已保存 article_id=%s type=%s pending_images=%s elapsed_ms=%.1f",
         article["id"],
         article_type,
-        len(images),
+        len(image_plan),
         (time.perf_counter() - started) * 1000,
     )
     return get_article(article["id"])
+
+
+def _image_generation_summary(items, status=None, current_index=None):
+    total = len(items)
+    succeeded = sum(item.get("status") == "completed" for item in items)
+    failed = sum(item.get("status") == "failed" for item in items)
+    completed = succeeded + failed
+    if status is None:
+        if completed < total:
+            status = "running"
+        elif failed and succeeded:
+            status = "partial"
+        elif failed:
+            status = "failed"
+        else:
+            status = "completed"
+    return {
+        "status": status,
+        "total": total,
+        "completed": completed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "current_index": current_index,
+        "errors": [
+            {
+                "index": index,
+                "message": item.get("error") or "图片生成失败",
+            }
+            for index, item in enumerate(items)
+            if item.get("status") == "failed"
+        ],
+        "updated_at": utc_now(),
+    }
+
+
+def _normalized_generated_images(image_plan, generated_images):
+    items = list(generated_images or [])
+    while len(items) < len(image_plan):
+        plan = image_plan[len(items)]
+        items.append(
+            {
+                **plan,
+                "path": "",
+                "status": "pending",
+                "error": "",
+            }
+        )
+    return items[:len(image_plan)]
+
+
+def generate_ai_article_images(article_id, settings=None):
+    settings = settings or get_settings()
+    try:
+        article = get_article(article_id, include_records=False)
+        ai_result = dict(article.get("ai_result") or {})
+        image_plan = list(ai_result.get("image_plan") or [])
+        generated_images = _normalized_generated_images(
+            image_plan,
+            ai_result.get("generated_images"),
+        )
+        if not image_plan:
+            return article
+
+        ai_result["generated_images"] = generated_images
+        ai_result["image_generation"] = _image_generation_summary(
+            generated_images,
+            status="running",
+        )
+        update_article(article_id, {"ai_result": ai_result})
+        image_service = AIImageService(settings)
+
+        for image_index, plan in enumerate(image_plan):
+            article = get_article(article_id, include_records=False)
+            ai_result = dict(article.get("ai_result") or {})
+            generated_images = _normalized_generated_images(
+                image_plan,
+                ai_result.get("generated_images"),
+            )
+            if generated_images[image_index].get("status") == "completed":
+                continue
+            generated_images[image_index] = {
+                **plan,
+                "path": "",
+                "status": "running",
+                "error": "",
+            }
+            ai_result["generated_images"] = generated_images
+            ai_result["image_generation"] = _image_generation_summary(
+                generated_images,
+                status="running",
+                current_index=image_index,
+            )
+            update_article(article_id, {"ai_result": ai_result})
+
+            try:
+                replacement = image_service.generate_images([plan])[0]
+                replacement = {
+                    **replacement,
+                    "status": "completed",
+                    "error": "",
+                }
+            except Exception as exc:
+                logger.exception(
+                    "AI 图片生成失败 article_id=%s image_index=%s",
+                    article_id,
+                    image_index,
+                )
+                replacement = {
+                    **plan,
+                    "path": "",
+                    "status": "failed",
+                    "error": redact_text(exc),
+                }
+
+            article = get_article(article_id, include_records=False)
+            ai_result = dict(article.get("ai_result") or {})
+            generated_images = _normalized_generated_images(
+                image_plan,
+                ai_result.get("generated_images"),
+            )
+            old_path = generated_images[image_index].get("path") or ""
+            generated_images[image_index] = replacement
+            content_md = article.get("content_md") or ""
+            if replacement.get("path"):
+                if old_path:
+                    content_md = content_md.replace(
+                        Path(old_path).as_posix(),
+                        Path(replacement["path"]).as_posix(),
+                    )
+                else:
+                    content_md = _insert_generated_images(
+                        content_md,
+                        [replacement],
+                    )
+            media_paths = [
+                item["path"]
+                for item in generated_images
+                if item.get("path")
+            ]
+            ai_result["generated_images"] = generated_images
+            ai_result["image_generation"] = _image_generation_summary(
+                generated_images,
+                current_index=(
+                    image_index
+                    if image_index + 1 < len(image_plan)
+                    else None
+                ),
+            )
+            values = {
+                "content_md": content_md,
+                "media_paths": media_paths,
+                "ai_result": ai_result,
+            }
+            first_path = generated_images[0].get("path")
+            if first_path:
+                values["cover_url"] = first_path
+            update_article(article_id, values)
+
+        result = get_article(article_id)
+        generation = result.get("ai_result", {}).get("image_generation") or {}
+        logger.info(
+            "AI 图片任务结束 article_id=%s status=%s succeeded=%s failed=%s",
+            article_id,
+            generation.get("status"),
+            generation.get("succeeded"),
+            generation.get("failed"),
+        )
+        return result
+    except Exception as exc:
+        logger.exception("AI 图片后台任务中止 article_id=%s", article_id)
+        try:
+            article = get_article(article_id, include_records=False)
+            ai_result = dict(article.get("ai_result") or {})
+            image_plan = list(ai_result.get("image_plan") or [])
+            generated_images = _normalized_generated_images(
+                image_plan,
+                ai_result.get("generated_images"),
+            )
+            ai_result["generated_images"] = generated_images
+            summary = _image_generation_summary(
+                generated_images,
+                status="failed",
+            )
+            summary["errors"].append(
+                {"index": None, "message": redact_text(exc)}
+            )
+            ai_result["image_generation"] = summary
+            update_article(article_id, {"ai_result": ai_result})
+        except Exception:
+            logger.exception(
+                "AI 图片任务失败状态保存失败 article_id=%s",
+                article_id,
+            )
+        return get_article(article_id)
 
 
 def regenerate_ai_image(article_id, image_index, settings=None):
@@ -838,26 +1468,44 @@ def regenerate_ai_image(article_id, image_index, settings=None):
         raise RuntimeError("AI 内容生成尚未启用")
     article = get_article(article_id, include_records=False)
     image_plan = article.get("ai_result", {}).get("image_plan") or []
-    generated_images = list(
-        article.get("ai_result", {}).get("generated_images") or []
+    generated_images = _normalized_generated_images(
+        image_plan,
+        article.get("ai_result", {}).get("generated_images"),
     )
     if image_index < 0 or image_index >= len(image_plan):
         raise ValueError("图片序号超出可重绘范围")
 
-    replacement = AIImageService(settings).generate_images([image_plan[image_index]])[0]
-    old_path = (
-        generated_images[image_index].get("path")
-        if image_index < len(generated_images)
-        else ""
-    )
-    while len(generated_images) <= image_index:
-        generated_images.append({})
-    generated_images[image_index] = replacement
+    old_path = generated_images[image_index].get("path") or ""
+    try:
+        replacement = AIImageService(settings).generate_images(
+            [image_plan[image_index]]
+        )[0]
+    except Exception as exc:
+        generated_images[image_index] = {
+            **image_plan[image_index],
+            "path": old_path,
+            "status": "failed",
+            "error": redact_text(exc),
+        }
+        ai_result = dict(article.get("ai_result") or {})
+        ai_result["generated_images"] = generated_images
+        ai_result["image_generation"] = _image_generation_summary(
+            generated_images,
+        )
+        update_article(article_id, {"ai_result": ai_result})
+        raise
 
-    media_paths = list(article.get("media_paths") or [])
-    while len(media_paths) <= image_index:
-        media_paths.append("")
-    media_paths[image_index] = replacement["path"]
+    replacement = {
+        **replacement,
+        "status": "completed",
+        "error": "",
+    }
+    generated_images[image_index] = replacement
+    media_paths = [
+        item["path"]
+        for item in generated_images
+        if item.get("path")
+    ]
 
     content_md = article.get("content_md") or ""
     if old_path:
@@ -865,8 +1513,13 @@ def regenerate_ai_image(article_id, image_index, settings=None):
             Path(old_path).as_posix(),
             Path(replacement["path"]).as_posix(),
         )
+    else:
+        content_md = _insert_generated_images(content_md, [replacement])
     ai_result = dict(article.get("ai_result") or {})
     ai_result["generated_images"] = generated_images
+    ai_result["image_generation"] = _image_generation_summary(
+        generated_images,
+    )
     values = {
         "content_md": content_md,
         "media_paths": media_paths,
@@ -880,7 +1533,7 @@ def regenerate_ai_image(article_id, image_index, settings=None):
         Path(replacement["path"]).unlink(missing_ok=True)
         raise
 
-    if old_path:
+    if old_path and old_path != replacement["path"]:
         old_file = Path(old_path).resolve()
         try:
             old_file.relative_to((MEDIA_DIR / "ai").resolve())
@@ -904,7 +1557,11 @@ def enrich_article(article_id, settings=None):
         settings["ai_model"] or "(未配置)",
     )
     result = AIContentService(settings).enrich(article)
-    merged_tags = list(dict.fromkeys(article["tags"] + result["tags"]))
+    merged_tags = list(
+        dict.fromkeys(result["tags"] + article["tags"])
+    )[:5]
+    if not merged_tags:
+        raise RuntimeError("AI 加工必须生成至少一个有效标签")
     now = utc_now()
     with connection() as conn:
         conn.execute(
@@ -923,10 +1580,11 @@ def enrich_article(article_id, settings=None):
             ),
         )
     logger.info(
-        "AI 内容加工完成 article_id=%s new_tags=%s platforms=%s elapsed_ms=%.1f",
+        "AI 内容加工完成 article_id=%s tags=%s title_recommended=%s "
+        "elapsed_ms=%.1f",
         article_id,
-        len(result["tags"]),
-        ",".join(result.get("platforms", {}).keys()),
+        len(merged_tags),
+        bool(result.get("recommended_title")),
         (time.perf_counter() - started) * 1000,
     )
     return get_article(article_id)
@@ -974,45 +1632,196 @@ def _set_article_status(article_id, status, error):
         )
 
 
+def _automatic_target_needs_run(state, action, account_id):
+    if not _state_matches_target(state, action, account_id):
+        return True
+    return state["status"] not in {"drafted", "published", "failed"}
+
+
 def run_auto_publish():
+    if not operation_lock.acquire(blocking=False):
+        raise RuntimeError("已有同步或发布任务正在执行")
+    operation_id = publish_progress.begin("automatic", "自动发布检查")
+    publish_progress.event(
+        operation_id,
+        "正在读取自动发布规则与待处理稿件",
+        stage="scan",
+    )
+    try:
+        return _run_auto_publish(operation_id)
+    except Exception as exc:
+        publish_progress.event(
+            operation_id,
+            f"自动发布检查中止：{redact_text(exc)}",
+            level="error",
+            stage="failed",
+        )
+        publish_progress.finish(operation_id, "failed", redact_text(exc))
+        raise
+    finally:
+        operation_lock.release()
+
+
+def _run_auto_publish(operation_id):
     settings = get_settings()
     if not settings["auto_publish_enabled"]:
         logger.info("自动发布检查结束：功能未启用 processed=0")
-        return {"processed": 0, "results": []}
+        publish_progress.event(
+            operation_id,
+            "自动发布尚未启用，本次未执行",
+            level="warning",
+            stage="skipped",
+        )
+        publish_progress.finish(operation_id, "completed", "未启用自动发布")
+        return {"processed": 0, "results": [], "operation_id": operation_id}
+
+    targets = {
+        platform: target
+        for platform, target in (settings.get("auto_publish_targets") or {}).items()
+        if target.get("enabled")
+    }
+    if not targets:
+        logger.info("自动发布检查结束：未配置发布平台 processed=0")
+        publish_progress.event(
+            operation_id,
+            "没有已启用的自动发布平台",
+            level="warning",
+            stage="skipped",
+        )
+        publish_progress.finish(operation_id, "completed", "未配置发布平台")
+        return {
+            "processed": 0,
+            "results": [],
+            "message": "未配置自动发布平台",
+            "operation_id": operation_id,
+        }
+
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT id FROM articles
-            WHERE publish_mode = 'automatic' AND status = 'ready'
+            SELECT id, article_type FROM articles
+            WHERE publish_mode = 'automatic'
+              AND status IN ('ready', 'partial', 'failed', 'publishing')
             ORDER BY created_at
             """
         ).fetchall()
-        excluded = conn.execute(
-            """
-            SELECT publish_mode, status, COUNT(*) AS count
-            FROM articles
-            GROUP BY publish_mode, status
-            ORDER BY publish_mode, status
-            """
-        ).fetchall()
-    logger.info(
-        "自动发布筛选完成 eligible=%s inventory=%s",
-        len(rows),
-        [
-            {
-                "publish_mode": row["publish_mode"],
-                "status": row["status"],
-                "count": row["count"],
-            }
-            for row in excluded
-        ],
+
+    publishers = get_platforms(settings)
+    actions = {
+        platform: target["action"] for platform, target in targets.items()
+    }
+
+    publish_progress.configure(
+        operation_id,
+        total=len(rows) * len(actions),
+    )
+    publish_progress.event(
+        operation_id,
+        f"找到 {len(rows)} 篇候选稿件，目标平台 {len(actions)} 个",
+        stage="scan",
     )
     results = []
     for row in rows:
-        results.append(publish_article(row["id"]))
-    logger.info("自动发布执行结束 processed=%s", len(results))
-    return {"processed": len(results), "results": results}
+        article_id = row["id"]
+        compatible_targets = {
+            platform: target for platform, target in targets.items()
+            if publishers[platform].supports_content_type(row["article_type"])
+        }
+        incompatible_count = len(targets) - len(compatible_targets)
+        if incompatible_count:
+            publish_progress.event(
+                operation_id,
+                f"稿件 #{article_id} 已跳过 {incompatible_count} 个不支持当前类型的平台",
+                level="warning",
+                stage="skipped",
+                article_id=article_id,
+                advance=incompatible_count,
+            )
+        if not compatible_targets:
+            continue
 
+        compatible_actions = {
+            platform: target["action"]
+            for platform, target in compatible_targets.items()
+        }
+        compatible_accounts = {
+            platform: target["account_id"]
+            for platform, target in compatible_targets.items()
+        }
+        states = {
+            state["platform"]: state for state in _get_platform_states(article_id)
+        }
+        if not any(
+            _automatic_target_needs_run(
+                states.get(platform), target["action"], target["account_id"]
+            )
+            for platform, target in compatible_targets.items()
+        ):
+            publish_progress.event(
+                operation_id,
+                f"稿件 #{article_id} 无需重复处理",
+                level="success",
+                stage="skipped",
+                article_id=article_id,
+                advance=len(compatible_actions),
+            )
+            continue
+        try:
+            results.append(
+                publish_article(
+                    article_id,
+                    requested_actions=compatible_actions,
+                    requested_accounts=compatible_accounts,
+                    retry_failed=False,
+                    operation_id=operation_id,
+                )
+            )
+        except Exception as exc:
+            logger.exception("自动发布稿件失败 article_id=%s", article_id)
+            publish_progress.event(
+                operation_id,
+                f"稿件 #{article_id} 处理失败：{redact_text(exc)}",
+                level="error",
+                stage="failed",
+                article_id=article_id,
+            )
+            results.append(
+                {"article_id": article_id, "status": "failed", "error": str(exc)}
+            )
+    logger.info("自动发布执行结束 processed=%s", len(results))
+    failed = any(item.get("status") in {"failed", "partial"} for item in results)
+    publish_progress.finish(
+        operation_id,
+        "partial" if failed else "completed",
+        f"自动发布检查完成，处理 {len(results)} 篇稿件",
+    )
+    return {
+        "processed": len(results),
+        "results": results,
+        "operation_id": operation_id,
+    }
+
+def retry_article_platform(article_id, platform):
+    states = {
+        state["platform"]: state for state in _get_platform_states(article_id)
+    }
+    state = states.get(platform)
+    if not state:
+        raise LookupError("该稿件还没有此平台的发布状态")
+    if state["status"] != "failed":
+        raise ValueError("只能重试发布失败的平台")
+    accounts = (
+        {platform: state["account_id"]}
+        if state["account_id"] is not None
+        else None
+    )
+    return publish_article(
+        article_id,
+        requested_actions={platform: state["action"]},
+        requested_accounts=accounts,
+        retry_failed=True,
+        operation_kind="retry",
+    )
 
 def dashboard_summary():
     with connection() as conn:
@@ -1029,8 +1838,19 @@ def dashboard_summary():
             """
         ).fetchall()
         total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+    follower_counts = []
+    for account in list_accounts():
+        value = (account.get("profile") or {}).get("followers_count")
+        if value is None:
+            continue
+        try:
+            follower_counts.append(max(0, int(value)))
+        except (TypeError, ValueError):
+            continue
     return {
         "total": total,
+        "total_followers": sum(follower_counts),
+        "follower_accounts": len(follower_counts),
         "by_status": {row["status"]: row["count"] for row in status_rows},
         "recent_records": [dict(row) for row in recent_rows],
     }

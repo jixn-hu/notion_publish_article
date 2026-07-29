@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Check,
   Download,
+  Eye,
   FileText,
   Film,
   Image as ImageIcon,
@@ -12,6 +14,7 @@ import {
   X
 } from 'lucide-react'
 import { api, materialFileUrl } from './api'
+import MarkdownPreview from './MarkdownPreview'
 
 const KIND_LABELS = {
   all: '全部',
@@ -51,6 +54,7 @@ export default function Materials ({ notify }) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(new Set())
   const [editor, setEditor] = useState(null)
+  const [viewer, setViewer] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [downloading, setDownloading] = useState(false)
 
@@ -237,6 +241,7 @@ export default function Materials ({ notify }) {
                 material={material}
                 selected={selected.has(material.id)}
                 onToggle={() => toggle(material.id)}
+                onView={() => setViewer(material)}
                 onEdit={() => setEditor(material)}
                 onDelete={() => remove(material)}
               />
@@ -257,27 +262,45 @@ export default function Materials ({ notify }) {
           onSave={saveEditor}
         />
       )}
+
+      {viewer && (
+        <MaterialViewer
+          material={viewer}
+          onClose={() => setViewer(null)}
+        />
+      )}
     </div>
   )
 }
 
-function MaterialCard ({ material, selected, onToggle, onEdit, onDelete }) {
+function MaterialCard ({ material, selected, onToggle, onView, onEdit, onDelete }) {
   const KindIcon = KIND_ICONS[material.kind] || FileText
   return (
     <article className={selected ? 'material-card selected' : 'material-card'}>
       <div className='material-preview'>
-        {material.kind === 'image' && (
-          <img src={materialFileUrl(material.id)} alt='' loading='lazy' />
-        )}
-        {material.kind === 'video' && (
-          <video src={materialFileUrl(material.id)} controls preload='metadata' />
-        )}
-        {material.kind === 'note' && (
-          <div className='note-preview'>
-            <FileText size={25} />
-            <p>{material.content_md}</p>
-          </div>
-        )}
+        <button
+          type='button'
+          className='material-preview-button'
+          aria-label={'查看素材 ' + material.title}
+          onClick={onView}
+        >
+          {material.kind === 'image' && (
+            <img src={materialFileUrl(material.id)} alt={material.title} loading='lazy' />
+          )}
+          {material.kind === 'video' && (
+            <video src={materialFileUrl(material.id)} muted preload='metadata' />
+          )}
+          {material.kind === 'note' && (
+            <div className='note-preview'>
+              <FileText size={25} />
+              <p>{material.content_md}</p>
+            </div>
+          )}
+          <span className='material-view-cue'>
+            <Eye size={15} />
+            查看
+          </span>
+        </button>
         <label className='material-check'>
           <input
             type='checkbox'
@@ -294,7 +317,13 @@ function MaterialCard ({ material, selected, onToggle, onEdit, onDelete }) {
       <div className='material-card-body'>
         <div className='material-card-title'>
           <div>
-            <b>{material.title}</b>
+            <button
+              type='button'
+              className='material-title-button'
+              onClick={onView}
+            >
+              {material.title}
+            </button>
             <span>
               {material.kind === 'note'
                 ? material.content_md.length + ' 字'
@@ -320,6 +349,65 @@ function MaterialCard ({ material, selected, onToggle, onEdit, onDelete }) {
         </div>
       </div>
     </article>
+  )
+}
+
+function MaterialViewer ({ material, onClose }) {
+  const KindIcon = KIND_ICONS[material.kind] || FileText
+
+  useEffect(() => {
+    const closeOnEscape = event => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose])
+
+  return (
+    <div className='modal-backdrop material-viewer-backdrop' onMouseDown={onClose}>
+      <section
+        className={'material-viewer ' + material.kind}
+        role='dialog'
+        aria-modal='true'
+        aria-label={'查看素材 ' + material.title}
+        onMouseDown={event => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className='eyebrow'>MATERIAL PREVIEW</span>
+            <h2>{material.title}</h2>
+          </div>
+          <button type='button' className='close-button' aria-label='关闭' onClick={onClose}>
+            <X size={18} />
+          </button>
+        </header>
+        <div className='material-viewer-body'>
+          {material.kind === 'image' && (
+            <img src={materialFileUrl(material.id)} alt={material.title} />
+          )}
+          {material.kind === 'video' && (
+            <video src={materialFileUrl(material.id)} controls autoPlay preload='metadata' />
+          )}
+          {material.kind === 'note' && (
+            <div className='material-note-document'>
+              <MarkdownPreview markdown={material.content_md} />
+            </div>
+          )}
+        </div>
+        <footer>
+          <span className={'material-kind-label ' + material.kind}>
+            <KindIcon size={13} />
+            {material.kind === 'note' ? 'Markdown 笔记' : KIND_LABELS[material.kind]}
+          </span>
+          <span>
+            {material.kind === 'note'
+              ? material.content_md.length + ' 字'
+              : formatBytes(material.size_bytes)}
+            {' · 更新于 ' + dateLabel(material.updated_at)}
+          </span>
+        </footer>
+      </section>
+    </div>
   )
 }
 
@@ -381,11 +469,12 @@ function MaterialEditor ({ material, onClose, onSave }) {
           </label>
           {isNote && (
             <label className='field full'>
-              <span>笔记内容</span>
+              <span>Markdown 内容</span>
               <textarea
                 required
                 className='note-content-input'
                 maxLength='20000'
+                placeholder={'# 标题\n\n使用 Markdown 记录可复用的观点、资料和写作片段。'}
                 value={form.content_md}
                 onChange={event => set('content_md', event.target.value)}
               />
@@ -467,6 +556,12 @@ export function MaterialPicker ({ selected = [], onChange }) {
         {!loading && visible.map(material => {
           const KindIcon = KIND_ICONS[material.kind] || FileText
           const active = selected.includes(material.id)
+          const detailText = material.kind === 'note'
+            ? String(material.content_md || '').replace(/[#*_>]/g, '').trim()
+            : material.description || `${formatBytes(material.size_bytes)} · ${dateLabel(material.updated_at)}`
+          const detail = detailText.length > 80
+            ? detailText.slice(0, 80) + '…'
+            : detailText
           return (
             <button
               type='button'
@@ -475,8 +570,16 @@ export function MaterialPicker ({ selected = [], onChange }) {
               key={material.id}
               onClick={() => toggle(material.id)}
             >
-              <KindIcon size={14} />
-              <span>{material.title}</span>
+              <span className={`reference-item-icon ${material.kind}`}>
+                <KindIcon size={17} />
+              </span>
+              <span className='reference-item-copy'>
+                <b>{material.title}</b>
+                <small>{KIND_LABELS[material.kind]}{detail ? ` · ${detail}` : ''}</small>
+              </span>
+              <span className='reference-item-check'>
+                {active && <Check size={14} />}
+              </span>
             </button>
           )
         })}

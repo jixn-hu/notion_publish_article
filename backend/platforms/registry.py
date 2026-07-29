@@ -2,7 +2,7 @@ from backend.platforms.bilibili import BilibiliPublisher
 from backend.platforms.channels import ChannelsPublisher
 from backend.platforms.csdn import CsdnPublisher
 from backend.platforms.douyin import DouyinPublisher
-from backend.platforms.wechat_browser import WechatPublisher
+from backend.platforms.wechat import WechatPublisher
 from backend.platforms.xiaohongshu import XiaohongshuPublisher
 
 

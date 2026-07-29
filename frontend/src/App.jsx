@@ -1,11 +1,23 @@
-import { lazy, Suspense, useEffect, useState } from 'react'
-import { ArrowLeft, Plus, Sparkles, Trash2, WandSparkles } from 'lucide-react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowUp,
+  Image as ImageIcon,
+  Plus,
+  Sparkles,
+  Trash2,
+  WandSparkles
+} from 'lucide-react'
 import { api, mediaPreviewUrl } from './api'
 import Accounts from './Accounts'
 import Automation from './Automation'
 import ProxyDirectory from './Proxies'
 import Materials, { MaterialPicker } from './Materials'
 import News, { NewsPicker } from './News'
+import AIAssistant from './AIAssistant'
+import BackgroundTasks from './BackgroundTasks'
+import PublishProgress from './PublishProgress'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
 
@@ -40,12 +52,39 @@ const PLATFORM_LABELS = {
 
 const BROWSER_PLATFORM_KEYS = ['wechat', 'xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
 const DRAFT_PLATFORM_KEYS = ['wechat', 'csdn']
-const PUBLISH_PLATFORM_KEYS = ['xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
+const PUBLISH_PLATFORM_KEYS = ['wechat', 'xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
 
 const CONTENT_TYPE_LABELS = {
   article: '文章',
   image: '图文',
   video: '视频'
+}
+
+const ACTIVE_IMAGE_GENERATION = new Set(['queued', 'running'])
+
+const imageGenerationMessage = article => {
+  const generation = article?.ai_result?.image_generation
+  if (!generation) return '文稿已保存'
+  const progress = `${generation.completed || 0} / ${generation.total || 0}`
+  if (ACTIVE_IMAGE_GENERATION.has(generation.status)) {
+    return `文稿已保存，正在生成图片 ${progress}`
+  }
+  if (generation.status === 'completed') {
+    return `文稿与图片已保存，共 ${generation.succeeded || 0} 张`
+  }
+  return `文稿已保存，图片成功 ${generation.succeeded || 0} 张、失败 ${generation.failed || 0} 张，可打开稿件重试`
+}
+
+async function waitForArticleImages (article, onProgress) {
+  let current = article
+  while (ACTIVE_IMAGE_GENERATION.has(
+    current?.ai_result?.image_generation?.status
+  )) {
+    onProgress(imageGenerationMessage(current))
+    await new Promise(resolve => window.setTimeout(resolve, 1500))
+    current = await api.article(current.id)
+  }
+  return current
 }
 
 const NOTION_FIELD_ROWS = [
@@ -67,8 +106,12 @@ function App () {
   const [accounts, setAccounts] = useState([])
   const [settingsData, setSettingsData] = useState(null)
   const [health, setHealth] = useState(null)
-  const [busy, setBusy] = useState('')
+  const [busyKeys, setBusyKeys] = useState([])
+  const actionRunning = useRef(new Set())
+  const [backgroundTasks, setBackgroundTasks] = useState([])
+  const backgroundRunning = useRef(new Set())
   const [toast, setToast] = useState(null)
+  const [libraryVersion, setLibraryVersion] = useState(0)
 
   const notify = (message, kind = 'success') => {
     setToast({ message, kind })
@@ -104,7 +147,7 @@ function App () {
 
   useEffect(() => {
     if (view === 'articles') {
-      Promise.all([loadArticles(), loadAccounts()])
+      Promise.all([loadArticles(), loadAccounts(), loadSettings()])
         .catch(error => notify(error.message, 'error'))
     }
     if (view === 'accounts') {
@@ -117,7 +160,9 @@ function App () {
   }, [view])
 
   const runAction = async (key, action, successMessage) => {
-    setBusy(key)
+    if (actionRunning.current.has(key)) return
+    actionRunning.current.add(key)
+    setBusyKeys(current => current.includes(key) ? current : [...current, key])
     try {
       const result = await action()
       const notice = successMessage(result)
@@ -132,8 +177,71 @@ function App () {
       notify(error.message, 'error')
       throw error
     } finally {
-      setBusy('')
+      actionRunning.current.delete(key)
+      setBusyKeys(current => current.filter(item => item !== key))
     }
+  }
+
+  const startBackgroundTask = ({ key, title, action, successMessage, destination, onSuccess }) => {
+    if (backgroundRunning.current.has(key)) {
+      notify(`“${title}”已在后台处理中`)
+      return false
+    }
+
+    const id = `${key}-${Date.now()}`
+    backgroundRunning.current.add(key)
+    setBackgroundTasks(current => [{
+      id,
+      key,
+      title,
+      status: 'running',
+      message: '正在处理，可继续使用其他功能',
+      destination,
+      startedAt: new Date().toISOString()
+    }, ...current].slice(0, 8))
+    notify(`“${title}”已转到后台，可继续其他操作`)
+
+    const updateProgress = message => {
+      setBackgroundTasks(current => current.map(task => (
+        task.id === id ? { ...task, message } : task
+      )))
+    }
+
+    Promise.resolve()
+      .then(() => action(updateProgress))
+      .then(async result => {
+        if (onSuccess) await onSuccess(result)
+        const message = typeof successMessage === 'function'
+          ? successMessage(result)
+          : successMessage
+        setBackgroundTasks(current => current.map(task => (
+          task.id === id
+            ? { ...task, status: 'completed', message: message || '处理完成', result }
+            : task
+        )))
+        notify(message || `“${title}”已完成`)
+      })
+      .catch(error => {
+        setBackgroundTasks(current => current.map(task => (
+          task.id === id
+            ? { ...task, status: 'failed', message: error.message || '处理失败' }
+            : task
+        )))
+        notify(`${title}失败：${error.message}`, 'error')
+      })
+      .finally(() => backgroundRunning.current.delete(key))
+
+    return true
+  }
+
+  const handleAssistantCreated = async (result, navigate = false) => {
+    await loadOverview()
+    if (result.destination === 'articles') {
+      await loadArticles()
+    } else {
+      setLibraryVersion(current => current + 1)
+    }
+    if (navigate) setView(result.destination)
   }
 
   return (
@@ -178,14 +286,17 @@ function App () {
           <div className='topbar-actions'>
             <button
               className='button ghost'
-              disabled={Boolean(busy)}
-              onClick={() => runAction(
-                'sync',
-                api.syncNotion,
-                result => `同步完成：新增 ${result.created}，更新 ${result.updated}`
-              )}
+              disabled={backgroundRunning.current.has('sync-notion')}
+              onClick={() => startBackgroundTask({
+                key: 'sync-notion',
+                title: '从 Notion 同步',
+                action: api.syncNotion,
+                destination: 'articles',
+                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，Notion 已标记 ${result.marked_synced || 0} 篇`,
+                onSuccess: () => Promise.all([loadOverview(), loadArticles()])
+              })}
             >
-              <span className={busy === 'sync' ? 'spin' : ''}>↻</span>
+              <span className={backgroundRunning.current.has('sync-notion') ? 'spin' : ''}>↻</span>
               从 Notion 同步
             </button>
             <button className='button ink' onClick={() => setView('articles')}>
@@ -199,7 +310,7 @@ function App () {
             data={dashboard}
             platforms={platforms}
             health={health}
-            busy={busy}
+            busyKeys={busyKeys}
             runAction={runAction}
             onNavigate={setView}
           />
@@ -207,18 +318,22 @@ function App () {
         {view === 'articles' && (
           <Articles
             articles={articles}
-            busy={busy}
+            platforms={platforms}
+            busyKeys={busyKeys}
             reload={loadArticles}
+            reloadOverview={loadOverview}
             runAction={runAction}
+            startBackgroundTask={startBackgroundTask}
             notify={notify}
             accounts={accounts}
+            automationTargets={settingsData?.values?.auto_publish_targets || {}}
           />
         )}
         {view === 'news' && (
-          <News notify={notify} />
+          <News key={'news-' + libraryVersion} notify={notify} />
         )}
         {view === 'materials' && (
-          <Materials notify={notify} />
+          <Materials key={'materials-' + libraryVersion} notify={notify} />
         )}
         {view === 'accounts' && (
           <Accounts
@@ -239,6 +354,7 @@ function App () {
         {view === 'automation' && settingsData && (
           <Automation
             data={settingsData}
+            platforms={platforms}
             notify={notify}
             onSaved={async () => {
               await Promise.all([loadSettings(), loadOverview()])
@@ -247,14 +363,37 @@ function App () {
         )}
       </main>
 
+      <AIAssistant
+        notify={notify}
+        onCreated={handleAssistantCreated}
+      />
+      <PublishProgress />
+      <BackgroundTasks
+        tasks={backgroundTasks}
+        onDismiss={id => setBackgroundTasks(current => current.filter(task => task.id !== id))}
+        onOpen={task => {
+          if (task.destination) setView(task.destination)
+        }}
+      />
       {toast && <div className={`toast ${toast.kind}`}>{toast.message}</div>}
     </div>
   )
 }
 
-function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
+function Dashboard ({ data, platforms, health, busyKeys, runAction, onNavigate }) {
   const counts = data?.by_status || {}
+  const formatMetricValue = value => {
+    const count = Number(value || 0)
+    if (count >= 100000000) return `${(count / 100000000).toFixed(1).replace(/\.0$/, '')}亿`
+    if (count >= 10000) return `${(count / 10000).toFixed(1).replace(/\.0$/, '')}万`
+    return count.toLocaleString('zh-CN')
+  }
   const cards = [
+    {
+      label: '全网粉丝',
+      value: data?.total_followers || 0,
+      note: `${data?.follower_accounts || 0} 个账号已同步`
+    },
     { label: '内容总量', value: data?.total || 0, note: '系统内全部稿件' },
     { label: '等待发布', value: counts.ready || 0, note: '已同步，可立即发布' },
     {
@@ -288,7 +427,9 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
         {cards.map((card, index) => (
           <article className='metric-card' key={card.label}>
             <span>0{index + 1}</span>
-            <strong>{String(card.value).padStart(2, '0')}</strong>
+            <strong title={Number(card.value || 0).toLocaleString('zh-CN')}>
+              {formatMetricValue(card.value)}
+            </strong>
             <div>
               <b>{card.label}</b>
               <small>{card.note}</small>
@@ -347,7 +488,7 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
           </div>
           <button
             className='button wide paper'
-            disabled={Boolean(busy)}
+            disabled={busyKeys.some(key => key === 'auto' || key.startsWith('publish-') || key.startsWith('retry-'))}
             onClick={() => runAction(
               'auto',
               api.runAutomation,
@@ -362,17 +503,41 @@ function Dashboard ({ data, platforms, health, busy, runAction, onNavigate }) {
   )
 }
 
-function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
+function Articles ({ articles, accounts, platforms, automationTargets, busyKeys, reload, reloadOverview, runAction, startBackgroundTask, notify }) {
   const [status, setStatus] = useState('all')
   const [query, setQuery] = useState('')
   const [articleType, setArticleType] = useState('all')
   const [editing, setEditing] = useState(null)
   const [creating, setCreating] = useState(false)
   const [generating, setGenerating] = useState(false)
+  const isBusy = key => busyKeys.includes(key)
+  const publishingBusy = busyKeys.some(key => (
+    key === 'auto' || key.startsWith('publish-') || key.startsWith('retry-')
+  ))
+  const platformSupports = (key, contentType) => {
+    const supportedTypes = platforms.find(item => item.key === key)?.content_types
+    return !Array.isArray(supportedTypes) || supportedTypes.includes(contentType)
+  }
 
   const applyFilter = async (nextStatus = status, nextQuery = query) => {
     setStatus(nextStatus)
     await reload(nextStatus, nextQuery)
+  }
+
+  const removeArticle = article => {
+    const sourceNotice = article.notion_page_id
+      ? ' 这篇稿件来自 Notion，下次同步时可能重新出现。'
+      : ''
+    if (!window.confirm(
+      `确定删除稿件“${article.title}”吗？发布记录和文章关联将一并删除，且无法恢复。${sourceNotice}`
+    )) return
+    runAction(
+      `delete-article-${article.id}`,
+      () => api.deleteArticle(article.id),
+      result => result.cleanup_warning
+        ? { message: `稿件已删除；部分本地配图未清理：${result.cleanup_warning}`, kind: 'error' }
+        : `稿件“${article.title}”已删除`
+    ).catch(() => {})
   }
 
   const visibleArticles = articles.filter(
@@ -462,6 +627,12 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
                   <small>
                     {article.author || '未署名'} · 更新于 {formatDate(article.updated_at)}
                   </small>
+                  {article.ai_result?.image_generation &&
+                    article.ai_result.image_generation.status !== 'completed' && (
+                    <small className={`article-image-generation ${article.ai_result.image_generation.status}`}>
+                      {imageGenerationMessage(article)}
+                    </small>
+                  )}
                   {articleFailureReason(article) && (
                     <small
                       className='article-error'
@@ -476,31 +647,80 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
                 <b>{CONTENT_TYPE_LABELS[article.article_type] || article.article_type}</b>
                 <small>{article.publish_mode === 'automatic' ? '自动发布' : '手动发布'}</small>
               </div>
-              <div className='platform-chips'>
-                {article.target_platforms.map(key => (
-                  <span key={key}>
-                    {PLATFORM_LABELS[key] || key}
-                    · {article.platform_actions?.[key] === 'publish' ? '直发' : '草稿'}
-                  </span>
-                ))}
+              <div className='platform-chips platform-state-list'>
+                {(article.publish_mode === 'automatic'
+                  ? Object.entries(automationTargets)
+                    .filter(([key, target]) => (
+                      target.enabled && platformSupports(key, article.article_type)
+                    ))
+                    .map(([key]) => key)
+                  : article.target_platforms.filter(key => (
+                    platformSupports(key, article.article_type)
+                  ))
+                ).map(key => {
+                  const state = article.platform_states?.find(item => item.platform === key)
+                  const action = state?.action ||
+                    (article.publish_mode === 'automatic'
+                      ? automationTargets[key]?.action
+                      : article.platform_actions?.[key])
+                  return (
+                    <div
+                      className={state ? `platform-state ${state.status}` : 'platform-state pending'}
+                      title={state?.last_error || ''}
+                      key={key}
+                    >
+                      <span>
+                        {PLATFORM_LABELS[key] || key}
+                        · {action === 'publish' ? '直发' : '草稿'}
+                      </span>
+                      <small>
+                        {state
+                          ? `${STATUS_LABELS[state.status] || state.status} · ${state.attempts} 次`
+                          : '等待执行'}
+                      </small>
+                      {state?.status === 'failed' && (
+                        <button
+                          type='button'
+                          disabled={publishingBusy}
+                          onClick={() => runAction(
+                            `retry-${article.id}-${key}`,
+                            () => api.retryArticlePlatform(article.id, key),
+                            publishResultNotice
+                          )}
+                        >
+                          重试
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+                {article.publish_mode === 'automatic' &&
+                  !Object.entries(automationTargets).some(([key, target]) => (
+                    target.enabled && platformSupports(key, article.article_type)
+                  )) && (
+                    <div className='platform-state pending'>
+                      <span>当前类型没有可用的自动发布平台</span>
+                      <small>请前往自动化设置</small>
+                    </div>
+                  )}
               </div>
               <StatusPill value={article.status} />
               <div className='row-actions'>
                 <button onClick={() => setEditing(article)}>编辑</button>
                 <button
                   className={article.ai_enriched_at ? 'ai-link done' : 'ai-link'}
-                  disabled={Boolean(busy)}
+                  disabled={isBusy(`ai-${article.id}`)}
                   onClick={() => runAction(
                     `ai-${article.id}`,
                     () => api.enrichArticle(article.id),
-                    () => 'AI 加工完成，已生成标签和平台版本'
+                    () => 'AI 加工完成，已生成标题建议和标签'
                   )}
                 >
                   {article.ai_enriched_at ? 'AI已加工' : 'AI加工'}
                 </button>
                 <button
                   className='publish-link'
-                  disabled={Boolean(busy) || article.status === 'publishing'}
+                  disabled={publishingBusy || article.status === 'publishing'}
                   onClick={() => runAction(
                     `publish-${article.id}`,
                     () => api.publishArticle(article.id),
@@ -508,6 +728,16 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
                   )}
                 >
                   发布 →
+                </button>
+                <button
+                  className='delete-link'
+                  type='button'
+                  title='删除稿件'
+                  aria-label={`删除稿件 ${article.title}`}
+                  disabled={isBusy(`delete-article-${article.id}`) || article.status === 'publishing'}
+                  onClick={() => removeArticle(article)}
+                >
+                  <Trash2 size={14} />
                 </button>
               </div>
             </article>
@@ -518,11 +748,24 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
       {generating && (
         <AIArticleGenerator
           onClose={() => setGenerating(false)}
-          onGenerated={async article => {
-            setGenerating(false)
-            await reload(status, query)
-            setEditing(article)
-            notify('AI 稿件已生成，发布前请核对正文与图片')
+          onGenerate={values => {
+            const started = startBackgroundTask({
+              key: `generate-article-${Date.now()}`,
+              title: values.article_type === 'image'
+                ? `生成图文：${values.topic}`
+                : `生成文章：${values.topic}`,
+              action: async updateProgress => {
+                const article = await api.generateArticle(values)
+                await Promise.all([reload(status, query), reloadOverview()])
+                updateProgress(imageGenerationMessage(article))
+                return waitForArticleImages(article, updateProgress)
+              },
+              destination: 'articles',
+              successMessage: result => imageGenerationMessage(result),
+              onSuccess: () => Promise.all([reload(status, query), reloadOverview()])
+            })
+            if (started) setGenerating(false)
+            return started
           }}
         />
       )}
@@ -530,6 +773,7 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
         <ArticleEditor
           article={editing}
           accounts={accounts}
+          platforms={platforms}
           onClose={() => {
             setEditing(null)
             setCreating(false)
@@ -547,7 +791,7 @@ function Articles ({ articles, accounts, busy, reload, runAction, notify }) {
 }
 
 
-function AIArticleGenerator ({ onClose, onGenerated }) {
+function AIArticleGenerator ({ onClose, onGenerate }) {
   const [form, setForm] = useState({
     topic: '',
     article_type: 'article',
@@ -557,6 +801,7 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
     requirements: '',
     word_count: 1200,
     image_count: 1,
+    image_mode: 'auto',
     material_ids: [],
     news_ids: []
   })
@@ -571,7 +816,8 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
       ...current,
       article_type: articleType,
       word_count: articleType === 'image' ? 700 : 1200,
-      image_count: articleType === 'image' ? 5 : 1
+      image_count: articleType === 'image' ? 5 : 1,
+      image_mode: 'auto'
     }))
   }
 
@@ -585,26 +831,28 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
   const submit = async event => {
     event.preventDefault()
     if (form.topic.trim().length < 2 || submitting) return
-    setSubmitting(true)
     setError('')
-    try {
-      if (form.article_type === 'image' && !storyboard) {
-        const result = await api.generateStoryboard(requestValues())
-        setStoryboard(result)
-        setForm(current => ({
-          ...current,
-          image_count: result.pages.length
-        }))
-        setSubmitting(false)
-        return
-      }
-      const article = await api.generateArticle({
+
+    if (form.article_type !== 'image' || storyboard) {
+      const started = onGenerate({
         ...requestValues(),
         storyboard: form.article_type === 'image' ? storyboard : null
       })
-      await onGenerated(article)
+      if (!started) setError('相同任务正在后台处理中')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      const result = await api.generateStoryboard(requestValues())
+      setStoryboard(result)
+      setForm(current => ({
+        ...current,
+        image_count: result.pages.length
+      }))
     } catch (generationError) {
       setError(generationError.message)
+    } finally {
       setSubmitting(false)
     }
   }
@@ -663,13 +911,13 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
   }
 
   const isStoryboard = form.article_type === 'image' && storyboard
-  const statusTitle = isStoryboard ? '正在生成整套图片' : '正在生成正文与配图'
-  const statusNote = isStoryboard ? '先生成封面，再生成其余页面' : '图片会保存到本地素材目录'
+  const statusTitle = '正在规划图文分镜'
+  const statusNote = '完成后可继续调整每一页的内容与版式'
 
   return (
     <div
       className='modal-backdrop ai-generator-backdrop'
-      onMouseDown={submitting ? undefined : onClose}
+      onMouseDown={onClose}
     >
       <form
         className={isStoryboard ? 'ai-generator storyboard-mode' : 'ai-generator'}
@@ -699,7 +947,6 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
             type='button'
             className='close-button'
             aria-label='关闭'
-            disabled={submitting}
             onClick={onClose}
           >
             ×
@@ -783,16 +1030,38 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
                       onChange={event => set('word_count', event.target.value)}
                     />
                   </label>
-                  <label className='field'>
-                    <span>{form.article_type === 'image' ? '分镜页数' : '配图数量'}</span>
-                    <input
-                      type='number'
-                      min={form.article_type === 'image' ? 1 : 0}
-                      max='9'
-                      value={form.image_count}
-                      onChange={event => set('image_count', event.target.value)}
-                    />
-                  </label>
+
+                </div>
+              </div>
+
+              <div className='ai-image-mode field full'>
+                <span>配图方式</span>
+                <div role='group' aria-label='配图方式'>
+                  <button
+                    type='button'
+                    className={form.image_mode === 'auto' ? 'active' : ''}
+                    onClick={() => set('image_mode', 'auto')}
+                  >
+                    <b>自动配图</b>
+                    <small>按篇幅和章节自动安排</small>
+                  </button>
+                  <button
+                    type='button'
+                    className={form.image_mode === 'cover' ? 'active' : ''}
+                    onClick={() => set('image_mode', 'cover')}
+                  >
+                    <b>仅生成封面</b>
+                    <small>正文不插入额外图片</small>
+                  </button>
+                  <button
+                    type='button'
+                    disabled={form.article_type === 'image'}
+                    className={form.image_mode === 'none' ? 'active' : ''}
+                    onClick={() => set('image_mode', 'none')}
+                  >
+                    <b>不配图</b>
+                    <small>{form.article_type === 'image' ? '图文内容不可用' : '只生成正文'}</small>
+                  </button>
                 </div>
               </div>
 
@@ -979,7 +1248,6 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
           <button
             type='button'
             className='button ghost'
-            disabled={submitting}
             onClick={onClose}
           >
             取消
@@ -1011,7 +1279,7 @@ function AIArticleGenerator ({ onClose, onGenerated }) {
   )
 }
 
-function ArticleEditor ({ article, accounts, onClose, onSaved }) {
+function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const empty = {
     title: '',
     author: '',
@@ -1033,6 +1301,63 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
   const [uploading, setUploading] = useState(false)
   const [regeneratingImage, setRegeneratingImage] = useState(null)
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
+  const selectedWechatAccount = accounts.find(account => (
+    account.platform === 'wechat' &&
+    String(account.id) === String(form.platform_accounts?.wechat || '')
+  ))
+  const wechatApiCannotPublish = selectedWechatAccount?.wechat?.publish_method === 'api' &&
+    selectedWechatAccount.wechat?.api_capabilities?.publish !== true
+  const canDirectPublish = key => (
+    PUBLISH_PLATFORM_KEYS.includes(key) &&
+    (key !== 'wechat' || !wechatApiCannotPublish)
+  )
+  const aiImagePlan = form.ai_result?.image_plan || []
+  const generatedImages = form.ai_result?.generated_images || []
+  const imageGeneration = form.ai_result?.image_generation || {}
+  const imageGenerationActive = ACTIVE_IMAGE_GENERATION.has(
+    imageGeneration.status
+  )
+
+  useEffect(() => {
+    if (!wechatApiCannotPublish || form.platform_actions?.wechat !== 'publish') return
+    setForm(current => ({
+      ...current,
+      platform_actions: {
+        ...(current.platform_actions || {}),
+        wechat: 'draft'
+      }
+    }))
+  }, [wechatApiCannotPublish, form.platform_actions?.wechat])
+
+  const platformSupports = (key, contentType) => {
+    const supportedTypes = platforms.find(item => item.key === key)?.content_types
+    return !Array.isArray(supportedTypes) || supportedTypes.includes(contentType)
+  }
+  const availablePlatforms = Object.entries(PLATFORM_LABELS).filter(([key]) => (
+    platformSupports(key, form.article_type)
+  ))
+  const changeArticleType = articleType => {
+    setForm(current => {
+      const targetPlatforms = current.target_platforms.filter(key => (
+        platformSupports(key, articleType)
+      ))
+      return {
+        ...current,
+        article_type: articleType,
+        target_platforms: targetPlatforms,
+        platform_actions: Object.fromEntries(
+          Object.entries(current.platform_actions || {}).filter(([key]) => (
+            targetPlatforms.includes(key)
+          ))
+        ),
+        platform_accounts: Object.fromEntries(
+          Object.entries(current.platform_accounts || {}).filter(([key]) => (
+            targetPlatforms.includes(key)
+          ))
+        )
+      }
+    })
+  }
 
   const save = async () => {
     setSaving(true)
@@ -1086,22 +1411,6 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
     }
   }
 
-  const updatePlatformVariant = (platform, key, value) => {
-    setForm(current => ({
-      ...current,
-      ai_result: {
-        ...current.ai_result,
-        platforms: {
-          ...(current.ai_result?.platforms || {}),
-          [platform]: {
-            ...(current.ai_result?.platforms?.[platform] || {}),
-            [key]: value
-          }
-        }
-      }
-    }))
-  }
-
   const uploadFiles = async files => {
     const selected = Array.from(files || [])
     if (!selected.length) return []
@@ -1133,26 +1442,82 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
     setRegeneratingImage(imageIndex)
     try {
       const updated = await api.regenerateArticleImage(article.id, imageIndex)
-      setForm(current => {
-        const oldPath = current.media_paths?.[imageIndex] || ''
-        const nextPath = updated.media_paths?.[imageIndex] || ''
-        const oldSource = oldPath.replaceAll('\\', '/')
-        const nextSource = nextPath.replaceAll('\\', '/')
-        return {
-          ...current,
-          content_md: oldSource && nextSource
-            ? current.content_md.replaceAll(oldSource, nextSource)
-            : updated.content_md,
-          cover_url: imageIndex === 0 ? nextPath : current.cover_url,
-          media_paths: updated.media_paths,
-          ai_result: updated.ai_result
-        }
-      })
-    } catch (error) {
+      setForm(current => ({
+        ...current,
+        content_md: updated.content_md,
+        cover_url: updated.cover_url,
+        media_paths: updated.media_paths,
+        ai_result: updated.ai_result
+      }))    } catch (error) {
       window.alert(error.message)
     } finally {
       setRegeneratingImage(null)
     }
+  }
+
+  const moveMedia = (index, offset) => {
+    setForm(current => {
+      const target = index + offset
+      const mediaPaths = [...(current.media_paths || [])]
+      if (target < 0 || target >= mediaPaths.length) return current
+      const first = mediaPaths[index]
+      const second = mediaPaths[target]
+      ;[mediaPaths[index], mediaPaths[target]] = [second, first]
+
+      const firstSource = first.replaceAll('\\', '/')
+      const secondSource = second.replaceAll('\\', '/')
+      const placeholder = `__MOFLOW_MEDIA_${Date.now()}_${index}__`
+      const contentMd = current.content_md
+        .replaceAll(firstSource, placeholder)
+        .replaceAll(secondSource, firstSource)
+        .replaceAll(placeholder, secondSource)
+      const aiResult = { ...(current.ai_result || {}) }
+      for (const key of ['image_plan', 'generated_images']) {
+        if (Array.isArray(aiResult[key]) && aiResult[key].length > target) {
+          aiResult[key] = [...aiResult[key]]
+          ;[aiResult[key][index], aiResult[key][target]] = [
+            aiResult[key][target],
+            aiResult[key][index]
+          ]
+        }
+      }
+      return {
+        ...current,
+        content_md: contentMd,
+        media_paths: mediaPaths,
+        ai_result: aiResult
+      }
+    })
+  }
+
+  const removeMedia = index => {
+    setForm(current => {
+      const path = current.media_paths?.[index] || ''
+      const source = path.replaceAll('\\', '/')
+      const escaped = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const imagePattern = new RegExp(`!?\\[[^\\]]*\\]\\(${escaped}\\)\\s*`, 'g')
+      const mediaPaths = current.media_paths.filter((_, itemIndex) => itemIndex !== index)
+      const aiResult = { ...(current.ai_result || {}) }
+      if (Array.isArray(aiResult.image_plan)) {
+        aiResult.image_plan = aiResult.image_plan.filter((_, itemIndex) => itemIndex !== index)
+      }
+      if (Array.isArray(aiResult.generated_images)) {
+        aiResult.generated_images = aiResult.generated_images.filter((_, itemIndex) => itemIndex !== index)
+      }
+      return {
+        ...current,
+        content_md: source
+          ? current.content_md.replace(imagePattern, '').trim()
+          : current.content_md,
+        cover_url: current.cover_url === path ? (mediaPaths[0] || '') : current.cover_url,
+        media_paths: mediaPaths,
+        ai_result: aiResult
+      }
+    })
+  }
+
+  const setMediaCover = path => {
+    setForm(current => ({ ...current, cover_url: path }))
   }
 
   const updatePlatformAccount = (platform, value) => {
@@ -1160,7 +1525,19 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
       const next = { ...(current.platform_accounts || {}) }
       if (value) next[platform] = Number(value)
       else delete next[platform]
-      return { ...current, platform_accounts: next }
+      const selectedAccount = accounts.find(account => (
+        account.platform === platform && String(account.id) === String(value)
+      ))
+      const apiCannotPublish = platform === 'wechat' &&
+        selectedAccount?.wechat?.publish_method === 'api' &&
+        selectedAccount.wechat?.api_capabilities?.publish !== true
+      return {
+        ...current,
+        platform_accounts: next,
+        platform_actions: apiCannotPublish
+          ? { ...(current.platform_actions || {}), wechat: 'draft' }
+          : current.platform_actions
+      }
     })
   }
 
@@ -1192,14 +1569,16 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
             </label>
             <label className='field'>
               <span>内容类型</span>
-              <select value={form.article_type} onChange={e => set('article_type', e.target.value)}>
+              <select value={form.article_type} onChange={e => changeArticleType(e.target.value)}>
                 <option value='article'>文章</option>
                 <option value='image'>图文（多图）</option>
                 <option value='video'>视频</option>
               </select>
             </label>
           </div>
-          {(form.article_type !== 'article' || form.media_paths?.length > 0) && (
+          {(form.article_type !== 'article' ||
+            form.media_paths?.length > 0 ||
+            aiImagePlan.length > 0) && (
             <div className='field full media-field'>
               <div className='media-field-head'>
                 <div>
@@ -1235,31 +1614,88 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                     <span className='media-order'>{String(index + 1).padStart(2, '0')}</span>
                     <b>{path.split(/[\\/]/).pop()}</b>
                     <div className='media-item-actions'>
-                      {article && form.ai_result?.image_plan?.[index] && (
+                      {form.article_type !== 'video' && form.cover_url !== path && (
                         <button
                           type='button'
-                          className='regenerate'
-                          disabled={regeneratingImage !== null}
-                          onClick={() => regenerateImage(index)}
+                          title='设为封面'
+                          aria-label='设为封面'
+                          onClick={() => setMediaCover(path)}
                         >
-                          <WandSparkles size={13} />
-                          {regeneratingImage === index ? '重绘中…' : '重绘'}
+                          <ImageIcon size={13} />
                         </button>
                       )}
                       <button
                         type='button'
-                        onClick={() => set(
-                          'media_paths',
-                          form.media_paths.filter((_, itemIndex) => itemIndex !== index)
-                        )}
+                        title='向前移动'
+                        aria-label='向前移动'
+                        disabled={index === 0}
+                        onClick={() => moveMedia(index, -1)}
                       >
-                        移除
+                        <ArrowUp size={13} />
+                      </button>
+                      <button
+                        type='button'
+                        title='向后移动'
+                        aria-label='向后移动'
+                        disabled={index === form.media_paths.length - 1}
+                        onClick={() => moveMedia(index, 1)}
+                      >
+                        <ArrowDown size={13} />
+                      </button>
+
+                      <button
+                        type='button'
+                        title='移除图片'
+                        aria-label='移除图片'
+                        onClick={() => removeMedia(index)}
+                      >
+                        <Trash2 size={13} />
                       </button>
                     </div>
                   </div>
                 ))}
-                {!form.media_paths?.length && <p>还没有上传素材。</p>}
+                {!form.media_paths?.length && <p>还没有生成或上传的图片。</p>}
               </div>
+              {article && aiImagePlan.length > 0 && (
+                <div className='ai-image-status-list'>
+                  <header>
+                    <b>AI 图片任务</b>
+                    <span>{imageGenerationMessage({ ai_result: form.ai_result })}</span>
+                  </header>
+                  {aiImagePlan.map((plan, imageIndex) => {
+                    const generated = generatedImages[imageIndex] || {}
+                    const imageStatus = generated.status ||
+                      (generated.path ? 'completed' : 'pending')
+                    return (
+                      <div className={`ai-image-status ${imageStatus}`} key={plan.position || imageIndex}>
+                        <span>{String(imageIndex + 1).padStart(2, '0')}</span>
+                        <div>
+                          <b>{plan.alt || `第 ${imageIndex + 1} 张图片`}</b>
+                          <small>
+                            {imageStatus === 'completed' && '生成成功'}
+                            {imageStatus === 'failed' && (generated.error || '生成失败')}
+                            {imageStatus === 'running' && '正在生成'}
+                            {imageStatus === 'pending' && '等待生成'}
+                          </small>
+                        </div>
+                        {['completed', 'failed'].includes(imageStatus) && (
+                          <button
+                            type='button'
+                            className='regenerate'
+                            disabled={imageGenerationActive || regeneratingImage !== null}
+                            onClick={() => regenerateImage(imageIndex)}
+                          >
+                            <WandSparkles size={13} />
+                            {regeneratingImage === imageIndex
+                              ? '生成中…'
+                              : imageStatus === 'failed' ? '重试' : '重新生成'}
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
           <div className='field full markdown-field'>
@@ -1291,7 +1727,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
             <div className='field platform-target-field'>
               <span>目标平台</span>
               <div className='platform-action-list'>
-                {Object.entries(PLATFORM_LABELS).map(([key, label]) => (
+                {availablePlatforms.map(([key, label]) => (
                   <div className='platform-action-row' key={key}>
                     <label>
                       <input
@@ -1323,7 +1759,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                       })}
                     >
                       {DRAFT_PLATFORM_KEYS.includes(key) && <option value='draft'>保存草稿</option>}
-                      {PUBLISH_PLATFORM_KEYS.includes(key) && <option value='publish'>直接发布</option>}
+                      {canDirectPublish(key) && <option value='publish'>直接发布</option>}
                     </select>
                     {BROWSER_PLATFORM_KEYS.includes(key) && form.target_platforms.includes(key) && (
                       <select
@@ -1338,9 +1774,23 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                             <option
                               key={account.id}
                               value={account.id}
-                              disabled={account.status !== 'valid'}
+                              disabled={key === 'wechat'
+                                ? account.wechat?.publish_method === 'api'
+                                  ? !account.wechat?.app_secret_configured
+                                  : account.status !== 'valid'
+                                : account.status !== 'valid'}
                             >
-                              {account.name} · {account.status === 'valid' ? '可用' : '需登录'}
+                              {account.name} · {key === 'wechat'
+                                ? account.wechat?.publish_method === 'api'
+                                  ? account.wechat?.app_secret_configured ? '官方 API' : 'API 未配置'
+                                  : account.status === 'valid' ? '浏览器' : '需登录'
+                                : account.status === 'valid' ? '可用' : '需登录'}
+                              {key === 'wechat' &&
+                                account.wechat?.publish_method === 'api' &&
+                                account.wechat?.app_secret_configured &&
+                                account.wechat?.api_capabilities?.publish !== true
+                                ? ' · 仅草稿'
+                                : ''}
                             </option>
                           ))}
                       </select>
@@ -1355,7 +1805,7 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
             <header>
               <div>
                 <span className='eyebrow'>AI EDITOR</span>
-                <h3>智能加工与平台版本</h3>
+                <h3>智能加工</h3>
               </div>
               <button
                 className='button paper'
@@ -1365,13 +1815,31 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                 {enriching ? '正在加工…' : form.ai_enriched_at ? '重新加工' : '开始 AI 加工'}
               </button>
             </header>
-            {form.ai_result?.summary
+            {(form.ai_result?.recommended_title ||
+              form.ai_result?.summary ||
+              (form.ai_result?.tags || []).length)
               ? (
                 <>
+                  {form.ai_result?.recommended_title && (
+                    <div className='ai-title-recommendation'>
+                      <div>
+                        <b>推荐标题</b>
+                        <p>{form.ai_result.recommended_title}</p>
+                      </div>
+                      <button
+                        type='button'
+                        className='button ghost'
+                        disabled={form.title === form.ai_result.recommended_title}
+                        onClick={() => set('title', form.ai_result.recommended_title)}
+                      >
+                        {form.title === form.ai_result.recommended_title ? '已采用' : '采用标题'}
+                      </button>
+                    </div>
+                  )}
                   <div className='ai-summary'>
                     <div>
                       <b>内容摘要</b>
-                      <p>{form.ai_result.summary}</p>
+                      <p>{form.ai_result.summary || '暂无摘要'}</p>
                     </div>
                     <div>
                       <b>人工确认</b>
@@ -1379,40 +1847,15 @@ function ArticleEditor ({ article, accounts, onClose, onSaved }) {
                     </div>
                   </div>
                   <div className='ai-tags'>
-                    {(form.ai_result.tags || []).map(tag => <span key={tag}>#{tag}</span>)}
-                  </div>
-                  <div className='ai-variants'>
-                    {Object.entries(form.ai_result.platforms || {}).map(([key, variant]) => (
-                      <article key={key}>
-                        <header>
-                          <b>{PLATFORM_LABELS[key] || key}版本</b>
-                          <button
-                            onClick={() => setForm(current => ({
-                              ...current,
-                              title: variant.title || current.title,
-                              content_md: variant.content_md || current.content_md
-                            }))}
-                          >
-                            应用到主稿
-                          </button>
-                        </header>
-                        <input
-                          value={variant.title || ''}
-                          onChange={e => updatePlatformVariant(key, 'title', e.target.value)}
-                        />
-                        <textarea
-                          value={variant.content_md || ''}
-                          onChange={e => updatePlatformVariant(key, 'content_md', e.target.value)}
-                        />
-                      </article>
+                    {(form.ai_result.tags || []).slice(0, 5).map(tag => (
+                      <span key={tag}>#{tag}</span>
                     ))}
                   </div>
                 </>
                 )
               : (
                 <p className='ai-empty'>
-                  AI 会在不虚构事实的前提下生成标签、摘要和各平台专用版本。
-                  生成结果可以人工修改，发布时优先使用对应平台版本。
+                  AI 加工会保留主稿正文，只生成一个可选标题、摘要和最多 5 个标签。
                 </p>
                 )}
           </section>
@@ -1504,6 +1947,27 @@ function Settings ({ data, platforms, notify, onSaved }) {
     }
   }
 
+  const scanRss = async () => {
+    setTesting('rss')
+    try {
+      await api.saveSettings(form)
+      const result = await api.scanRss()
+      const errorNote = result.errors.length
+        ? '，失败 ' + result.errors.length + ' 个源'
+        : ''
+      notify(
+        'RSS 扫描完成：新增 ' + result.created +
+        '，已存在 ' + result.existing + errorNote,
+        result.errors.length ? 'error' : 'success'
+      )
+      await onSaved()
+    } catch (error) {
+      notify(error.message, 'error')
+    } finally {
+      setTesting('')
+    }
+  }
+
   return (
     <div className='page enter settings-page'>
       <section className='settings-intro'>
@@ -1515,7 +1979,7 @@ function Settings ({ data, platforms, notify, onSaved }) {
       <SettingsSection
         index='01'
         title='Notion 内容源'
-        description='同步状态为“待发布”的页面，并读取官方 Markdown。'
+        description='只同步状态为“待同步”的文章和图文，成功后回写“已同步”。'
         action={
           <div className='settings-actions'>
             <button
@@ -1541,6 +2005,7 @@ function Settings ({ data, platforms, notify, onSaved }) {
           <TextField label='Data Source ID（可选）' value={form.notion_data_source_id} onChange={v => set('notion_data_source_id', v)} />
           <TextField label='代理地址（留空直连）' value={form.notion_proxy_url} onChange={v => set('notion_proxy_url', v)} placeholder='http://127.0.0.1:7890' />
           <TextField label='待同步状态' value={form.notion_pending_status} onChange={v => set('notion_pending_status', v)} />
+          <TextField label='同步完成状态' value={form.notion_synced_status} onChange={v => set('notion_synced_status', v)} />
           <TextField label='发布完成状态' value={form.notion_published_status} onChange={v => set('notion_published_status', v)} />
           <NumberField label='同步间隔（分钟）' value={form.notion_sync_interval_minutes} onChange={v => set('notion_sync_interval_minutes', v)} />
         </div>
@@ -1567,11 +2032,7 @@ function Settings ({ data, platforms, notify, onSaved }) {
               />
             ))}
           </div>
-          <div className='mapping-values'>
-            <TextField label='Notion 图文类型值' value={form.notion_value_article} onChange={v => set('notion_value_article', v)} />
-            <TextField label='Notion 图片类型值' value={form.notion_value_image} onChange={v => set('notion_value_image', v)} />
-          </div>
-        </div>
+</div>
         <Toggle
           label='自动同步 Notion'
           note='开启后，后台按设定间隔拉取新内容。'
@@ -1582,6 +2043,39 @@ function Settings ({ data, platforms, notify, onSaved }) {
 
       <SettingsSection
         index='02'
+        title='RSS 资讯订阅'
+        description='维护资讯订阅源；每次扫描只把原文链接尚未出现的新条目写入资讯库。'
+        action={
+          <button
+            className='button paper'
+            disabled={Boolean(testing) || !(form.rss_feed_urls || []).length}
+            onClick={scanRss}
+          >
+            {testing === 'rss' ? '扫描中…' : '立即扫描'}
+          </button>
+        }
+      >
+        <label className='field full rss-feed-field'>
+          <span>RSS / Atom 地址（每行一个）</span>
+          <textarea
+            value={(form.rss_feed_urls || []).join(String.fromCharCode(10))}
+            onChange={event => set(
+              'rss_feed_urls',
+              event.target.value
+                .split(String.fromCharCode(10))
+                .map(line => line.trim())
+                .filter(Boolean)
+            )}
+            placeholder='https://example.com/rss.xml'
+          />
+        </label>
+        <div className='integration-note'>
+          <b>{(form.rss_feed_urls || []).length} 个订阅源</b>
+          <span>支持 RSS 2.0 和 Atom；启用与扫描频率请在“自动化”中设置。</span>
+        </div>
+      </SettingsSection>
+      <SettingsSection
+        index='03'
         title='浏览器发布通道'
         description='每个账号使用独立的本地 Chrome 会话；公众号保存草稿，CSDN 支持草稿和直发，其余平台按各自能力发布。'
         action={
@@ -1642,9 +2136,9 @@ function Settings ({ data, platforms, notify, onSaved }) {
       <ProxyDirectory notify={notify} />
 
       <SettingsSection
-        index='03'
+        index='04'
         title='AI 内容编辑'
-        description='自动提取标签、生成摘要，并按目标平台生成可人工修改的内容版本。'
+        description='保留主稿正文，生成可选标题、摘要和最多 5 个准确标签。'
         action={
           <button
             className='button paper'
@@ -1688,6 +2182,12 @@ function Settings ({ data, platforms, notify, onSaved }) {
             onChange={v => set('ai_image_size', v)}
             placeholder='1024x1024'
           />
+          <TextField
+            label='图文竖版尺寸'
+            value={form.ai_image_post_size}
+            onChange={v => set('ai_image_post_size', v)}
+            placeholder='1024x1536'
+          />
 
           <label className='field full ai-prompt-field'>
             <span>自定义编辑要求</span>
@@ -1706,7 +2206,7 @@ function Settings ({ data, platforms, notify, onSaved }) {
         />
         <Toggle
           label='同步后自动加工'
-          note='每次从 Notion 同步新内容后，自动生成标签和平台版本。'
+          note='每次从 Notion 同步新内容后，自动生成标题建议、摘要和标签。'
           checked={form.ai_auto_enrich_after_sync}
           onChange={v => set('ai_auto_enrich_after_sync', v)}
         />
