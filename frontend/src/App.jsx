@@ -18,17 +18,19 @@ import News, { NewsPicker } from './News'
 import AIAssistant from './AIAssistant'
 import BackgroundTasks from './BackgroundTasks'
 import PublishProgress from './PublishProgress'
+import Canvas from './Canvas'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: '工作台', mark: '01' },
-  { key: 'articles', label: '内容库', mark: '02' },
-  { key: 'news', label: '资讯', mark: '03' },
-  { key: 'materials', label: '素材库', mark: '04' },
-  { key: 'accounts', label: '账号管理', mark: '05' },
-  { key: 'settings', label: '设置', mark: '06' },
-  { key: 'automation', label: '自动化', mark: '07' }
+  { key: 'canvas', label: '内容画布', mark: '02' },
+  { key: 'articles', label: '内容库', mark: '03' },
+  { key: 'news', label: '资讯', mark: '04' },
+  { key: 'materials', label: '素材库', mark: '05' },
+  { key: 'accounts', label: '账号管理', mark: '06' },
+  { key: 'settings', label: '设置', mark: '07' },
+  { key: 'automation', label: '自动化', mark: '08' }
 ]
 const STATUS_LABELS = {
   ready: '待发布',
@@ -283,7 +285,8 @@ function App () {
             <span className='eyebrow'>PUBLISHING OPERATIONS</span>
             <h1>{NAV_ITEMS.find(item => item.key === view)?.label}</h1>
           </div>
-          <div className='topbar-actions'>
+          {view !== 'canvas' && (
+            <div className='topbar-actions'>
             <button
               className='button ghost'
               disabled={backgroundRunning.current.has('sync-notion')}
@@ -302,7 +305,8 @@ function App () {
             <button className='button ink' onClick={() => setView('articles')}>
               查看内容库 →
             </button>
-          </div>
+            </div>
+          )}
         </header>
 
         {view === 'dashboard' && (
@@ -312,6 +316,12 @@ function App () {
             health={health}
             busyKeys={busyKeys}
             runAction={runAction}
+            onNavigate={setView}
+          />
+        )}
+        {view === 'canvas' && (
+          <Canvas
+            notify={notify}
             onNavigate={setView}
           />
         )}

@@ -23,6 +23,19 @@ function publishingRequest (path, options) {
 export const api = {
   health: () => request('/health'),
   dashboard: () => request('/dashboard'),
+  canvases: () => request('/canvases'),
+  canvas: id => request('/canvases/' + id),
+  createCanvas: values => request('/canvases', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
+  updateCanvas: (id, values) => request('/canvases/' + id, {
+    method: 'PATCH',
+    body: JSON.stringify(values)
+  }),
+  deleteCanvas: id => request('/canvases/' + id, {
+    method: 'DELETE'
+  }),
   articles: (status = 'all', q = '', articleType = 'all') => {
     const params = new URLSearchParams()
     if (status !== 'all') params.set('status', status)
