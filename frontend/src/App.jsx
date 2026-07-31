@@ -292,7 +292,7 @@ function App () {
                 title: '从 Notion 同步',
                 action: api.syncNotion,
                 destination: 'articles',
-                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，Notion 已标记 ${result.marked_synced || 0} 篇`,
+                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，生成封面 ${result.covers_generated || 0} 张，Notion 已标记 ${result.marked_synced || 0} 篇${result.cover_errors?.length ? `，封面生成失败 ${result.cover_errors.length} 张` : ''}`,
                 onSuccess: () => Promise.all([loadOverview(), loadArticles()])
               })}
             >
@@ -2209,6 +2209,12 @@ function Settings ({ data, platforms, notify, onSaved }) {
           note='每次从 Notion 同步新内容后，自动生成标题建议、摘要和标签。'
           checked={form.ai_auto_enrich_after_sync}
           onChange={v => set('ai_auto_enrich_after_sync', v)}
+        />
+        <Toggle
+          label='缺少封面时自动生成'
+          note='同步文章或图文时，根据标题和正文生成封面；需要配置图片模型。'
+          checked={form.ai_auto_generate_cover_after_sync}
+          onChange={v => set('ai_auto_generate_cover_after_sync', v)}
         />
       </SettingsSection>
 

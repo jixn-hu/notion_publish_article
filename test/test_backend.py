@@ -1760,6 +1760,19 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(articles[0]["title"], "覆盖后的标题")
         self.assertEqual(articles[0]["notion_page_id"], "page-b")
 
+    def test_resync_without_cover_keeps_existing_cover(self):
+        first = self._notion_article("unique:cover", "cover-page-a", "第一版")
+        first["cover_url"] = "C:/media/generated-cover.png"
+        _, article_id = _upsert_synced_article(first, "manual")
+
+        second = self._notion_article("unique:cover", "cover-page-b", "第二版")
+        action, updated_id = _upsert_synced_article(second, "manual")
+
+        self.assertEqual(action, "updated")
+        self.assertEqual(updated_id, article_id)
+        article = self.client.get(f"/api/articles/{article_id}").json()
+        self.assertEqual(article["cover_url"], "C:/media/generated-cover.png")
+
     def test_identity_conflict_keeps_existing_articles(self):
         _upsert_synced_article(
             self._notion_article("unique:100", "page-a", "文章 A"),
@@ -1912,6 +1925,97 @@ class BackendApiTests(unittest.TestCase):
         )
         article = self.client.get("/api/articles").json()[0]
         self.assertEqual(article["article_type"], "image")
+
+    def test_notion_sync_generates_missing_image_cover_from_content(self):
+        page = {
+            "id": "cover-page",
+            "url": "https://notion.so/cover-page",
+            "properties": {
+                "标题": {
+                    "type": "title",
+                    "title": [{"plain_text": "春季城市骑行指南"}],
+                },
+                "文章类型": {
+                    "type": "select",
+                    "select": {"name": "图文"},
+                },
+            },
+        }
+        client = Mock()
+        client.query_pages.return_value = [page]
+        client.get_page_markdown.return_value = "# 路线建议\n\n选择河岸绿道，避开晚高峰。"
+        generated_cover = Path(self.temp_dir.name) / "generated-cover.png"
+        generated_cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True, "ai_image_model": "image-model"}},
+        )
+
+        with (
+            patch("backend.services.notion_client", return_value=client),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                return_value=[{"path": str(generated_cover.resolve())}],
+            ) as generate_images,
+        ):
+            response = self.client.post("/api/sync/notion")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["covers_generated"], 1)
+        self.assertEqual(result["cover_errors"], [])
+        plan = generate_images.call_args.args[0][0]
+        self.assertEqual(plan["content_kind"], "image_post")
+        self.assertIn("春季城市骑行指南", plan["prompt"])
+        self.assertIn("选择河岸绿道", plan["prompt"])
+        article = self.client.get("/api/articles").json()[0]
+        self.assertEqual(article["cover_url"], str(generated_cover.resolve()))
+        self.assertEqual(article["media_paths"], [str(generated_cover.resolve())])
+        client.update_status.assert_called_once()
+
+    def test_notion_sync_continues_when_cover_generation_fails(self):
+        page = {
+            "id": "cover-error-page",
+            "url": "https://notion.so/cover-error-page",
+            "properties": {
+                "标题": {
+                    "type": "title",
+                    "title": [{"plain_text": "没有封面的文章"}],
+                },
+                "文章类型": {
+                    "type": "select",
+                    "select": {"name": "文章"},
+                },
+            },
+        }
+        client = Mock()
+        client.query_pages.return_value = [page]
+        client.get_page_markdown.return_value = "正文"
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True, "ai_image_model": "image-model"}},
+        )
+
+        with (
+            patch("backend.services.notion_client", return_value=client),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                side_effect=RuntimeError("图片服务暂不可用"),
+            ),
+        ):
+            response = self.client.post("/api/sync/notion")
+
+        result = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["marked_synced"], 1)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["covers_generated"], 0)
+        self.assertEqual(len(result["cover_errors"]), 1)
+        self.assertIn("图片服务暂不可用", result["cover_errors"][0]["message"])
+        self.assertEqual(self.client.get("/api/articles").json()[0]["cover_url"], "")
+        client.update_status.assert_called_once()
+
     def test_custom_status_field_is_used_for_query_and_writeback(self):
         client = NotionClient("token", "database", data_source_id="source")
         response = Mock()

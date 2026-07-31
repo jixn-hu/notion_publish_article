@@ -143,6 +143,11 @@ SETTING_DEFINITIONS = {
         "secret": False,
         "group": "ai",
     },
+    "ai_auto_generate_cover_after_sync": {
+        "default": True,
+        "secret": False,
+        "group": "ai",
+    },
     "ai_base_url": {
         "default": "https://api.openai.com/v1",
         "secret": False,
