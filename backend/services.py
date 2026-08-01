@@ -10,6 +10,7 @@ from backend.ai_service import AIContentService
 from backend.accounts import list_accounts
 from backend.assets import sync_article_assets
 from backend.db import connection, row_to_article, utc_now
+from backend.image_localizer import localize_remote_images
 from backend.media import MEDIA_DIR
 from backend.materials import (
     format_material_context,
@@ -73,6 +74,18 @@ def _sync_cover_prompt(article):
 """.strip()
 
 
+def _generate_cover_image(article, settings, purpose):
+    plan = {
+        "position": "cover",
+        "alt": article["title"],
+        "purpose": purpose,
+        "prompt": _sync_cover_prompt(article),
+    }
+    if article["article_type"] == "image":
+        plan["content_kind"] = "image_post"
+    return AIImageService(settings).generate_images([plan])[0]
+
+
 def _generate_missing_sync_cover(article_id, settings):
     if not (
         settings["ai_enabled"]
@@ -86,15 +99,7 @@ def _generate_missing_sync_cover(article_id, settings):
     }:
         return False
 
-    plan = {
-        "position": "cover",
-        "alt": article["title"],
-        "purpose": "同步内容自动封面",
-        "prompt": _sync_cover_prompt(article),
-    }
-    if article["article_type"] == "image":
-        plan["content_kind"] = "image_post"
-    generated = AIImageService(settings).generate_images([plan])[0]
+    generated = _generate_cover_image(article, settings, "同步内容自动封面")
     path = generated["path"]
     media_paths = list(dict.fromkeys([path, *(article.get("media_paths") or [])]))
     try:
@@ -140,9 +145,12 @@ def sync_from_notion():
             "marked_synced": 0,
             "ai_enriched": 0,
             "covers_generated": 0,
+            "images_downloaded": 0,
+            "images_reused": 0,
             "errors": [],
             "ai_errors": [],
             "cover_errors": [],
+            "image_errors": [],
         }
         logger.info("Notion 同步筛选完成 matched=%s", len(pages))
         for index, page in enumerate(pages, start=1):
@@ -173,6 +181,21 @@ def sync_from_notion():
                 )
                 metadata["content_md"] = normalize_notion_markdown(
                     client.get_page_markdown(page["id"])
+                )
+                localized = localize_remote_images(
+                    metadata["content_md"],
+                    metadata["cover_url"],
+                    session=client.session,
+                    namespace=page_id or metadata["source_key"],
+                )
+                metadata["content_md"] = localized["markdown"]
+                metadata["cover_url"] = localized["cover_url"]
+                metadata["media_paths"] = localized["paths"]
+                result["images_downloaded"] += localized["downloaded"]
+                result["images_reused"] += localized["reused"]
+                result["image_errors"].extend(
+                    {"page_id": page_id, **error}
+                    for error in localized["errors"]
                 )
                 action, article_id = _upsert_synced_article(
                     metadata, settings["default_publish_mode"]
@@ -242,7 +265,8 @@ def sync_from_notion():
         logger.info(
             "Notion 同步结束 matched=%s created=%s updated=%s marked_synced=%s "
             "errors=%s ai_enriched=%s ai_errors=%s covers_generated=%s "
-            "cover_errors=%s elapsed_ms=%.1f",
+            "cover_errors=%s images_downloaded=%s images_reused=%s "
+            "image_errors=%s elapsed_ms=%.1f",
             result["total"],
             result["created"],
             result["updated"],
@@ -252,6 +276,9 @@ def sync_from_notion():
             len(result["ai_errors"]),
             result["covers_generated"],
             len(result["cover_errors"]),
+            result["images_downloaded"],
+            result["images_reused"],
+            len(result["image_errors"]),
             (time.perf_counter() - started) * 1000,
         )
         return result
@@ -263,11 +290,11 @@ def _upsert_synced_article(article, default_publish_mode):
     now = utc_now()
     with connection() as conn:
         source_match = conn.execute(
-            "SELECT id, cover_url FROM articles WHERE source_key = ?",
+            "SELECT id, cover_url, media_paths_json FROM articles WHERE source_key = ?",
             (article["source_key"],),
         ).fetchone()
         page_match = conn.execute(
-            "SELECT id, cover_url FROM articles WHERE notion_page_id = ?",
+            "SELECT id, cover_url, media_paths_json FROM articles WHERE notion_page_id = ?",
             (article["notion_page_id"],),
         ).fetchone()
         if source_match and page_match and source_match["id"] != page_match["id"]:
@@ -285,13 +312,20 @@ def _upsert_synced_article(article, default_publish_mode):
         existing = source_match or page_match
         if existing:
             match_by = "source_key" if source_match else "notion_page_id"
+            cover_url = article["cover_url"] or existing["cover_url"]
+            media_paths = list(article.get("media_paths") or [])
+            if not article["cover_url"]:
+                existing_paths = json.loads(existing["media_paths_json"] or "[]")
+                if existing["cover_url"] in existing_paths:
+                    media_paths.append(existing["cover_url"])
+            media_paths = list(dict.fromkeys(media_paths))
             conn.execute(
                 """
                 UPDATE articles SET
                     source_key = ?, notion_page_id = ?, notion_url = ?,
                     title = ?, author = ?, article_type = ?,
                     content_md = ?, cover_url = ?, source_url = ?, tags_json = ?,
-                    ai_result_json = '{}', ai_enriched_at = NULL,
+                    media_paths_json = ?, ai_result_json = '{}', ai_enriched_at = NULL,
                     last_synced_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -303,9 +337,10 @@ def _upsert_synced_article(article, default_publish_mode):
                     article["author"],
                     article["article_type"],
                     article["content_md"],
-                    article["cover_url"] or existing["cover_url"],
+                    cover_url,
                     article["source_url"],
                     json.dumps(article["tags"], ensure_ascii=False),
+                    json.dumps(media_paths, ensure_ascii=False),
                     now,
                     now,
                     existing["id"],
@@ -324,10 +359,10 @@ def _upsert_synced_article(article, default_publish_mode):
             """
             INSERT INTO articles (
                 source_key, notion_page_id, notion_url, title, author, article_type,
-                content_md, cover_url, source_url, tags_json, publish_mode,
-                target_platforms_json, platform_actions_json, status,
+                content_md, cover_url, source_url, tags_json, media_paths_json,
+                publish_mode, target_platforms_json, platform_actions_json, status,
                 last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
             """,
             (
                 article["source_key"],
@@ -340,6 +375,7 @@ def _upsert_synced_article(article, default_publish_mode):
                 article["cover_url"],
                 article["source_url"],
                 json.dumps(article["tags"], ensure_ascii=False),
+                json.dumps(article.get("media_paths", []), ensure_ascii=False),
                 default_publish_mode,
                 json.dumps(["wechat"], ensure_ascii=False),
                 json.dumps({"wechat": "draft"}, ensure_ascii=False),
@@ -531,6 +567,41 @@ def _resolved_media_path(value):
     if not path.is_absolute():
         path = MEDIA_DIR / path
     return path.resolve()
+
+
+def localize_article_images(article_id):
+    if not operation_lock.acquire(blocking=False):
+        raise RuntimeError("已有同步或发布任务正在执行，请稍后再本地化图片")
+    try:
+        article = get_article(article_id, include_records=False)
+        client = notion_client()
+        localized = localize_remote_images(
+            article["content_md"],
+            article["cover_url"],
+            media_paths=article.get("media_paths"),
+            session=client.session,
+            namespace=article.get("notion_page_id") or f"article-{article_id}",
+        )
+        media_paths = list(dict.fromkeys([
+            *localized["media_paths"],
+            *localized["paths"],
+        ]))
+        updated = update_article(
+            article_id,
+            {
+                "content_md": localized["markdown"],
+                "cover_url": localized["cover_url"],
+                "media_paths": media_paths,
+            },
+        )
+        return {
+            "article": updated,
+            "downloaded": localized["downloaded"],
+            "reused": localized["reused"],
+            "errors": localized["errors"],
+        }
+    finally:
+        operation_lock.release()
 
 
 def delete_article(article_id):
@@ -1634,29 +1705,78 @@ def enrich_article(article_id, settings=None):
     )[:5]
     if not merged_tags:
         raise RuntimeError("AI 加工必须生成至少一个有效标签")
+
+    generated_path = ""
+    cover_url = article.get("cover_url") or ""
+    media_paths = list(article.get("media_paths") or [])
+    cover_generation = {"status": "skipped", "reason": "已有封面"}
+    if not cover_url and article["article_type"] in {"article", "image"}:
+        if not str(settings.get("ai_image_model") or "").strip():
+            cover_generation = {
+                "status": "skipped",
+                "reason": "未配置图片生成模型",
+            }
+        else:
+            try:
+                generated = _generate_cover_image(
+                    article,
+                    settings,
+                    "AI 加工自动封面",
+                )
+                generated_path = generated["path"]
+                cover_url = generated_path
+                media_paths = list(dict.fromkeys([
+                    generated_path,
+                    *media_paths,
+                ]))
+                cover_generation = {
+                    "status": "completed",
+                    "path": generated_path,
+                }
+            except Exception as exc:
+                logger.exception(
+                    "AI 加工自动封面生成失败 article_id=%s",
+                    article_id,
+                )
+                cover_generation = {
+                    "status": "failed",
+                    "message": redact_text(exc),
+                }
+    result["cover_generation"] = cover_generation
+
     now = utc_now()
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE articles
-            SET tags_json = ?, ai_result_json = ?, ai_enriched_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                json.dumps(merged_tags, ensure_ascii=False),
-                json.dumps(result, ensure_ascii=False),
-                now,
-                now,
-                article_id,
-            ),
-        )
+    try:
+        with connection() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET tags_json = ?, ai_result_json = ?, ai_enriched_at = ?,
+                    cover_url = ?, media_paths_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(merged_tags, ensure_ascii=False),
+                    json.dumps(result, ensure_ascii=False),
+                    now,
+                    cover_url,
+                    json.dumps(media_paths, ensure_ascii=False),
+                    now,
+                    article_id,
+                ),
+            )
+        sync_article_assets(article_id, article["content_md"], cover_url)
+    except Exception:
+        if generated_path:
+            Path(generated_path).unlink(missing_ok=True)
+        raise
+
     logger.info(
         "AI 内容加工完成 article_id=%s tags=%s title_recommended=%s "
-        "elapsed_ms=%.1f",
+        "cover_status=%s elapsed_ms=%.1f",
         article_id,
         len(merged_tags),
         bool(result.get("recommended_title")),
+        cover_generation["status"],
         (time.perf_counter() - started) * 1000,
     )
     return get_article(article_id)

@@ -16,6 +16,7 @@ import backend.browser
 import backend.proxies
 import backend.app as app_module
 from backend.assets import get_platform_asset, save_platform_asset
+from backend.image_localizer import localize_remote_images
 from backend.logging_config import redact_text, redact_url
 from backend.notion_client import NotionClient, page_metadata
 from backend.platforms.bilibili import (
@@ -1724,6 +1725,103 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertNotIn("platforms", enriched["ai_result"])
 
+    def test_ai_enrichment_generates_local_cover_when_missing(self):
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "本地 AI 工作流", "content_md": "正文内容"},
+        ).json()
+        self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "ai_enabled": True,
+                    "ai_image_model": "image-model",
+                }
+            },
+        )
+        generated_cover = Path(self.temp_dir.name) / "enriched-cover.png"
+        generated_cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
+        ai_result = {
+            "recommended_title": "推荐标题",
+            "tags": ["AI", "工作流"],
+            "summary": "摘要",
+            "editor_notes": "",
+        }
+
+        with (
+            patch(
+                "backend.services.AIContentService.enrich",
+                return_value=ai_result,
+            ),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                return_value=[{"path": str(generated_cover.resolve())}],
+            ),
+        ):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/enrich"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        enriched = response.json()
+        self.assertEqual(
+            enriched["cover_url"],
+            str(generated_cover.resolve()),
+        )
+        self.assertIn(str(generated_cover.resolve()), enriched["media_paths"])
+        self.assertEqual(
+            enriched["ai_result"]["cover_generation"]["status"],
+            "completed",
+        )
+
+    def test_ai_enrichment_keeps_text_result_when_cover_generation_fails(self):
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "封面容错", "content_md": "正文内容"},
+        ).json()
+        self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "ai_enabled": True,
+                    "ai_image_model": "image-model",
+                }
+            },
+        )
+        ai_result = {
+            "recommended_title": "推荐标题",
+            "tags": ["容错"],
+            "summary": "摘要",
+            "editor_notes": "",
+        }
+
+        with (
+            patch(
+                "backend.services.AIContentService.enrich",
+                return_value=ai_result,
+            ),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                side_effect=RuntimeError("图片服务暂不可用"),
+            ),
+        ):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/enrich"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        enriched = response.json()
+        self.assertEqual(enriched["tags"], ["容错"])
+        self.assertEqual(enriched["cover_url"], "")
+        self.assertEqual(
+            enriched["ai_result"]["cover_generation"]["status"],
+            "failed",
+        )
+        self.assertIn(
+            "图片服务暂不可用",
+            enriched["ai_result"]["cover_generation"]["message"],
+        )
+
     def test_ai_enrichment_requires_one_to_five_tags(self):
         from backend.ai_service import AIContentService
 
@@ -1925,6 +2023,118 @@ class BackendApiTests(unittest.TestCase):
         )
         article = self.client.get("/api/articles").json()[0]
         self.assertEqual(article["article_type"], "image")
+
+    def test_notion_sync_localizes_cover_and_markdown_images(self):
+        cover_url = "https://files.example.com/cover.png?X-Amz-Signature=old"
+        body_url = "https://files.example.com/body.png?token=old"
+        page = {
+            "id": "local-image-page",
+            "url": "https://notion.so/local-image-page",
+            "properties": {
+                "标题": {
+                    "type": "title",
+                    "title": [{"plain_text": "本地图片稿件"}],
+                },
+                "文章类型": {
+                    "type": "select",
+                    "select": {"name": "文章"},
+                },
+                "封面图片": {"type": "url", "url": cover_url},
+            },
+        }
+        client = Mock()
+        client.query_pages.return_value = [page]
+        client.get_page_markdown.return_value = (
+            f"# 正文\n\n![正文图片]({body_url})"
+        )
+        client.session = Mock()
+        responses = []
+        for marker in (b"cover", b"body"):
+            response = Mock()
+            response.iter_content.return_value = [
+                b"\x89PNG\r\n\x1a\n" + marker
+            ]
+            responses.append(response)
+        client.session.get.side_effect = responses
+
+        with patch("backend.services.notion_client", return_value=client):
+            response = self.client.post("/api/sync/notion")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["images_downloaded"], 2)
+        self.assertEqual(result["image_errors"], [])
+        article = self.client.get("/api/articles").json()[0]
+        self.assertFalse(article["cover_url"].startswith("http"))
+        self.assertTrue(Path(article["cover_url"]).is_file())
+        self.assertNotIn(body_url, article["content_md"])
+        self.assertEqual(len(article["media_paths"]), 2)
+        self.assertTrue(all(Path(path).is_file() for path in article["media_paths"]))
+
+    def test_local_image_cache_reuses_refreshed_signed_url(self):
+        first_url = (
+            "https://files.example.com/image.png?"
+            "x-oss-signature=old&x-oss-expires=100"
+        )
+        refreshed_url = (
+            "https://files.example.com/image.png?"
+            "x-oss-expires=200&x-oss-signature=new"
+        )
+        session = Mock()
+        response = Mock()
+        response.iter_content.return_value = [b"\x89PNG\r\n\x1a\nimage"]
+        session.get.return_value = response
+
+        first = localize_remote_images(
+            f"![图]({first_url})",
+            session=session,
+            namespace="signed-page",
+        )
+        second = localize_remote_images(
+            f"![图]({refreshed_url})",
+            session=session,
+            namespace="signed-page",
+        )
+
+        self.assertEqual(first["downloaded"], 1)
+        self.assertEqual(second["reused"], 1)
+        self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(first["paths"], second["paths"])
+
+    def test_existing_article_image_localization_keeps_failed_url(self):
+        cover_url = "https://files.example.com/cover.png"
+        body_url = "https://files.example.com/body.png?token=secret"
+        article = self.client.post(
+            "/api/articles",
+            json={
+                "title": "旧稿图片迁移",
+                "cover_url": cover_url,
+                "content_md": f"![正文]({body_url})",
+            },
+        ).json()
+        client = Mock()
+        client.session = Mock()
+        cover_response = Mock()
+        cover_response.iter_content.return_value = [
+            b"\x89PNG\r\n\x1a\ncover"
+        ]
+        failed_response = Mock()
+        failed_response.raise_for_status.side_effect = RuntimeError("下载失败")
+        client.session.get.side_effect = [cover_response, failed_response]
+
+        with patch("backend.services.notion_client", return_value=client):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/localize-images"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["downloaded"], 1)
+        self.assertEqual(len(result["errors"]), 1)
+        localized = result["article"]
+        self.assertTrue(Path(localized["cover_url"]).is_file())
+        self.assertIn(body_url, localized["content_md"])
+        self.assertNotIn("secret", result["errors"][0]["url"])
 
     def test_notion_sync_generates_missing_image_cover_from_content(self):
         page = {

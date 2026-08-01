@@ -3,10 +3,12 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  HardDriveDownload,
   Image as ImageIcon,
   Plus,
   Sparkles,
   Trash2,
+  Upload,
   WandSparkles
 } from 'lucide-react'
 import { api, mediaPreviewUrl } from './api'
@@ -292,7 +294,7 @@ function App () {
                 title: '从 Notion 同步',
                 action: api.syncNotion,
                 destination: 'articles',
-                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，生成封面 ${result.covers_generated || 0} 张，Notion 已标记 ${result.marked_synced || 0} 篇${result.cover_errors?.length ? `，封面生成失败 ${result.cover_errors.length} 张` : ''}`,
+                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，本地化图片 ${result.images_downloaded || 0} 张，复用 ${result.images_reused || 0} 张，生成封面 ${result.covers_generated || 0} 张，Notion 已标记 ${result.marked_synced || 0} 篇${result.image_errors?.length ? `，图片下载失败 ${result.image_errors.length} 张` : ''}${result.cover_errors?.length ? `，封面生成失败 ${result.cover_errors.length} 张` : ''}`,
                 onSuccess: () => Promise.all([loadOverview(), loadArticles()])
               })}
             >
@@ -1299,6 +1301,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const [saving, setSaving] = useState(false)
   const [enriching, setEnriching] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [localizingImages, setLocalizingImages] = useState(false)
   const [regeneratingImage, setRegeneratingImage] = useState(null)
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
   const selectedWechatAccount = accounts.find(account => (
@@ -1317,6 +1320,10 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const imageGenerationActive = ACTIVE_IMAGE_GENERATION.has(
     imageGeneration.status
   )
+  const remoteCover = /^https?:\/\//i.test(form.cover_url || '')
+  const hasRemoteImages = remoteCover ||
+    /!\[[^\]]*\]\(\s*<?https?:\/\//i.test(form.content_md || '') ||
+    (form.media_paths || []).some(path => /^https?:\/\//i.test(path))
 
   useEffect(() => {
     if (!wechatApiCannotPublish || form.platform_actions?.wechat !== 'publish') return
@@ -1401,6 +1408,8 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
       setForm(current => ({
         ...current,
         tags: enriched.tags,
+        cover_url: enriched.cover_url,
+        media_paths: enriched.media_paths,
         ai_result: enriched.ai_result,
         ai_enriched_at: enriched.ai_enriched_at
       }))
@@ -1420,7 +1429,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
       const paths = uploaded.map(item => item.path)
       setForm(current => ({
         ...current,
-        media_paths: [...(current.media_paths || []), ...paths]
+        media_paths: [...new Set([...(current.media_paths || []), ...paths])]
       }))
       return paths
     } catch (error) {
@@ -1435,6 +1444,36 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
     await uploadFiles(files)
+  }
+
+  const uploadCover = async event => {
+    const files = Array.from(event.target.files || []).slice(0, 1)
+    event.target.value = ''
+    const paths = await uploadFiles(files)
+    if (paths[0]) set('cover_url', paths[0])
+  }
+
+  const localizeImages = async () => {
+    if (!article || localizingImages) return
+    setLocalizingImages(true)
+    try {
+      const result = await api.localizeArticleImages(article.id)
+      setForm(current => ({
+        ...current,
+        content_md: result.article.content_md,
+        cover_url: result.article.cover_url,
+        media_paths: result.article.media_paths
+      }))
+      window.alert(
+        result.errors.length
+          ? '本地化完成，部分远程图片下载失败，可稍后重试'
+          : '远程图片已保存到本地'
+      )
+    } catch (error) {
+      window.alert(error.message)
+    } finally {
+      setLocalizingImages(false)
+    }
   }
 
   const regenerateImage = async imageIndex => {
@@ -1576,6 +1615,83 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
               </select>
             </label>
           </div>
+          <section className='cover-field'>
+            <div className='cover-field-copy'>
+              <span>稿件封面</span>
+              <small>
+                {form.cover_url
+                  ? remoteCover ? '远程封面，建议保存到本地' : '本地图片'
+                  : '尚未设置封面，智能加工时可根据正文自动生成'}
+              </small>
+            </div>
+            <div className={form.cover_url ? 'cover-control has-cover' : 'cover-control'}>
+              <div className='cover-preview'>
+                {form.cover_url
+                  ? (
+                    <img
+                      src={remoteCover ? form.cover_url : mediaPreviewUrl(form.cover_url)}
+                      alt='稿件封面'
+                    />
+                    )
+                  : <ImageIcon size={28} strokeWidth={1.5} />}
+              </div>
+              <div className='cover-meta'>
+                <b>
+                  {form.cover_url
+                    ? form.cover_url.split(/[\\/]/).pop()
+                    : '等待选择或生成封面'}
+                </b>
+                <span>
+                  {form.cover_url && !remoteCover
+                    ? form.cover_url
+                    : remoteCover
+                      ? '当前仍引用网络图片'
+                      : '支持 JPG、PNG、WebP、GIF'}
+                </span>
+              </div>
+              <div className='cover-actions'>
+                <label className={uploading ? 'button paper disabled' : 'button paper'}>
+                  <Upload size={14} />
+                  {form.cover_url ? '替换' : '上传'}
+                  <input
+                    type='file'
+                    hidden
+                    disabled={uploading}
+                    accept='image/jpeg,image/png,image/webp,image/gif'
+                    onChange={uploadCover}
+                  />
+                </label>
+                {form.cover_url && (
+                  <button
+                    type='button'
+                    className='button ghost'
+                    onClick={() => set('cover_url', '')}
+                  >
+                    <Trash2 size={14} />
+                    移除
+                  </button>
+                )}
+              </div>
+            </div>
+            {hasRemoteImages && (
+              <div className='remote-image-notice'>
+                <div>
+                  <HardDriveDownload size={17} />
+                  <span>稿件中仍有远程图片，发布前建议下载到本地。</span>
+                </div>
+                {article && (
+                  <button
+                    type='button'
+                    className='button ghost'
+                    disabled={localizingImages}
+                    onClick={localizeImages}
+                  >
+                    {localizingImages ? '正在下载…' : '保存到本地'}
+                  </button>
+                )}
+              </div>
+            )}
+          </section>
           {(form.article_type !== 'article' ||
             form.media_paths?.length > 0 ||
             aiImagePlan.length > 0) && (
@@ -1705,13 +1821,10 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                 mediaPaths={form.media_paths}
                 onChange={value => set('content_md', value)}
                 onUploadImages={uploadFiles}
+                initialMode={article ? 'preview' : 'edit'}
               />
             </Suspense>
           </div>
-          <label className='field full'>
-            <span>封面图片 URL</span>
-            <input value={form.cover_url} onChange={e => set('cover_url', e.target.value)} />
-          </label>
           <label className='field full'>
             <span>阅读原文 URL</span>
             <input value={form.source_url} onChange={e => set('source_url', e.target.value)} />
@@ -1855,7 +1968,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                 )
               : (
                 <p className='ai-empty'>
-                  AI 加工会保留主稿正文，只生成一个可选标题、摘要和最多 5 个标签。
+                  AI 加工会保留主稿正文，生成可选标题、摘要和最多 5 个标签；缺少封面时会同时尝试生成本地封面。
                 </p>
                 )}
           </section>

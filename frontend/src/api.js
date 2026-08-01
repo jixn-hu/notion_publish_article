@@ -114,6 +114,8 @@ export const api = {
   retryArticlePlatform: (id, platform) =>
     publishingRequest(`/articles/${id}/platforms/${platform}/retry`, { method: 'POST' }),
   enrichArticle: id => request(`/articles/${id}/enrich`, { method: 'POST' }),
+  localizeArticleImages: id =>
+    request(`/articles/${id}/localize-images`, { method: 'POST' }),
   syncNotion: () => request('/sync/notion', { method: 'POST' }),
   runAutomation: () => publishingRequest('/automation/publish', { method: 'POST' }),
   publishProgress: () => request('/publish-progress'),

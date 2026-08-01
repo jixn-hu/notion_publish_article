@@ -70,6 +70,7 @@ from backend.services import (
     generate_ai_storyboard,
     get_article,
     list_articles,
+    localize_article_images,
     notion_client,
     publish_article,
     regenerate_ai_image,
@@ -625,6 +626,11 @@ def article_platform_retry(article_id: int, platform: str):
 @app.post("/api/articles/{article_id}/enrich")
 def article_enrich(article_id: int):
     return api_call(enrich_article, article_id)
+
+
+@app.post("/api/articles/{article_id}/localize-images")
+def article_images_localize(article_id: int):
+    return api_call(localize_article_images, article_id)
 
 
 @app.post("/api/sync/notion")

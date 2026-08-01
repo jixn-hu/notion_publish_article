@@ -129,15 +129,19 @@ export default function MarkdownComposer ({
   value,
   onChange,
   mediaPaths = [],
-  onUploadImages
+  onUploadImages,
+  initialMode = 'edit'
 }) {
   const hostRef = useRef(null)
   const previewRef = useRef(null)
   const viewRef = useRef(null)
   const onChangeRef = useRef(onChange)
   const uploadRef = useRef(onUploadImages)
-  const modeRef = useRef('edit')
-  const [mode, setMode] = useState('edit')
+  const startingMode = ['edit', 'split', 'preview'].includes(initialMode)
+    ? initialMode
+    : 'edit'
+  const modeRef = useRef(startingMode)
+  const [mode, setMode] = useState(startingMode)
   const [cursor, setCursor] = useState({ line: 1, column: 1 })
 
   onChangeRef.current = onChange
