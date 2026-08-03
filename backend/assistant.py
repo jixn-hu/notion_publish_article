@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from backend.ai_generation import AIImageService
 from backend.ai_service import AIContentService
@@ -23,7 +22,7 @@ from backend.news import (
     link_article_news,
 )
 from backend.services import (
-    _insert_generated_images,
+    _image_generation_summary,
     create_article,
     get_article,
     resolve_ai_image_count,
@@ -276,11 +275,15 @@ def execute_assistant(values, settings=None):
 
     if target == "article":
         item = _save_article(draft, values, settings)
+        generation = item.get("ai_result", {}).get("image_generation") or {}
+        message = "AI 稿件已写入内容库"
+        if generation.get("status") == "queued":
+            message += "，图片正在后台生成"
         return {
             "target": target,
             "destination": "articles",
             "item": item,
-            "message": "AI 稿件已写入内容库",
+            "message": message,
         }
 
     if target == "note":
@@ -366,29 +369,31 @@ def _save_article(draft, values, settings):
     material_ids = [item["id"] for item in materials]
     news_ids = [item["id"] for item in news]
 
-    images = AIImageService(settings).generate_images(generated["image_plan"])
-    content_md = _insert_generated_images(generated["content_md"], images)
-    media_paths = [image["path"] for image in images]
-    try:
-        article = create_article(
-            {
-                "title": generated["title"],
-                "author": str(values.get("author") or "").strip(),
-                "article_type": article_type,
-                "content_md": content_md,
-                "cover_url": media_paths[0] if media_paths else "",
-                "tags": generated["tags"],
-                "media_paths": media_paths,
-                "publish_mode": "manual",
-                "target_platforms": ["wechat"],
-                "platform_actions": {"wechat": "draft"},
-            }
-        )
-    except Exception:
-        for image in images:
-            Path(image["path"]).unlink(missing_ok=True)
-        raise
-
+    image_plan = generated["image_plan"]
+    generated_images = [
+        {
+            **plan,
+            "path": "",
+            "status": "pending",
+            "error": "",
+        }
+        for plan in image_plan
+    ]
+    generation_status = "queued" if image_plan else "completed"
+    article = create_article(
+        {
+            "title": generated["title"],
+            "author": str(values.get("author") or "").strip(),
+            "article_type": article_type,
+            "content_md": generated["content_md"],
+            "cover_url": "",
+            "tags": generated["tags"],
+            "media_paths": [],
+            "publish_mode": "manual",
+            "target_platforms": ["wechat"],
+            "platform_actions": {"wechat": "draft"},
+        }
+    )
 
     link_article_materials(article["id"], material_ids)
     link_article_news(article["id"], news_ids)
@@ -399,8 +404,12 @@ def _save_article(draft, values, settings):
         "tags": generated["tags"],
         "image_mode": values.get("image_mode", "auto"),
         "image_count": image_count,
-        "image_plan": generated["image_plan"],
-        "generated_images": images,
+        "image_plan": image_plan,
+        "generated_images": generated_images,
+        "image_generation": _image_generation_summary(
+            generated_images,
+            status=generation_status,
+        ),
         "material_ids": material_ids,
         "news_ids": news_ids,
         "platforms": {},

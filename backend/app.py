@@ -562,8 +562,20 @@ def assistant_preview(payload: AssistantPreviewPayload):
 
 
 @app.post("/api/assistant/execute", status_code=201)
-def assistant_execute(payload: AssistantExecutePayload):
-    return api_call(execute_assistant, payload.model_dump())
+def assistant_execute(
+    payload: AssistantExecutePayload,
+    background_tasks: BackgroundTasks,
+):
+    result = api_call(execute_assistant, payload.model_dump())
+    generation = result.get("item", {}).get("ai_result", {}).get(
+        "image_generation"
+    ) or {}
+    if generation.get("status") == "queued":
+        background_tasks.add_task(
+            generate_ai_article_images,
+            result["item"]["id"],
+        )
+    return result
 
 
 @app.get("/api/articles")

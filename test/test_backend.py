@@ -2318,6 +2318,56 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(saved.json()["item"]["ai_result"]["source"], "assistant")
         self.assertEqual(len(self.client.get("/api/articles").json()), 1)
 
+    def test_assistant_saves_article_before_generating_images(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        image_plan = {
+            "position": "image:1",
+            "alt": "后台配图",
+            "purpose": "说明后台配图流程",
+            "prompt": "内容工作台中的后台图片生成任务",
+        }
+        draft = {
+            "title": "先保存文章再生成图片",
+            "summary": "文章写入不应等待图片生成",
+            "content_md": "## 正文\n\n文章正文。\n\n<!-- image:1 -->",
+            "tags": ["AI", "配图"],
+            "image_plan": [image_plan],
+        }
+
+        with (
+            patch(
+                "backend.assistant.AIImageService.generate_images",
+                side_effect=AssertionError("文章保存不应同步生成图片"),
+            ) as generate_images,
+            patch("backend.app.generate_ai_article_images") as background_generate,
+        ):
+            response = self.client.post(
+                "/api/assistant/execute",
+                json={
+                    "target": "article",
+                    "draft": draft,
+                    "article_type": "article",
+                    "image_count": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 201)
+        result = response.json()
+        article = result["item"]
+        generation = article["ai_result"]["image_generation"]
+        self.assertEqual(generation["status"], "queued")
+        self.assertEqual(
+            article["ai_result"]["generated_images"][0]["status"],
+            "pending",
+        )
+        self.assertIn("图片正在后台生成", result["message"])
+        self.assertEqual(len(self.client.get("/api/articles").json()), 1)
+        generate_images.assert_not_called()
+        background_generate.assert_called_once_with(article["id"])
+
     def test_assistant_saves_news_note_and_generated_image(self):
         self.client.put(
             "/api/settings",
