@@ -20,6 +20,7 @@ import News, { NewsPicker } from './News'
 import AIAssistant from './AIAssistant'
 import BackgroundTasks from './BackgroundTasks'
 import PublishProgress from './PublishProgress'
+import ImageViewer from './ImageViewer'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
 
@@ -1303,6 +1304,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const [uploading, setUploading] = useState(false)
   const [localizingImages, setLocalizingImages] = useState(false)
   const [regeneratingImage, setRegeneratingImage] = useState(null)
+  const [imageViewer, setImageViewer] = useState(null)
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
   const selectedWechatAccount = accounts.find(account => (
     account.platform === 'wechat' &&
@@ -1625,7 +1627,18 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
               </small>
             </div>
             <div className={form.cover_url ? 'cover-control has-cover' : 'cover-control'}>
-              <div className='cover-preview'>
+              <button
+                type='button'
+                className={form.cover_url ? 'cover-preview is-clickable' : 'cover-preview'}
+                disabled={!form.cover_url}
+                aria-label={form.cover_url ? '打开稿件封面' : '尚未设置封面'}
+                title={form.cover_url ? '点击查看大图' : '尚未设置封面'}
+                onClick={() => form.cover_url && setImageViewer({
+                  src: remoteCover ? form.cover_url : mediaPreviewUrl(form.cover_url),
+                  title: '稿件封面',
+                  alt: form.title || '稿件封面'
+                })}
+              >
                 {form.cover_url
                   ? (
                     <img
@@ -1634,7 +1647,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                     />
                     )
                   : <ImageIcon size={28} strokeWidth={1.5} />}
-              </div>
+              </button>
               <div className='cover-meta'>
                 <b>
                   {form.cover_url
@@ -1725,7 +1738,23 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                 {(form.media_paths || []).map((path, index) => (
                   <div className='media-item' key={`${path}-${index}`}>
                     {form.article_type !== 'video' && (
-                      <img src={mediaPreviewUrl(path)} alt='' loading='lazy' />
+                      <button
+                        type='button'
+                        className='media-item-preview'
+                        title='点击查看大图'
+                        aria-label={`打开第 ${index + 1} 张图片`}
+                        onClick={() => setImageViewer({
+                          src: /^https?:\/\//i.test(path) ? path : mediaPreviewUrl(path),
+                          title: path.split(/[\\/]/).pop() || `图片 ${index + 1}`,
+                          alt: path.split(/[\\/]/).pop() || `图片 ${index + 1}`
+                        })}
+                      >
+                        <img
+                          src={/^https?:\/\//i.test(path) ? path : mediaPreviewUrl(path)}
+                          alt=''
+                          loading='lazy'
+                        />
+                      </button>
                     )}
                     <span className='media-order'>{String(index + 1).padStart(2, '0')}</span>
                     <b>{path.split(/[\\/]/).pop()}</b>
@@ -1821,6 +1850,10 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                 mediaPaths={form.media_paths}
                 onChange={value => set('content_md', value)}
                 onUploadImages={uploadFiles}
+                onImageClick={image => setImageViewer({
+                  ...image,
+                  title: image.alt || form.title || '文章图片'
+                })}
                 initialMode={article ? 'preview' : 'edit'}
               />
             </Suspense>
@@ -1980,6 +2013,10 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
           </button>
         </footer>
       </section>
+      <ImageViewer
+        {...imageViewer}
+        onClose={() => setImageViewer(null)}
+      />
     </div>
   )
 }

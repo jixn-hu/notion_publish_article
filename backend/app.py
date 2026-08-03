@@ -15,7 +15,7 @@ from backend.logging_config import configure_logging
 
 
 from backend.ai_service import AIContentService
-from backend.assistant import execute_assistant, preview_assistant
+from backend.assistant import assistant_chat, execute_assistant, preview_assistant
 from backend.accounts import (
     account_avatar_path,
     check_account,
@@ -206,6 +206,11 @@ class AssistantExecutePayload(BaseModel):
     image_mode: str = "auto"
     source_name: str = Field(default="", max_length=120)
     references: dict[str, list[int]] = Field(default_factory=dict)
+
+
+class AssistantChatPayload(BaseModel):
+    message: str = Field(min_length=2, max_length=4000)
+    history: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
 
 
 class ArticleUpdatePayload(BaseModel):
@@ -544,6 +549,12 @@ def news_patch(news_id: int, payload: NewsUpdatePayload):
 @app.delete("/api/news/{news_id}")
 def news_delete(news_id: int):
     return api_call(delete_news, news_id)
+
+
+@app.post("/api/assistant/chat")
+def assistant_chat_post(payload: AssistantChatPayload):
+    return api_call(assistant_chat, payload.model_dump())
+
 
 @app.post("/api/assistant/preview")
 def assistant_preview(payload: AssistantPreviewPayload):

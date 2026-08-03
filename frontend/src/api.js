@@ -94,6 +94,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(values)
   }),
+  assistantChat: values => request('/assistant/chat', {
+    method: 'POST',
+    body: JSON.stringify(values)
+  }),
   previewAssistant: values => request('/assistant/preview', {
     method: 'POST',
     body: JSON.stringify(values)

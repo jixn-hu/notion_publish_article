@@ -130,6 +130,7 @@ export default function MarkdownComposer ({
   onChange,
   mediaPaths = [],
   onUploadImages,
+  onImageClick,
   initialMode = 'edit'
 }) {
   const hostRef = useRef(null)
@@ -423,7 +424,11 @@ export default function MarkdownComposer ({
           <div ref={hostRef} className='codemirror-host' />
         </div>
         <div ref={previewRef} className='markdown-preview-pane'>
-          <MarkdownPreview markdown={value} mediaPaths={mediaPaths} />
+          <MarkdownPreview
+            markdown={value}
+            mediaPaths={mediaPaths}
+            onImageClick={onImageClick}
+          />
         </div>
       </div>
 

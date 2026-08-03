@@ -2426,6 +2426,216 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(preview_file.content, image_bytes)
 
+    def test_assistant_chat_reads_safe_project_data(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "内容账号"},
+        ).json()
+        with backend.db.connection() as conn:
+            conn.execute(
+                "UPDATE accounts SET profile_json = ? WHERE id = ?",
+                (
+                    '{"followers_count": 1234, "nickname": "墨流", '
+                    '"cookie": "secret-cookie"}',
+                    account["id"],
+                ),
+            )
+        self.client.post(
+            "/api/proxies",
+            json={
+                "name": "本地代理",
+                "proxy_url": "http://127.0.0.1:7890",
+            },
+        )
+        responses = [
+            {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "accounts-call",
+                        "type": "function",
+                        "function": {
+                            "name": "list_accounts",
+                            "arguments": "{}",
+                        },
+                    },
+                    {
+                        "id": "proxies-call",
+                        "type": "function",
+                        "function": {
+                            "name": "list_proxies",
+                            "arguments": "{}",
+                        },
+                    },
+                ],
+            },
+            {
+                "content": "CSDN 账号已记录，当前状态为待检查。",
+            },
+        ]
+        with patch(
+            "backend.assistant.AIContentService.chat_with_tools",
+            side_effect=responses,
+        ) as chat:
+            response = self.client.post(
+                "/api/assistant/chat",
+                json={"message": "看看我的账号和代理状态"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["kind"], "message")
+        self.assertEqual([item["type"] for item in body["results"]], [
+            "accounts",
+            "proxies",
+        ])
+        profile = body["results"][0]["items"][0]["profile"]
+        self.assertEqual(profile["followers_count"], 1234)
+        self.assertNotIn("cookie", profile)
+        self.assertNotIn("secret-cookie", str(body))
+        self.assertEqual(
+            body["results"][1]["items"][0]["proxy_url"],
+            "http://***:7890",
+        )
+        self.assertEqual(chat.call_count, 2)
+        second_messages = chat.call_args_list[1].args[0]
+        self.assertEqual(
+            [item["role"] for item in second_messages[-2:]],
+            ["tool", "tool"],
+        )
+
+    def test_assistant_chat_requires_confirmation_before_creation(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        tool_response = {
+            "content": None,
+            "tool_calls": [{
+                "id": "create-note-call",
+                "type": "function",
+                "function": {
+                    "name": "create_note",
+                    "arguments": '{"instruction": "解释什么是内容原子化"}',
+                },
+            }],
+        }
+        draft = {
+            "title": "内容原子化",
+            "summary": "一张卡片只保留一个可复用知识点",
+            "content_md": "## 核心\n\n一张卡片只解释一个小点。",
+            "tags": ["卡片笔记"],
+            "source_name": "",
+            "image_prompt": "",
+        }
+        with patch(
+            "backend.assistant.AIContentService.chat_with_tools",
+            return_value=tool_response,
+        ), patch(
+            "backend.assistant.AIContentService.generate_assistant_item",
+            return_value=draft,
+        ):
+            response = self.client.post(
+                "/api/assistant/chat",
+                json={"message": "给我新建一张内容原子化卡片"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["kind"], "confirmation")
+        self.assertEqual(body["action"]["target"], "note")
+        self.assertEqual(
+            self.client.get("/api/materials").json()["counts"]["all"],
+            0,
+        )
+
+        saved = self.client.post(
+            "/api/assistant/execute",
+            json={
+                "target": "note",
+                "draft": body["action"]["preview"]["draft"],
+            },
+        )
+        self.assertEqual(saved.status_code, 201)
+        self.assertEqual(saved.json()["item"]["kind"], "note")
+
+    def test_assistant_chat_can_read_news_then_prepare_article(self):
+        self.client.put(
+            "/api/settings",
+            json={"values": {"ai_enabled": True}},
+        )
+        news = self.client.post(
+            "/api/news",
+            json={
+                "title": "AI 内容工具更新",
+                "source_name": "示例来源",
+                "source_url": "https://example.com/ai-update",
+                "summary": "工具新增结构化内容能力",
+                "content_md": "## 更新\n\n新增结构化内容能力。",
+                "tags": ["AI"],
+            },
+        ).json()
+        responses = [
+            {
+                "content": None,
+                "tool_calls": [{
+                    "id": "news-call",
+                    "type": "function",
+                    "function": {
+                        "name": "list_news",
+                        "arguments": '{"limit": 5}',
+                    },
+                }],
+            },
+            {
+                "content": None,
+                "tool_calls": [{
+                    "id": "article-call",
+                    "type": "function",
+                    "function": {
+                        "name": "create_article",
+                        "arguments": (
+                            '{"instruction": "根据最近资讯写一篇分析文章", '
+                            '"article_type": "article", "image_mode": "none", '
+                            f'"news_ids": [{news["id"]}]' + "}"
+                        ),
+                    },
+                }],
+            },
+        ]
+        draft = {
+            "title": "结构化内容能力正在进入工作流",
+            "summary": "基于资讯整理的分析稿",
+            "content_md": "## 变化\n\n结构化能力正在进入内容工作流。",
+            "tags": ["AI", "内容工作流"],
+            "image_plan": [],
+        }
+        with patch(
+            "backend.assistant.AIContentService.chat_with_tools",
+            side_effect=responses,
+        ), patch(
+            "backend.assistant.AIContentService.generate_article",
+            return_value=draft,
+        ):
+            response = self.client.post(
+                "/api/assistant/chat",
+                json={"message": "根据最近 5 条资讯写一篇文章"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["kind"], "confirmation")
+        self.assertEqual(body["results"][0]["type"], "news")
+        self.assertEqual(
+            body["action"]["preview"]["references"]["news_ids"],
+            [news["id"]],
+        )
+        self.assertEqual(len(self.client.get("/api/articles").json()), 0)
+
     def test_generate_article_creates_local_image_draft(self):
         self.client.put(
             "/api/settings",

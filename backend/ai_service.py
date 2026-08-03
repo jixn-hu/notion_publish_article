@@ -34,6 +34,39 @@ class AIContentService:
         self._raise(response)
         return {"message": "AI 接口连接成功"}
 
+    def chat_with_tools(self, messages, tools):
+        self.validate()
+        response = self.session.post(
+            f"{self.base_url}/chat/completions",
+            headers=self._headers(),
+            json={
+                "model": self.model,
+                "temperature": 0.2,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+            },
+            timeout=180,
+        )
+        self._raise(response)
+        payload = response.json()
+        try:
+            message = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("AI 响应缺少 choices[0].message") from exc
+        if not isinstance(message, dict):
+            raise RuntimeError("AI 助手响应格式无效")
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = "\n".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        elif content is not None and not isinstance(content, str):
+            message["content"] = str(content)
+        return message
+
     def enrich(self, article):
         self.validate()
         prompt = f"""
