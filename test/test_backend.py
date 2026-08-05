@@ -207,6 +207,49 @@ class BackendApiTests(unittest.TestCase):
             [call.args[0] for call in page.wait_for_timeout.call_args_list],
             [2500, 2000],
         )
+
+    def test_account_login_reports_browser_closed_during_status_check(self):
+        from contextlib import nullcontext
+
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "关闭登录页账号"},
+        ).json()
+        context = Mock()
+        page = Mock()
+        page.is_closed.side_effect = [False, True]
+        page.wait_for_timeout.side_effect = [
+            None,
+            RuntimeError("target closed"),
+        ]
+        context.pages = [page]
+
+        with (
+            patch(
+                "backend.accounts.open_account_browser",
+                return_value=nullcontext(context),
+            ),
+            patch(
+                "backend.accounts.get_or_create_page",
+                return_value=page,
+            ),
+            patch(
+                "backend.accounts._account_management_runtime",
+                return_value=(
+                    object(),
+                    "https://mp.csdn.net/",
+                    Mock(return_value=False),
+                ),
+            ),
+        ):
+            response = self.client.post(f"/api/accounts/{account['id']}/login")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["detail"],
+            "登录浏览器已关闭，尚未检测到登录成功",
+        )
+
     def test_account_browser_view_uses_account_profile(self):
         account = self.client.post(
             "/api/accounts",
@@ -311,7 +354,7 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertFalse(_is_logged_in(Page()))
 
-    def test_csdn_login_check_accepts_visible_profile_card(self):
+    def test_csdn_login_check_prefers_profile_card_over_toolbar_login(self):
         from backend.platforms.csdn import _is_logged_in
 
         class Locator:
@@ -333,7 +376,7 @@ class BackendApiTests(unittest.TestCase):
             url = "https://mp.csdn.net/"
 
             def get_by_text(self, text, exact=False):
-                return Locator()
+                return Locator(count=1, visible=True)
 
             def locator(self, selector):
                 return Locator(
@@ -343,6 +386,90 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertTrue(_is_logged_in(Page()))
 
+    def test_csdn_profile_extracts_current_home_layout(self):
+        from backend.platforms.csdn import (
+            PROFILE_NAME_SELECTOR,
+            _is_logged_in,
+            extract_csdn_profile,
+        )
+
+        class Locator:
+            def __init__(
+                self,
+                count=0,
+                visible=False,
+                text="",
+                attributes=None,
+                children=None,
+            ):
+                self._count = count
+                self._visible = visible
+                self._text = text
+                self._attributes = attributes or {}
+                self._children = children or {}
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return self._count
+
+            def is_visible(self):
+                return self._visible
+
+            def inner_text(self):
+                return self._text
+
+            def get_attribute(self, name):
+                return self._attributes.get(name)
+
+            def locator(self, selector):
+                return self._children.get(selector, Locator())
+
+        avatar = Locator(
+            count=1,
+            visible=True,
+            attributes={"src": "https://i-avatar.csdnimg.cn/account.jpg"},
+        )
+        name = Locator(count=1, visible=True, text="小胡的第二大脑")
+        main = Locator(
+            count=1,
+            visible=True,
+            text=(
+                "小胡的第二大脑\nLV.6\n304原创\n4517粉丝\n"
+                "7732博客积分\n总阅读量\n7,940,382\n收藏数\n3,746"
+            ),
+            children={
+                PROFILE_NAME_SELECTOR: name,
+                "a.avatar-box img": avatar,
+            },
+        )
+        empty = Locator()
+
+        class Page:
+            url = "https://mp.csdn.net/"
+
+            def get_by_text(self, text, exact=False):
+                return empty
+
+            def locator(self, selector):
+                if selector == "main":
+                    return main
+                return empty
+
+        page = Page()
+        self.assertTrue(_is_logged_in(page))
+        profile = extract_csdn_profile(page)
+        self.assertEqual(profile["display_name"], "小胡的第二大脑")
+        self.assertEqual(profile["works_count"], 304)
+        self.assertEqual(profile["followers_count"], 4517)
+        self.assertEqual(profile["read_count"], 7940382)
+        self.assertEqual(profile["favorites_count"], 3746)
+        self.assertEqual(
+            profile["avatar_url"],
+            "https://i-avatar.csdnimg.cn/account.jpg",
+        )
     def test_wechat_login_check_rejects_root_page_with_qr_frame(self):
         from backend.platforms.wechat_browser import _is_logged_in
 

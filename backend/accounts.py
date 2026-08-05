@@ -584,7 +584,14 @@ def login_account(account_id, timeout_seconds=300):
                     except Exception:
                         pass
                     return {**result, "management_mode": "login"}
-                page.wait_for_timeout(1000)
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception as exc:
+                    page = _current_account_page(context, page)
+                    if page is None:
+                        raise RuntimeError(
+                            "登录浏览器已关闭，尚未检测到登录成功"
+                        ) from exc
             raise RuntimeError("等待账号登录超时，请重新打开账号管理")
     except Exception as exc:
         update_account_status(account_id, "invalid", str(exc))

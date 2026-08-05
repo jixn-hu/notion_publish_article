@@ -24,7 +24,7 @@ LOGIN_SELECTORS = (
 )
 LOGIN_TEXT = "登录"
 PROFILE_CARD_SELECTOR = ".home-exp-user-card"
-PROFILE_NAME_SELECTOR = ".home-exp-user-card__head"
+PROFILE_NAME_SELECTOR = ".home-exp-user-card__head, p.name"
 TITLE_SELECTOR = "textarea#txtTitle"
 EDITOR_FRAME_SELECTOR = "iframe.cke_wysiwyg_frame"
 EDITOR_BODY_SELECTOR = "body.cke_editable[contenteditable='true']"
@@ -49,14 +49,37 @@ CSDN_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 logger = logging.getLogger("mozhou.csdn")
 
 
+def _profile_container(page):
+    for selector in (PROFILE_CARD_SELECTOR, "main"):
+        locator = page.locator(selector).first
+        try:
+            if not locator.count() or not locator.is_visible():
+                continue
+            if selector == PROFILE_CARD_SELECTOR:
+                return locator
+            text = locator.inner_text()
+        except Exception:
+            continue
+        if (
+            re.search(r"[\d.,]+(?:\.\d+)?[\u4e07\u4ebf]?\s*\u539f\u521b", text)
+            and re.search(r"[\d.,]+(?:\.\d+)?[\u4e07\u4ebf]?\s*\u7c89\u4e1d", text)
+        ):
+            return locator
+    return None
+
+
+def _profile_avatar(container):
+    preferred = container.locator("a.avatar-box img").first
+    try:
+        if preferred.count():
+            return preferred
+    except Exception:
+        pass
+    return container.locator("img").first
+
+
 def _is_logged_in(page):
     if "mp.csdn.net" not in page.url or "passport.csdn.net" in page.url:
-        return False
-    login_entry = page.get_by_text(LOGIN_TEXT, exact=True).first
-    try:
-        if login_entry.count() and login_entry.is_visible():
-            return False
-    except Exception:
         return False
     for selector in LOGIN_SELECTORS:
         locator = page.locator(selector).first
@@ -65,11 +88,15 @@ def _is_logged_in(page):
                 return False
         except Exception:
             return False
-    profile_card = page.locator(PROFILE_CARD_SELECTOR).first
+    if _profile_container(page) is not None:
+        return True
+    login_entry = page.get_by_text(LOGIN_TEXT, exact=True).first
     try:
-        return bool(profile_card.count() and profile_card.is_visible())
+        if login_entry.count() and login_entry.is_visible():
+            return False
     except Exception:
         return False
+    return False
 
 
 def login_csdn_account(account, timeout_seconds=300):
@@ -120,9 +147,10 @@ def _csdn_profile_text(text):
 
 
 def extract_csdn_profile(page):
-    card = page.locator(PROFILE_CARD_SELECTOR).first
-    card.wait_for(state="visible", timeout=30_000)
-    name = card.locator(PROFILE_NAME_SELECTOR).first
+    container = _profile_container(page)
+    if container is None:
+        raise RuntimeError("CSDN 账号资料区域未加载")
+    name = container.locator(PROFILE_NAME_SELECTOR).first
     name_lines = [
         line.strip()
         for line in (name.inner_text() if name.count() else "").splitlines()
@@ -133,9 +161,9 @@ def extract_csdn_profile(page):
         "",
     )
     if not display_name:
-        raise RuntimeError("Unable to identify the CSDN account display name")
-    avatar = card.locator("img").first
-    profile = _csdn_profile_text(card.inner_text())
+        raise RuntimeError("无法识别 CSDN 账号昵称")
+    avatar = _profile_avatar(container)
+    profile = _csdn_profile_text(container.inner_text())
     profile.update(
         {
             "display_name": display_name,
@@ -160,9 +188,10 @@ def fetch_csdn_profile(account, page=None):
     if not _is_logged_in(page):
         raise RuntimeError("CSDN login status has expired; please log in again")
     profile = extract_csdn_profile(page)
-    avatar = page.locator(f"{PROFILE_CARD_SELECTOR} img").first
+    container = _profile_container(page)
+    avatar = _profile_avatar(container) if container is not None else None
     try:
-        if not avatar.count() or not avatar.is_visible():
+        if avatar is None or not avatar.count() or not avatar.is_visible():
             raise RuntimeError("CSDN account avatar was not found")
         avatar_path = account_avatar_path(account)
         avatar_path.parent.mkdir(parents=True, exist_ok=True)
