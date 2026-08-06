@@ -11,9 +11,11 @@ import {
   Upload,
   WandSparkles
 } from 'lucide-react'
+import packageMetadata from '../package.json'
 import { api, mediaPreviewUrl } from './api'
 import Accounts from './Accounts'
 import Automation from './Automation'
+import About from './About'
 import ProxyDirectory from './Proxies'
 import Materials, { MaterialPicker } from './Materials'
 import News, { NewsPicker } from './News'
@@ -23,6 +25,7 @@ import PublishProgress from './PublishProgress'
 import ImageViewer from './ImageViewer'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
+const APP_VERSION = packageMetadata.version
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: '工作台', mark: '01' },
@@ -31,7 +34,8 @@ const NAV_ITEMS = [
   { key: 'materials', label: '素材库', mark: '04' },
   { key: 'accounts', label: '账号管理', mark: '05' },
   { key: 'settings', label: '设置', mark: '06' },
-  { key: 'automation', label: '自动化', mark: '07' }
+  { key: 'automation', label: '自动化', mark: '07' },
+  { key: 'about', label: '关于', mark: '08' }
 ]
 const STATUS_LABELS = {
   ready: '待发布',
@@ -275,7 +279,7 @@ function App () {
           <span className={health?.status === 'ok' ? 'live-dot' : 'live-dot off'} />
           <div>
             <b>{health?.status === 'ok' ? '系统在线' : '正在连接'}</b>
-            <small>本地发布服务</small>
+            <small>本地发布服务 · v{APP_VERSION}</small>
           </div>
         </div>
       </aside>
@@ -286,26 +290,28 @@ function App () {
             <span className='eyebrow'>PUBLISHING OPERATIONS</span>
             <h1>{NAV_ITEMS.find(item => item.key === view)?.label}</h1>
           </div>
-          <div className='topbar-actions'>
-            <button
-              className='button ghost'
-              disabled={backgroundRunning.current.has('sync-notion')}
-              onClick={() => startBackgroundTask({
-                key: 'sync-notion',
-                title: '从 Notion 同步',
-                action: api.syncNotion,
-                destination: 'articles',
-                successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，本地化图片 ${result.images_downloaded || 0} 张，复用 ${result.images_reused || 0} 张，生成封面 ${result.covers_generated || 0} 张，Notion 已标记 ${result.marked_synced || 0} 篇${result.image_errors?.length ? `，图片下载失败 ${result.image_errors.length} 张` : ''}${result.cover_errors?.length ? `，封面生成失败 ${result.cover_errors.length} 张` : ''}`,
-                onSuccess: () => Promise.all([loadOverview(), loadArticles()])
-              })}
-            >
-              <span className={backgroundRunning.current.has('sync-notion') ? 'spin' : ''}>↻</span>
-              从 Notion 同步
-            </button>
-            <button className='button ink' onClick={() => setView('articles')}>
-              查看内容库 →
-            </button>
-          </div>
+          {view !== 'about' && (
+            <div className='topbar-actions'>
+              <button
+                className='button ghost'
+                disabled={backgroundRunning.current.has('sync-notion')}
+                onClick={() => startBackgroundTask({
+                  key: 'sync-notion',
+                  title: '从 Notion 同步',
+                  action: api.syncNotion,
+                  destination: 'articles',
+                  successMessage: result => `同步完成：新增 ${result.created}，更新 ${result.updated}，本地化图片 ${result.images_downloaded || 0} 张，复用 ${result.images_reused || 0} 张，生成封面 ${result.covers_generated || 0} 张，Notion 已标记 ${result.marked_synced || 0} 篇${result.image_errors?.length ? `，图片下载失败 ${result.image_errors.length} 张` : ''}${result.cover_errors?.length ? `，封面生成失败 ${result.cover_errors.length} 张` : ''}`,
+                  onSuccess: () => Promise.all([loadOverview(), loadArticles()])
+                })}
+              >
+                <span className={backgroundRunning.current.has('sync-notion') ? 'spin' : ''}>↻</span>
+                从 Notion 同步
+              </button>
+              <button className='button ink' onClick={() => setView('articles')}>
+                查看内容库 →
+              </button>
+            </div>
+          )}
         </header>
 
         {view === 'dashboard' && (
@@ -364,6 +370,7 @@ function App () {
             }}
           />
         )}
+        {view === 'about' && <About version={APP_VERSION} />}
       </main>
 
       <AIAssistant
