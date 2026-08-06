@@ -640,6 +640,90 @@ class BackendApiTests(unittest.TestCase):
             [first.resolve(), second.resolve()],
         )
 
+    def test_wechat_article_keeps_inline_image_position(self):
+        from bs4 import BeautifulSoup
+
+        from backend.platforms.wechat_browser import _wechat_content_html
+
+        cover = Path(self.temp_dir.name) / "cover.png"
+        inline = Path(self.temp_dir.name) / "inline.png"
+        cover.write_bytes(b"cover")
+        inline.write_bytes(b"inline")
+        article = {
+            "article_type": "article",
+            "content_md": (
+                "First paragraph\n\n"
+                f"![body image]({inline.as_posix()})\n\n"
+                "Second paragraph"
+            ),
+        }
+
+        content_html = _wechat_content_html(
+            article,
+            [cover.resolve(), inline.resolve()],
+            [
+                "https://mmbiz.qpic.cn/cover.png",
+                "https://mmbiz.qpic.cn/inline.png",
+            ],
+        )
+        document = BeautifulSoup(content_html, "html.parser")
+        inline_image = document.find("img")
+
+        self.assertEqual(
+            inline_image.get("src"),
+            "https://mmbiz.qpic.cn/inline.png",
+        )
+        self.assertNotIn("cover.png", content_html)
+        self.assertLess(
+            content_html.index("First paragraph"),
+            content_html.index("<img"),
+        )
+        self.assertLess(
+            content_html.index("<img"),
+            content_html.index("Second paragraph"),
+        )
+
+    def test_wechat_image_post_places_all_images_before_text(self):
+        from bs4 import BeautifulSoup
+
+        from backend.platforms.wechat_browser import _wechat_content_html
+
+        cover = Path(self.temp_dir.name) / "cover.png"
+        inline = Path(self.temp_dir.name) / "inline.png"
+        material = Path(self.temp_dir.name) / "material.png"
+        for path in (cover, inline, material):
+            path.write_bytes(b"image")
+        article = {
+            "article_type": "image",
+            "content_md": (
+                "First paragraph\n\n"
+                f"![body image]({inline.as_posix()})\n\n"
+                "Second paragraph"
+            ),
+        }
+        uploaded_sources = [
+            "https://mmbiz.qpic.cn/cover.png",
+            "https://mmbiz.qpic.cn/inline.png",
+            "https://mmbiz.qpic.cn/material.png",
+        ]
+
+        content_html = _wechat_content_html(
+            article,
+            [cover.resolve(), inline.resolve(), material.resolve()],
+            uploaded_sources,
+        )
+        document = BeautifulSoup(content_html, "html.parser")
+        top_level = [item for item in document.contents if item.name]
+
+        self.assertEqual(
+            [item.find("img").get("src") for item in top_level[:3]],
+            uploaded_sources,
+        )
+        self.assertFalse(any(item.find("img") for item in top_level[3:]))
+        self.assertEqual(
+            document.get_text(" ", strip=True),
+            "First paragraph Second paragraph",
+        )
     def test_wechat_saved_draft_requires_appmsg_id(self):
         from backend.platforms.wechat_browser import _saved_draft_id
 
@@ -693,14 +777,22 @@ class BackendApiTests(unittest.TestCase):
         from backend.platforms.wechat_browser import _select_wechat_cover
 
         page = Mock()
+        selected_item = Mock()
+        selected_item.is_visible.side_effect = [False, True]
         selected = Mock()
-        selected.first = selected
-        selected.count.side_effect = [0, 1]
-        selected.is_visible.return_value = True
+        selected.count.return_value = 1
+        selected.nth.return_value = selected_item
         cover = Mock()
-        cover.first = cover
+        hidden_from_content = Mock()
+        hidden_from_content.is_visible.return_value = False
+        visible_from_content = Mock()
+        visible_from_content.is_visible.return_value = True
         from_content = Mock()
-        from_content.first = from_content
+        from_content.count.return_value = 2
+        from_content.nth.side_effect = [
+            hidden_from_content,
+            visible_from_content,
+        ]
         image = Mock()
         next_button = Mock()
         confirm_button = Mock()
@@ -713,15 +805,16 @@ class BackendApiTests(unittest.TestCase):
             return locator
 
         image_locator = visible_locator(image)
+        cover_locator = visible_locator(cover)
         button_locators = {
-            "下一步": visible_locator(next_button),
-            "确认": visible_locator(confirm_button),
+            "\u4e0b\u4e00\u6b65": visible_locator(next_button),
+            "\u786e\u8ba4": visible_locator(confirm_button),
         }
 
         def page_locator(selector):
             return {
                 ".js_share_type_image": selected,
-                ".js_cover_btn_area": cover,
+                ".js_cover_btn_area": cover_locator,
                 "a.js_selectCoverFromContent": from_content,
                 ".card_mask_global.apmsg_content_img_mask": image_locator,
             }[selector]
@@ -733,8 +826,9 @@ class BackendApiTests(unittest.TestCase):
 
         _select_wechat_cover(page)
 
-        cover.click.assert_called_once_with()
-        from_content.click.assert_called_once_with()
+        cover.hover.assert_called_once_with()
+        hidden_from_content.click.assert_not_called()
+        visible_from_content.click.assert_called_once_with()
         image.click.assert_called_once_with()
         next_button.click.assert_called_once_with()
         confirm_button.click.assert_called_once_with()
@@ -745,9 +839,9 @@ class BackendApiTests(unittest.TestCase):
 
         page = Mock()
         article = {
-            "title": "公众号草稿",
-            "author": "作者",
-            "content_md": "正文",
+            "title": "WeChat draft",
+            "author": "Author",
+            "content_md": "Body",
             "platform_accounts": {"wechat": 3},
         }
         editor_url = (
@@ -760,6 +854,8 @@ class BackendApiTests(unittest.TestCase):
             "t=media/appmsg_edit&appmsgid=100000004"
         )
         image = Path(self.temp_dir.name) / "cover.png"
+        uploaded_sources = ["https://mmbiz.qpic.cn/cover.png"]
+        publish_steps = []
         with (
             patch(
                 "backend.platforms.wechat_browser.resolve_publish_account",
@@ -790,14 +886,19 @@ class BackendApiTests(unittest.TestCase):
             ),
             patch(
                 "backend.platforms.wechat_browser._upload_wechat_images",
-                return_value=1,
+                return_value=uploaded_sources,
             ) as upload_images,
             patch(
-                "backend.platforms.wechat_browser._select_wechat_cover"
+                "backend.platforms.wechat_browser._select_wechat_cover",
+                side_effect=lambda page: publish_steps.append("cover"),
             ) as select_cover,
             patch(
+                "backend.platforms.wechat_browser._apply_wechat_content_layout",
+                side_effect=lambda *args: publish_steps.append("layout"),
+            ) as apply_layout,
+            patch(
                 "backend.platforms.wechat_browser._save_wechat_draft",
-                return_value=saved_url,
+                side_effect=lambda page: publish_steps.append("save") or saved_url,
             ) as save_draft,
         ):
             result = WechatPublisher({}).publish(article, action="draft")
@@ -810,7 +911,14 @@ class BackendApiTests(unittest.TestCase):
         fill_editor.assert_called_once_with(page, article)
         upload_images.assert_called_once_with(page, [image])
         select_cover.assert_called_once_with(page)
+        apply_layout.assert_called_once_with(
+            page,
+            article,
+            [image],
+            uploaded_sources,
+        )
         save_draft.assert_called_once_with(page)
+        self.assertEqual(publish_steps, ["cover", "layout", "save"])
         self.assertEqual(
             [call.args[0] for call in page.wait_for_timeout.call_args_list],
             [3000, 3000],

@@ -407,40 +407,41 @@ def _fill_wechat_editor(page, article):
     return editor
 
 
-def _remote_editor_image_count(page):
+def _remote_editor_image_sources(page):
     images = _first_visible(page.locator(EDITOR_SELECTOR), 10).locator("img")
-    count = 0
+    sources = []
     for index in range(images.count()):
         source = str(
-            images.nth(index).get_attribute("src")
-            or images.nth(index).get_attribute("data-src")
+            images.nth(index).get_attribute("data-src")
+            or images.nth(index).get_attribute("src")
             or ""
-        ).lower()
-        if source.startswith(("http://", "https://", "//")):
-            count += 1
-    return count
+        ).strip()
+        if source.lower().startswith(("http://", "https://", "//")):
+            sources.append(source)
+    return sources
 
 
 def _upload_wechat_images(page, paths):
     if not paths:
-        return 0
+        return []
     editor = _first_visible(page.locator(EDITOR_SELECTOR), 10)
     editor.click()
     page.keyboard.press("Control+End")
     interaction_pause(page, 400, 800)
     upload = page.locator(IMAGE_UPLOAD_SELECTOR).first
     upload.wait_for(state="attached", timeout=30_000)
-    before = _remote_editor_image_count(page)
+    before = len(_remote_editor_image_sources(page))
     logger.info("公众号正文图片上传开始 count=%s", len(paths))
     upload.set_input_files([str(path) for path in paths])
 
     deadline = time.monotonic() + IMAGE_UPLOAD_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        uploaded = _remote_editor_image_count(page) - before
-        if uploaded >= len(paths):
+        sources = _remote_editor_image_sources(page)
+        uploaded_sources = sources[before:]
+        if len(uploaded_sources) >= len(paths):
             page.wait_for_timeout(3000)
-            logger.info("公众号正文图片上传完成 count=%s", uploaded)
-            return uploaded
+            logger.info("公众号正文图片上传完成 count=%s", len(uploaded_sources))
+            return uploaded_sources[:len(paths)]
         error = page.get_by_text(
             re.compile(r"上传.*失败|图片.*失败|图片.*过大"),
             exact=False,
@@ -458,6 +459,110 @@ def _upload_wechat_images(page, paths):
     raise RuntimeError("公众号图片上传超时，请检查图片格式、大小和网络")
 
 
+def _wechat_content_html(article, image_paths, uploaded_sources):
+    if len(image_paths) != len(uploaded_sources):
+        raise RuntimeError("公众号正文图片上传结果数量不一致")
+    source_by_path = {
+        str(Path(path).resolve()).lower(): source
+        for path, source in zip(image_paths, uploaded_sources)
+    }
+    document = BeautifulSoup(
+        markdown.markdown(article.get("content_md") or ""),
+        "html.parser",
+    )
+    inline_sources = []
+    for image in document.find_all("img"):
+        source = str(image.get("src") or "").strip()
+        local_path = _local_image_path(source)
+        if local_path is not None:
+            uploaded = source_by_path.get(str(local_path).lower())
+            if not uploaded:
+                raise RuntimeError(
+                    f"公众号正文图片未完成上传：{local_path.name}"
+                )
+            image["src"] = uploaded
+            image["data-src"] = uploaded
+            source = uploaded
+        if source and source not in inline_sources:
+            inline_sources.append(source)
+
+    if article.get("article_type", "article") != "image":
+        return str(document).strip()
+
+    top_sources = list(dict.fromkeys(uploaded_sources + inline_sources))
+    for image in list(document.find_all("img")):
+        parent = image.parent
+        image.decompose()
+        if (
+            parent is not None
+            and parent.name == "p"
+            and not parent.get_text(strip=True)
+            and not parent.find(True)
+        ):
+            parent.decompose()
+
+    layout = BeautifulSoup("", "html.parser")
+    for source in top_sources:
+        paragraph = layout.new_tag("p")
+        image = layout.new_tag("img")
+        image["src"] = source
+        image["data-src"] = source
+        paragraph.append(image)
+        layout.append(paragraph)
+    for child in list(document.contents):
+        layout.append(child.extract())
+    return str(layout).strip()
+
+
+def _apply_wechat_content_layout(page, article, image_paths, uploaded_sources):
+    content_html = _wechat_content_html(article, image_paths, uploaded_sources)
+    if not content_html:
+        raise ValueError("公众号正文不能为空")
+    editor = _first_visible(page.locator(EDITOR_SELECTOR), 10)
+    editor.click()
+    editor.evaluate(
+        """
+        (node, html) => {
+          node.focus();
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          const inserted = document.execCommand("insertHTML", false, html);
+          if (!inserted) node.innerHTML = html;
+          node.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        """,
+        content_html,
+    )
+    page.wait_for_timeout(1000)
+    rendered = str(editor.inner_html() or "").strip()
+    expected_images = len(BeautifulSoup(content_html, "html.parser").find_all("img"))
+    if not rendered or editor.locator("img").count() < expected_images:
+        raise RuntimeError("公众号正文排版写入失败，请稍后重试")
+    logger.info(
+        "公众号正文排版完成 type=%s images=%s",
+        article.get("article_type", "article"),
+        expected_images,
+    )
+    return content_html
+
+
+def _currently_visible(locator):
+    try:
+        count = locator.count()
+    except Exception:
+        return None
+    for index in range(count):
+        item = locator.nth(index)
+        try:
+            if item.is_visible():
+                return item
+        except Exception:
+            continue
+    return None
+
 def _first_visible(locator, timeout_seconds=30):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -473,18 +578,28 @@ def _first_visible(locator, timeout_seconds=30):
 
 
 def _select_wechat_cover(page):
-    selected = page.locator(".js_share_type_image").first
-    try:
-        if selected.count() and selected.is_visible():
-            return
-    except Exception:
-        pass
+    selected = page.locator(".js_share_type_image")
+    if _currently_visible(selected) is not None:
+        return
 
-    cover = page.locator(COVER_AREA_SELECTOR).first
-    cover.wait_for(state="visible", timeout=30_000)
-    cover.click()
-    from_content = page.locator(COVER_FROM_CONTENT_SELECTOR).first
-    from_content.wait_for(state="visible", timeout=10_000)
+    cover = _first_visible(page.locator(COVER_AREA_SELECTOR), 30)
+    cover.scroll_into_view_if_needed()
+    choices = page.locator(COVER_FROM_CONTENT_SELECTOR)
+    from_content = None
+    for _attempt in range(3):
+        cover.hover()
+        page.wait_for_timeout(350)
+        from_content = _currently_visible(choices)
+        if from_content is not None:
+            break
+        cover.click()
+        page.wait_for_timeout(500)
+        from_content = _currently_visible(choices)
+        if from_content is not None:
+            break
+    if from_content is None:
+        raise RuntimeError("公众号封面菜单未展开，请稍后重试")
+
     from_content.click()
     image = _first_visible(page.locator(COVER_IMAGE_SELECTOR), 15)
     image.click()
@@ -501,14 +616,10 @@ def _select_wechat_cover(page):
 
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        try:
-            if selected.count() and selected.is_visible():
-                return
-        except Exception:
-            pass
+        if _currently_visible(selected) is not None:
+            return
         page.wait_for_timeout(250)
     raise RuntimeError("公众号未能从正文选择封面，请检查正文图片")
-
 
 def _saved_draft_id(url):
     parsed = urlparse(str(url or ""))
@@ -636,9 +747,12 @@ class WechatPublisher(PlatformPublisher):
 
             _fill_wechat_editor(page, article)
             image_paths = _article_image_paths(article)
-            uploaded_images = _upload_wechat_images(page, image_paths)
-            if uploaded_images:
+            uploaded_sources = _upload_wechat_images(page, image_paths)
+            if uploaded_sources:
                 _select_wechat_cover(page)
+            _apply_wechat_content_layout(
+                page, article, image_paths, uploaded_sources
+            )
             external_url = _save_wechat_draft(page)
             status = "drafted"
             if action == "publish":
