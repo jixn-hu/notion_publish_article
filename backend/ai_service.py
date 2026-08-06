@@ -78,7 +78,8 @@ class AIContentService:
 2. 推荐一个可选标题，用户会自行决定是否采用；
 3. 写一段不超过 120 字的摘要；
 4. 给编辑留下需要人工确认的事项；
-5. 提炼一个公众号封面视觉方案：只描述一个具体主体、一个场景和一个关键动作，必须直接对应文章核心观点，不使用空泛科技意象。
+5. 提炼一个公众号封面视觉方案：只描述一个具体主体、一个场景和一个关键动作，必须直接对应文章核心观点，不使用空泛科技意象；
+6. 提炼一个 6-14 个汉字的封面短标题，保留文章核心信息，不使用标点、引号或营销套话。
 
 {self.custom_prompt}
 
@@ -88,7 +89,8 @@ class AIContentService:
   "tags": ["标签"],
   "summary": "摘要",
   "editor_notes": "人工确认事项，没有则为空字符串",
-  "cover_brief": "单一、具体、与文章核心观点直接相关的封面主体和场景"
+  "cover_brief": "单一、具体、与文章核心观点直接相关的封面主体和场景",
+  "cover_title": "6-14 个汉字的封面短标题"
 }}
 
 主稿标题：{article["title"]}
@@ -143,7 +145,9 @@ class AIContentService:
 文章封面规则：
 - image_plan 第 1 项必须专门设计为微信公众号文章封面，position 为 cover，purpose 为“公众号文章封面”。
 - 封面 prompt 只选择一个与文章核心论点直接相关的具体主体、场景和关键动作；不要随机组合通用图标、动物、钱币、沙漏或科技光效。
-- 封面按 2.35:1 横向头图思考，主体集中在中央正方形安全区，不生成任何文字。
+- 顶层 cover_title 必须是 6-14 个汉字的封面短标题，准确概括文章核心，不使用标点、引号或营销套话。
+- 封面按 2.35:1 横向头图思考：短标题位于左侧并控制在两行以内，主体位于中间偏右且仍在中央正方形安全区。
+- 图片中只允许准确出现 cover_title，不得增加副标题、英文、数字、Logo 或装饰性文字。
 - 正文中不要为封面放置占位符；其余正文配图从 <!-- image:2 --> 开始对应。
 """.strip()
             if article_type == "article" and image_count
@@ -181,6 +185,7 @@ class AIContentService:
 只返回合法 JSON 对象，不要代码围栏或解释：
 {{
   "title": "标题",
+  "cover_title": "6-14 个汉字的封面短标题",
   "summary": "120 字以内摘要",
   "content_md": "Markdown 正文",
   "tags": ["3-8 个标签"],
@@ -542,6 +547,11 @@ Markdown 正文使用清晰的小标题和列表，不要重复一级标题。
         content_md = str(result.get("content_md") or "").strip()
         if not title or not content_md:
             raise RuntimeError("AI 生成结果缺少标题或正文")
+        cover_title = re.sub(
+            r"[\s“”\"'《》【】\[\]]+",
+            "",
+            str(result.get("cover_title") or ""),
+        ).strip()[:18] or title[:18]
 
         tags = result.get("tags") or []
         if not isinstance(tags, list):
@@ -583,6 +593,7 @@ Markdown 正文使用清晰的小标题和列表，不要重复一级标题。
             summary = re.sub(r"[#*_>\\[\\]()!-]", "", content_md)[:120].strip()
         return {
             "title": title,
+            "cover_title": cover_title,
             "summary": summary,
             "content_md": content_md,
             "tags": [str(tag).strip() for tag in tags if str(tag).strip()][:8],
@@ -639,4 +650,9 @@ Markdown 正文使用清晰的小标题和列表，不要重复一级标题。
             "summary": str(result.get("summary", "")).strip(),
             "editor_notes": str(result.get("editor_notes", "")).strip(),
             "cover_brief": str(result.get("cover_brief", "")).strip()[:800],
+            "cover_title": re.sub(
+                r"[\s“”\"'《》【】\[\]]+",
+                "",
+                str(result.get("cover_title") or ""),
+            ).strip()[:18],
         }

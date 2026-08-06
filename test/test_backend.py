@@ -1870,6 +1870,7 @@ class BackendApiTests(unittest.TestCase):
         generated_cover.write_bytes(b"\x89PNG\r\n\x1a\ncover")
         ai_result = {
             "recommended_title": "推荐标题",
+            "cover_title": "本地AI工作流",
             "tags": ["AI", "工作流"],
             "summary": "摘要",
             "editor_notes": "",
@@ -1883,7 +1884,7 @@ class BackendApiTests(unittest.TestCase):
             patch(
                 "backend.services.AIImageService.generate_images",
                 return_value=[{"path": str(generated_cover.resolve())}],
-            ),
+            ) as generate_images,
         ):
             response = self.client.post(
                 f"/api/articles/{article['id']}/enrich"
@@ -1900,6 +1901,10 @@ class BackendApiTests(unittest.TestCase):
             enriched["ai_result"]["cover_generation"]["status"],
             "completed",
         )
+        cover_plan = generate_images.call_args.args[0][0]
+        self.assertEqual(cover_plan["cover_text"], "本地AI工作流")
+        self.assertIn("必须且只能出现一次", cover_plan["prompt"])
+        self.assertIn("本地AI工作流", cover_plan["prompt"])
 
     def test_ai_enrichment_keeps_text_result_when_cover_generation_fails(self):
         article = self.client.post(
@@ -1958,9 +1963,11 @@ class BackendApiTests(unittest.TestCase):
                 "tags": ["A", "A", "B", "C", "D", "E", "F"],
                 "summary": "",
                 "editor_notes": "",
+                "cover_title": "精准封面标题",
             }
         )
         self.assertEqual(result["tags"], ["A", "B", "C", "D", "E"])
+        self.assertEqual(result["cover_title"], "精准封面标题")
         with self.assertRaisesRegex(RuntimeError, "未生成有效标签"):
             AIContentService._validate_result(
                 {
@@ -3309,6 +3316,7 @@ class BackendApiTests(unittest.TestCase):
 
         generated = {
             "title": "AI 中转站安全选择指南",
+            "cover_title": "安全选择AI渠道",
             "summary": "比较低价渠道背后的账号和数据风险。",
             "content_md": """## 先看风险
 
@@ -3316,7 +3324,8 @@ class BackendApiTests(unittest.TestCase):
 
 ## 再做选择
 
-<!-- image:2 -->""",            "tags": ["AI", "账号安全"],
+<!-- image:2 -->""",
+            "tags": ["AI", "账号安全"],
             "image_plan": [
                 {
                     "position": "image:1",
@@ -3340,6 +3349,8 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(cover["content_kind"], "wechat_cover")
         self.assertIn("900×383", cover["prompt"])
         self.assertIn("低价 AI 渠道", cover["prompt"])
+        self.assertIn("安全选择AI渠道", cover["prompt"])
+        self.assertEqual(cover["cover_text"], "安全选择AI渠道")
         self.assertNotIn("<!-- image:1 -->", prepared["content_md"])
         self.assertIn("<!-- image:2 -->", prepared["content_md"])
         self.assertEqual(prepared["image_plan"][1], generated["image_plan"][1])

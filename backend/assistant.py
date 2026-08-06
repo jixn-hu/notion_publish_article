@@ -403,6 +403,7 @@ def _save_article(draft, values, settings):
         "source": "assistant",
         "summary": generated["summary"],
         "editor_notes": "AI 生成初稿，请在发布前核对事实、图片与平台要求。",
+        "cover_title": generated.get("cover_title") or "",
         "tags": generated["tags"],
         "image_mode": values.get("image_mode", "auto"),
         "image_count": image_count,

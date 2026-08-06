@@ -55,7 +55,17 @@ def notion_field_mapping(settings):
     }
 
 
-def _sync_cover_prompt(article, cover_brief=""):
+def _compact_cover_title(value):
+    title = " ".join(str(value or "").split()).strip("《》“”\"' ")
+    for separator in ("｜", "|", "：", ":", "——", "—"):
+        head = title.split(separator, 1)[0].strip()
+        if 6 <= len(head) <= 16:
+            title = head
+            break
+    return title[:18]
+
+
+def _sync_cover_prompt(article, cover_brief="", cover_title=""):
     content = str(article.get("content_md") or "").strip()[:2600]
     ai_result = article.get("ai_result") or {}
     summary = str(article.get("summary") or ai_result.get("summary") or "").strip()
@@ -65,10 +75,15 @@ def _sync_cover_prompt(article, cover_brief=""):
         if str(tag).strip()
     )
     visual_brief = str(cover_brief or "").strip()
+    display_title = (
+        _compact_cover_title(cover_title)
+        or _compact_cover_title(article["title"])
+    )
     return f"""
 为以下中文文章创作一张微信公众号首条图文封面。
 
 标题：{article['title']}
+封面短标题（必须逐字呈现）：{display_title}
 内容摘要：{summary or '未提供，请以标题与正文核心论点为准。'}
 关键词：{tags or '未提供'}
 封面视觉方案：{visual_brief or '从标题和正文中提炼一个最能代表核心论点的具体主体与场景。'}
@@ -80,21 +95,34 @@ def _sync_cover_prompt(article, cover_brief=""):
 硬性要求：
 - 最终成品用于 900×383 像素、2.35:1 的公众号横向头图；使用宽幅构图，不要按方形海报设计。
 - 只表达文章最核心的一个观点。选择一个具体主体和一个清晰场景，不要把多个弱相关元素随机堆在一起。
-- 主体、人物面部和关键动作必须完整落在画面中央约 40% 的正方形安全区，确保裁成 1:1 小图后仍能一眼识别。
+- 画面中必须且只能出现一次中文标题“{display_title}”，逐字准确，不得增删、改写、错写或替换任何汉字。
+- 标题放在左侧约 40% 的低细节区域，使用清晰醒目的现代中文字体，最多两行；保持足够边距、字号和对比度，手机缩略图中也能读清。
+- 具体主体、人物面部和关键动作放在中间偏右，同时完整落在中央正方形安全区，确保裁成 1:1 小图后仍能一眼识别。
 - 画面在手机列表缩略图中也要有明确焦点、轮廓和明暗对比；背景简洁，边缘区域只放可裁切的环境信息。
 - 优先采用克制的编辑摄影、真实场景或成熟商业插画。除非文章核心确实涉及，否则不要使用鲸鱼、沙漏、硬币、大脑、电路、霓虹数据流等通用隐喻。
 - 严格依据标题、摘要和封面视觉方案，不得增加正文没有支持的产品、人物、事件或结论。
 - 不要生成拼贴画、分屏对比、网页截图或复杂信息图。
-- 画面中不要出现标题、文字、字母、数字、Logo、二维码、签名或水印。
+- 除指定封面短标题外，不要出现副标题、英文、数字、Logo、二维码、签名、水印或其他文字。
 """.strip()
 
 
-def _generate_cover_image(article, settings, purpose, cover_brief=""):
+def _generate_cover_image(
+    article,
+    settings,
+    purpose,
+    cover_brief="",
+    cover_title="",
+):
+    display_title = (
+        _compact_cover_title(cover_title)
+        or _compact_cover_title(article["title"])
+    )
     plan = {
         "position": "cover",
         "alt": article["title"],
         "purpose": purpose,
-        "prompt": _sync_cover_prompt(article, cover_brief),
+        "prompt": _sync_cover_prompt(article, cover_brief, display_title),
+        "cover_text": display_title,
         "content_kind": (
             "image_post"
             if article["article_type"] == "image"
@@ -118,12 +146,21 @@ def _prepare_generated_article_images(generated, article_type):
         "tags": result.get("tags") or [],
     }
     first = plans[0]
+    display_title = (
+        _compact_cover_title(result.get("cover_title"))
+        or _compact_cover_title(result["title"])
+    )
     first.update(
         {
             "position": "cover",
             "alt": result["title"],
             "purpose": "微信公众号文章封面",
-            "prompt": _sync_cover_prompt(article, first.get("prompt") or ""),
+            "prompt": _sync_cover_prompt(
+                article,
+                first.get("prompt") or "",
+                display_title,
+            ),
+            "cover_text": display_title,
             "content_kind": "wechat_cover",
         }
     )
@@ -1405,6 +1442,7 @@ def generate_ai_article(values, settings=None):
         "source": "generated",
         "summary": generated["summary"],
         "editor_notes": "AI 生成初稿，请在发布前核对事实、图片与平台要求。",
+        "cover_title": generated.get("cover_title") or "",
         "tags": generated["tags"],
         "image_mode": values.get("image_mode") or "manual",
         "image_count": image_count,
@@ -1774,6 +1812,7 @@ def enrich_article(article_id, settings=None):
                     settings,
                     "AI 加工自动封面",
                     result.get("cover_brief") or "",
+                    result.get("cover_title") or "",
                 )
                 generated_path = generated["path"]
                 cover_url = generated_path
