@@ -507,6 +507,9 @@ def _wait_for_publish_success(page):
             if error.count() and error.is_visible():
                 message = error.inner_text().strip()
                 if message:
+                    if "文章正在保存" in message or "正在保存" in message:
+                        page.wait_for_timeout(500)
+                        continue
                     raise RuntimeError(f"CSDN 发布失败：{message}")
         except RuntimeError:
             raise
@@ -539,18 +542,9 @@ def _wait_for_editor_ready(page, initial_delay_ms=5_000):
 def _publish_blog(page):
     submit = page.get_by_role("button", name="发布博客", exact=True).first
     submit.wait_for(state="visible", timeout=30_000)
-    for attempt in range(3):
-        _wait_for_editor_ready(
-            page,
-            initial_delay_ms=5_000 if attempt == 0 else 7_000,
-        )
-        submit.click()
-        try:
-            return _wait_for_publish_success(page)
-        except RuntimeError as exc:
-            if "文章正在保存" not in str(exc) or attempt == 2:
-                raise
-            logger.info("CSDN 编辑器仍在保存，等待后重试发布 attempt=%s", attempt + 2)
+    _wait_for_editor_ready(page)
+    submit.click()
+    return _wait_for_publish_success(page)
 
 class CsdnPublisher(PlatformPublisher):
     key = "csdn"

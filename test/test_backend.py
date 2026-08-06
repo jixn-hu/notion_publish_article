@@ -1123,7 +1123,7 @@ class BackendApiTests(unittest.TestCase):
         page.wait_for_timeout.assert_called_once_with(3000)
         self.assertEqual(result["status"], "published")
 
-    def test_csdn_publish_retries_when_editor_is_still_saving(self):
+    def test_csdn_publish_does_not_retry_after_saving_message(self):
         from backend.platforms.csdn import _publish_blog
 
         page = Mock()
@@ -1133,17 +1133,16 @@ class BackendApiTests(unittest.TestCase):
             patch("backend.platforms.csdn._wait_for_editor_ready") as wait_ready,
             patch(
                 "backend.platforms.csdn._wait_for_publish_success",
-                side_effect=[
-                    RuntimeError("CSDN 发布失败：文章正在保存，请耐心等待。"),
-                    None,
-                ],
+                side_effect=RuntimeError("CSDN 发布失败：文章正在保存，请耐心等待。"),
             ) as wait_success,
         ):
-            _publish_blog(page)
+            with self.assertRaisesRegex(RuntimeError, "文章正在保存"):
+                _publish_blog(page)
 
-        self.assertEqual(wait_ready.call_count, 2)
-        self.assertEqual(submit.click.call_count, 2)
-        self.assertEqual(wait_success.call_count, 2)
+        self.assertEqual(wait_ready.call_count, 1)
+        self.assertEqual(submit.click.call_count, 1)
+        self.assertEqual(wait_success.call_count, 1)
+
     def test_csdn_publish_tags_accepts_existing_automatic_tag(self):
         from backend.platforms.csdn import _fill_publish_tags
 
