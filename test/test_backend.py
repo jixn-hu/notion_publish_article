@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import threading
 import tempfile
 import unittest
 import zipfile
@@ -1905,6 +1906,119 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(cover_plan["cover_text"], "本地AI工作流")
         self.assertIn("必须且只能出现一次", cover_plan["prompt"])
         self.assertIn("本地AI工作流", cover_plan["prompt"])
+
+    def test_ai_enrichment_rejects_duplicate_article_task(self):
+        from backend import services
+        from backend.settings import get_settings
+
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "并发加工", "content_md": "正文内容"},
+        ).json()
+        settings = get_settings()
+        settings["ai_enabled"] = True
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def slow_enrich(_article):
+            entered.set()
+            release.wait(2)
+            return {
+                "recommended_title": "",
+                "tags": ["并发测试"],
+                "summary": "",
+                "editor_notes": "",
+                "cover_brief": "",
+                "cover_title": "",
+            }
+
+        def run_first_task():
+            try:
+                services.enrich_article(article["id"], settings=settings)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch(
+            "backend.services.AIContentService.enrich",
+            side_effect=slow_enrich,
+        ):
+            worker = threading.Thread(target=run_first_task)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            with self.assertRaisesRegex(RuntimeError, "正在进行 AI 加工"):
+                services.enrich_article(article["id"], settings=settings)
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_ai_enrichment_discards_stale_cover_result(self):
+        from backend import services
+        from backend.settings import get_settings
+
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "封面竞争", "content_md": "正文内容"},
+        ).json()
+        settings = get_settings()
+        settings.update({"ai_enabled": True, "ai_image_model": "image-model"})
+        generated_cover = Path(self.temp_dir.name) / "stale-cover.png"
+        generated_cover.write_bytes(b"stale")
+        preserved_cover = Path(self.temp_dir.name) / "preserved-cover.png"
+        preserved_cover.write_bytes(b"preserved")
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def delayed_generate(_plans):
+            entered.set()
+            release.wait(2)
+            return [{"path": str(generated_cover.resolve())}]
+
+        def run_stale_task():
+            try:
+                services._enrich_article(article["id"], settings=settings)
+            except Exception as exc:
+                errors.append(exc)
+
+        enrichment = {
+            "recommended_title": "",
+            "tags": ["封面"],
+            "summary": "",
+            "editor_notes": "",
+            "cover_brief": "",
+            "cover_title": "",
+        }
+        with (
+            patch(
+                "backend.services.AIContentService.enrich",
+                return_value=enrichment,
+            ),
+            patch(
+                "backend.services.AIImageService.generate_images",
+                side_effect=delayed_generate,
+            ),
+        ):
+            worker = threading.Thread(target=run_stale_task)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            services.update_article(
+                article["id"],
+                {
+                    "cover_url": str(preserved_cover.resolve()),
+                    "media_paths": [str(preserved_cover.resolve())],
+                },
+            )
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        updated = services.get_article(article["id"])
+        self.assertEqual(updated["cover_url"], str(preserved_cover.resolve()))
+        self.assertFalse(generated_cover.exists())
 
     def test_ai_enrichment_keeps_text_result_when_cover_generation_fails(self):
         article = self.client.post(

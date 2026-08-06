@@ -31,6 +31,8 @@ from backend.settings import get_settings
 
 
 operation_lock = threading.RLock()
+enrichment_lock = threading.Lock()
+enriching_article_ids = set()
 logger = logging.getLogger("mozhou.services")
 
 
@@ -1778,10 +1780,23 @@ def regenerate_ai_image(article_id, image_index, settings=None):
 
 
 def enrich_article(article_id, settings=None):
+    with enrichment_lock:
+        if article_id in enriching_article_ids:
+            raise RuntimeError("该稿件正在进行 AI 加工，请等待当前任务完成")
+        enriching_article_ids.add(article_id)
+    try:
+        return _enrich_article(article_id, settings)
+    finally:
+        with enrichment_lock:
+            enriching_article_ids.discard(article_id)
+
+
+def _enrich_article(article_id, settings=None):
     settings = settings or get_settings()
     if not settings["ai_enabled"]:
         raise RuntimeError("AI 内容加工尚未启用")
     article = get_article(article_id, include_records=False)
+    initial_cover_url = article.get("cover_url") or ""
     started = time.perf_counter()
     logger.info(
         "AI 内容加工开始 article_id=%s title=%r model=%s",
@@ -1797,7 +1812,7 @@ def enrich_article(article_id, settings=None):
         raise RuntimeError("AI 加工必须生成至少一个有效标签")
 
     generated_path = ""
-    cover_url = article.get("cover_url") or ""
+    cover_url = initial_cover_url
     media_paths = list(article.get("media_paths") or [])
     cover_generation = {"status": "skipped", "reason": "已有封面"}
     if not cover_url and article["article_type"] in {"article", "image"}:
@@ -1838,13 +1853,14 @@ def enrich_article(article_id, settings=None):
 
     now = utc_now()
     try:
+        saved = False
         with connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE articles
                 SET tags_json = ?, ai_result_json = ?, ai_enriched_at = ?,
                     cover_url = ?, media_paths_json = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND cover_url = ?
                 """,
                 (
                     json.dumps(merged_tags, ensure_ascii=False),
@@ -1854,8 +1870,19 @@ def enrich_article(article_id, settings=None):
                     json.dumps(media_paths, ensure_ascii=False),
                     now,
                     article_id,
+                    initial_cover_url,
                 ),
             )
+            saved = cursor.rowcount == 1
+        if not saved:
+            logger.warning(
+                "AI 内容加工结果已丢弃，稿件封面在任务执行期间被更新 "
+                "article_id=%s",
+                article_id,
+            )
+            if generated_path:
+                Path(generated_path).unlink(missing_ok=True)
+            return get_article(article_id)
         sync_article_assets(article_id, article["content_md"], cover_url)
     except Exception:
         if generated_path:
