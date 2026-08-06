@@ -19,7 +19,7 @@ python -c "import hashlib,pathlib,sys; req=pathlib.Path('requirements.txt'); sta
 if errorlevel 1 set "INSTALL_PYTHON_DEPS=1"
 
 if not defined INSTALL_PYTHON_DEPS (
-    python -c "import bs4,cryptography,fastapi,markdown,multipart,patchright,pygments,requests,socks,uvicorn"
+    python -c "import bs4,cryptography,fastapi,markdown,multipart,patchright,PIL,pygments,requests,socks,uvicorn"
     if errorlevel 1 set "INSTALL_PYTHON_DEPS=1"
 )
 

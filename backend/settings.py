@@ -162,6 +162,7 @@ SETTING_DEFINITIONS = {
     "ai_image_model": {"default": "", "secret": False, "group": "ai"},
     "ai_image_size": {"default": "1024x1024", "secret": False, "group": "ai"},
     "ai_image_post_size": {"default": "1024x1536", "secret": False, "group": "ai"},
+    "ai_cover_image_size": {"default": "1536x1024", "secret": False, "group": "ai"},
 }
 
 

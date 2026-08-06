@@ -2338,6 +2338,12 @@ function Settings ({ data, platforms, notify, onSaved }) {
             onChange={v => set('ai_image_post_size', v)}
             placeholder='1024x1536'
           />
+          <TextField
+            label='公众号封面生成尺寸'
+            value={form.ai_cover_image_size}
+            onChange={v => set('ai_cover_image_size', v)}
+            placeholder='1536x1024'
+          />
 
           <label className='field full ai-prompt-field'>
             <span>自定义编辑要求</span>

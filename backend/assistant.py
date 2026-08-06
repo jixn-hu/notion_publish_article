@@ -23,6 +23,7 @@ from backend.news import (
 )
 from backend.services import (
     _image_generation_summary,
+    _prepare_generated_article_images,
     create_article,
     get_article,
     resolve_ai_image_count,
@@ -363,6 +364,7 @@ def _save_article(draft, values, settings):
     if article_type == "image" and image_count < 1:
         raise ValueError("图文内容至少需要 1 张图片")
     generated = AIContentService._validate_generated_article(draft, image_count)
+    generated = _prepare_generated_article_images(generated, article_type)
     references = values.get("references") or {}
     materials = get_material_references(references.get("material_ids") or [])
     news = get_news_references(references.get("news_ids") or [])

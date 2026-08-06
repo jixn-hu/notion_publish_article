@@ -3303,6 +3303,96 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(updated["media_paths"], [str(new_image.resolve())])
         self.assertIn(new_image.resolve().as_posix(), updated["content_md"])
         self.assertFalse(old_image.exists())
+
+    def test_article_first_image_is_prepared_as_wechat_cover(self):
+        from backend.services import _prepare_generated_article_images
+
+        generated = {
+            "title": "AI 中转站安全选择指南",
+            "summary": "比较低价渠道背后的账号和数据风险。",
+            "content_md": """## 先看风险
+
+<!-- image:1 -->
+
+## 再做选择
+
+<!-- image:2 -->""",            "tags": ["AI", "账号安全"],
+            "image_plan": [
+                {
+                    "position": "image:1",
+                    "alt": "低价渠道",
+                    "prompt": "一张关于低价 AI 渠道的普通配图",
+                    "purpose": "说明价格差异",
+                },
+                {
+                    "position": "image:2",
+                    "alt": "核对清单",
+                    "prompt": "用户核对服务条款",
+                    "purpose": "正文配图",
+                },
+            ],
+        }
+
+        prepared = _prepare_generated_article_images(generated, "article")
+
+        cover = prepared["image_plan"][0]
+        self.assertEqual(cover["position"], "cover")
+        self.assertEqual(cover["content_kind"], "wechat_cover")
+        self.assertIn("900×383", cover["prompt"])
+        self.assertIn("低价 AI 渠道", cover["prompt"])
+        self.assertNotIn("<!-- image:1 -->", prepared["content_md"])
+        self.assertIn("<!-- image:2 -->", prepared["content_md"])
+        self.assertEqual(prepared["image_plan"][1], generated["image_plan"][1])
+
+    def test_ai_image_service_normalizes_wechat_cover(self):
+        from io import BytesIO
+
+        from PIL import Image
+
+        from backend.ai_generation import AIImageService
+
+        source = BytesIO()
+        Image.new("RGB", (1200, 800), "#2f6f5e").save(source, format="PNG")
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [{
+                "b64_json": base64.b64encode(source.getvalue()).decode("ascii")
+            }],
+        }
+        service = AIImageService(
+            {
+                "ai_image_base_url": "",
+                "ai_base_url": "https://example.test/v1",
+                "ai_image_api_key": "",
+                "ai_api_key": "secret",
+                "ai_image_model": "image-model",
+                "ai_image_size": "1024x1024",
+                "ai_image_post_size": "1024x1536",
+                "ai_cover_image_size": "1536x1024",
+                "ai_proxy_url": "",
+            }
+        )
+
+        with patch.object(
+            service.session,
+            "post",
+            return_value=response,
+        ) as post:
+            generated = service.generate_images(
+                [{
+                    "position": "cover",
+                    "alt": "公众号封面",
+                    "prompt": "中央主体的公众号横向封面",
+                    "content_kind": "wechat_cover",
+                }]
+            )[0]
+
+        self.assertEqual(post.call_args.kwargs["json"]["size"], "1536x1024")
+        self.assertEqual((generated["width"], generated["height"]), (900, 383))
+        path = Path(generated["path"])
+        with Image.open(path) as image:
+            self.assertEqual(image.size, (900, 383))
     def test_ai_image_service_writes_valid_base64_image(self):
         from backend.ai_generation import AIImageService
 

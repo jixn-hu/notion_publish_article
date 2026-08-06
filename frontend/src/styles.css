@@ -3058,7 +3058,8 @@ select:focus-visible {
 .cover-preview {
   display: grid;
   width: 168px;
-  height: 92px;
+  height: auto;
+  aspect-ratio: 900 / 383;
   padding: 0;
   place-items: center;
   overflow: hidden;
@@ -5111,7 +5112,7 @@ select:focus-visible {
   .cover-preview {
     width: 100%;
     height: auto;
-    aspect-ratio: 16 / 7;
+    aspect-ratio: 900 / 383;
   }
 
   .cover-actions {

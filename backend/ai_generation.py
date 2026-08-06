@@ -5,11 +5,13 @@ from urllib.parse import unquote_to_bytes, urlparse
 from uuid import uuid4
 
 import requests
+from PIL import Image, ImageOps
 
 import backend.media as media
 
 
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+WECHAT_COVER_SIZE = (900, 383)
 
 
 class AIImageService:
@@ -24,6 +26,9 @@ class AIImageService:
         self.size = str(settings.get("ai_image_size") or "1024x1024").strip()
         self.image_post_size = str(
             settings.get("ai_image_post_size") or "1024x1536"
+        ).strip()
+        self.cover_size = str(
+            settings.get("ai_cover_image_size") or "1536x1024"
         ).strip()
         self.session = requests.Session()
         self.session.trust_env = False
@@ -55,11 +60,13 @@ class AIImageService:
         return generated
 
     def _generate_one(self, plan):
-        size = (
-            self.image_post_size
-            if plan.get("content_kind") == "image_post"
-            else self.size
-        )
+        content_kind = plan.get("content_kind")
+        if content_kind == "image_post":
+            size = self.image_post_size
+        elif content_kind == "wechat_cover":
+            size = self.cover_size
+        else:
+            size = self.size
         response = self.session.post(
             f"{self.base_url}/images/generations",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -80,13 +87,39 @@ class AIImageService:
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{uuid4().hex}{extension}"
         target.write_bytes(image_bytes)
-        return {
+        try:
+            if content_kind == "wechat_cover":
+                self._normalize_wechat_cover(target)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        result = {
             "position": plan.get("position") or "",
             "alt": plan.get("alt") or "文章配图",
             "purpose": plan.get("purpose") or "",
             "prompt": plan["prompt"],
             "path": str(target.resolve()),
         }
+        if content_kind == "wechat_cover":
+            result.update({"width": 900, "height": 383})
+        return result
+
+    @staticmethod
+    def _normalize_wechat_cover(target):
+        with Image.open(target) as source:
+            image = ImageOps.exif_transpose(source)
+            has_alpha = "A" in image.getbands()
+            mode = "RGBA" if target.suffix.lower() == ".png" and has_alpha else "RGB"
+            normalized = ImageOps.fit(
+                image.convert(mode),
+                WECHAT_COVER_SIZE,
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            save_options = {}
+            if target.suffix.lower() in {".jpg", ".jpeg", ".webp"}:
+                save_options["quality"] = 92
+            normalized.save(target, **save_options)
 
     def _image_bytes(self, payload):
         items = payload.get("data") if isinstance(payload, dict) else None

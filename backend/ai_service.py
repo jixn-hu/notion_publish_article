@@ -77,7 +77,8 @@ class AIContentService:
 1. 提取 1-5 个准确、简洁的标签，标签不能为空；
 2. 推荐一个可选标题，用户会自行决定是否采用；
 3. 写一段不超过 120 字的摘要；
-4. 给编辑留下需要人工确认的事项。
+4. 给编辑留下需要人工确认的事项；
+5. 提炼一个公众号封面视觉方案：只描述一个具体主体、一个场景和一个关键动作，必须直接对应文章核心观点，不使用空泛科技意象。
 
 {self.custom_prompt}
 
@@ -86,7 +87,8 @@ class AIContentService:
   "recommended_title": "推荐标题",
   "tags": ["标签"],
   "summary": "摘要",
-  "editor_notes": "人工确认事项，没有则为空字符串"
+  "editor_notes": "人工确认事项，没有则为空字符串",
+  "cover_brief": "单一、具体、与文章核心观点直接相关的封面主体和场景"
 }}
 
 主稿标题：{article["title"]}
@@ -136,6 +138,17 @@ class AIContentService:
                 "生成结构完整的中文文章：论点清晰，段落连贯，有二级标题，"
                 "适合公众号或知识平台阅读。"
             )
+        cover_guidance = (
+            """
+文章封面规则：
+- image_plan 第 1 项必须专门设计为微信公众号文章封面，position 为 cover，purpose 为“公众号文章封面”。
+- 封面 prompt 只选择一个与文章核心论点直接相关的具体主体、场景和关键动作；不要随机组合通用图标、动物、钱币、沙漏或科技光效。
+- 封面按 2.35:1 横向头图思考，主体集中在中央正方形安全区，不生成任何文字。
+- 正文中不要为封面放置占位符；其余正文配图从 <!-- image:2 --> 开始对应。
+""".strip()
+            if article_type == "article" and image_count
+            else "图文内容的第 1 张图仍是整套竖版卡片的封面页，不套用公众号横向封面规则；每一页都在正文保留对应的 image:n 占位符。"
+        )
         prompt = f"""
 请围绕给定主题创作一篇可直接进入人工编辑流程的中文稿件。
 
@@ -157,10 +170,11 @@ class AIContentService:
 3. 不虚构具体数据、案例、经历或引用；资讯存在冲突或无法确认时，使用审慎表述。
 4. 避免模板化开头、空泛总结和连续堆砌形容词。
 5. Markdown 正文不要重复一级标题。
-6. 需要配图时，在正文合适位置放置 <!-- image:1 --> 形式的占位符，
-   数量与配图数量一致。
+6. 图片占位符必须遵循下方的文章封面规则或图文规则，不得把公众号封面重复插入正文。
 7. image_plan 必须为每张图给出 position、alt、prompt、purpose。
    prompt 应描述主体、场景、构图、光线与视觉风格，避免要求模型生成文字。
+
+{cover_guidance}
 
 {self.custom_prompt}
 
@@ -172,7 +186,7 @@ class AIContentService:
   "tags": ["3-8 个标签"],
   "image_plan": [
     {{
-      "position": "image:1",
+      "position": "cover 或 image:n",
       "alt": "图片说明",
       "prompt": "图片生成提示词",
       "purpose": "图片在文章中的作用"
@@ -624,4 +638,5 @@ Markdown 正文使用清晰的小标题和列表，不要重复一级标题。
             "tags": clean_tags,
             "summary": str(result.get("summary", "")).strip(),
             "editor_notes": str(result.get("editor_notes", "")).strip(),
+            "cover_brief": str(result.get("cover_brief", "")).strip()[:800],
         }
