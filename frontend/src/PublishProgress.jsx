@@ -15,7 +15,8 @@ import './PublishProgress.css'
 const KIND_LABELS = {
   manual: '手动发布',
   automatic: '自动发布',
-  retry: '失败重试'
+  retry: '失败重试',
+  republish: '再次发布'
 }
 
 const STATUS_LABELS = {

@@ -156,7 +156,8 @@ class ArticlePayload(BaseModel):
     source_url: str = ""
     tags: list[str] = Field(default_factory=list)
     media_paths: list[str] = Field(default_factory=list)
-    publish_mode: str = "manual"
+    content_status: str | None = None
+    publish_mode: str | None = None
     target_platforms: list[str] = Field(default_factory=lambda: ["wechat"])
     platform_actions: dict[str, str] = Field(
         default_factory=lambda: {"wechat": "draft"}
@@ -222,6 +223,7 @@ class ArticleUpdatePayload(BaseModel):
     source_url: str | None = None
     tags: list[str] | None = None
     media_paths: list[str] | None = None
+    content_status: str | None = None
     publish_mode: str | None = None
     target_platforms: list[str] | None = None
     platform_actions: dict[str, str] | None = None
@@ -275,6 +277,8 @@ class NewsCollectPayload(BaseModel):
 
 class PublishPayload(BaseModel):
     platform_actions: dict[str, str] | None = None
+    platform_accounts: dict[str, int | None] | None = None
+    force: bool = False
 
 
 class AccountPayload(BaseModel):
@@ -643,12 +647,27 @@ def article_image_regenerate(article_id: int, image_index: int):
 
 @app.post("/api/articles/{article_id}/publish")
 def article_publish(article_id: int, payload: PublishPayload):
-    return api_call(publish_article, article_id, payload.platform_actions)
+    return api_call(
+        publish_article,
+        article_id,
+        requested_actions=payload.platform_actions,
+        requested_accounts=payload.platform_accounts,
+        force=payload.force,
+    )
 
 
 @app.post("/api/articles/{article_id}/platforms/{platform}/retry")
-def article_platform_retry(article_id: int, platform: str):
-    return api_call(retry_article_platform, article_id, platform)
+def article_platform_retry(
+    article_id: int,
+    platform: str,
+    account_id: int | None = Query(default=None, ge=1),
+):
+    return api_call(
+        retry_article_platform,
+        article_id,
+        platform,
+        account_id,
+    )
 
 @app.post("/api/articles/{article_id}/enrich")
 def article_enrich(article_id: int):

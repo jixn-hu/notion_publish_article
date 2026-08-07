@@ -111,12 +111,22 @@ export const api = {
     method: 'PATCH',
     body: JSON.stringify(values)
   }),
-  publishArticle: (id, platformActions = null) => publishingRequest(`/articles/${id}/publish`, {
+  publishArticle: (
+    id,
+    { platformActions = null, platformAccounts = null, force = false } = {}
+  ) => publishingRequest(`/articles/${id}/publish`, {
     method: 'POST',
-    body: JSON.stringify({ platform_actions: platformActions })
+    body: JSON.stringify({
+      platform_actions: platformActions,
+      platform_accounts: platformAccounts,
+      force
+    })
   }),
-  retryArticlePlatform: (id, platform) =>
-    publishingRequest(`/articles/${id}/platforms/${platform}/retry`, { method: 'POST' }),
+  retryArticlePlatform: (id, platform, accountId = null) =>
+    publishingRequest(
+      `/articles/${id}/platforms/${platform}/retry${accountId ? `?account_id=${accountId}` : ''}`,
+      { method: 'POST' }
+    ),
   enrichArticle: id => request(`/articles/${id}/enrich`, { method: 'POST' }),
   localizeArticleImages: id =>
     request(`/articles/${id}/localize-images`, { method: 'POST' }),

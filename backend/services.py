@@ -448,9 +448,11 @@ def _upsert_synced_article(article, default_publish_mode):
             INSERT INTO articles (
                 source_key, notion_page_id, notion_url, title, author, article_type,
                 content_md, cover_url, source_url, tags_json, media_paths_json,
-                publish_mode, target_platforms_json, platform_actions_json, status,
-                last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+                publish_mode, target_platforms_json, platform_actions_json,
+                content_status, status, last_synced_at, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', 'ready', ?, ?, ?
+            )
             """,
             (
                 article["source_key"],
@@ -464,7 +466,7 @@ def _upsert_synced_article(article, default_publish_mode):
                 article["source_url"],
                 json.dumps(article["tags"], ensure_ascii=False),
                 json.dumps(article.get("media_paths", []), ensure_ascii=False),
-                default_publish_mode,
+                "manual",
                 json.dumps(["wechat"], ensure_ascii=False),
                 json.dumps({"wechat": "draft"}, ensure_ascii=False),
                 now,
@@ -473,11 +475,10 @@ def _upsert_synced_article(article, default_publish_mode):
             ),
         )
         logger.debug(
-            "创建同步文章 article_id=%s source_key=%s page_id=%s publish_mode=%s",
+            "创建同步文章 article_id=%s source_key=%s page_id=%s content_status=ready",
             cursor.lastrowid,
             article["source_key"],
             article["notion_page_id"],
-            default_publish_mode,
         )
         return "created", cursor.lastrowid
 
@@ -544,9 +545,15 @@ def create_article(values):
     article_type = values.get("article_type", "article")
     if article_type not in {"article", "image", "video"}:
         raise ValueError("article_type 必须是 article、image 或 video")
-    publish_mode = values.get("publish_mode", "manual")
+    publish_mode = values.get("publish_mode") or "manual"
     if publish_mode not in {"manual", "automatic"}:
         raise ValueError("publish_mode 必须是 manual 或 automatic")
+    content_status = values.get("content_status")
+    if content_status is None:
+        content_status = "ready" if publish_mode == "automatic" else "draft"
+    if content_status not in {"draft", "ready"}:
+        raise ValueError("content_status 必须是 draft 或 ready")
+    initial_status = "ready" if content_status == "ready" else "draft"
 
     with connection() as conn:
         cursor = conn.execute(
@@ -554,9 +561,9 @@ def create_article(values):
             INSERT INTO articles (
                 title, author, article_type, content_md, cover_url, source_url,
                 tags_json, media_paths_json, publish_mode, target_platforms_json,
-                platform_actions_json, platform_accounts_json, status,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                platform_actions_json, platform_accounts_json, content_status,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 title,
@@ -580,6 +587,8 @@ def create_article(values):
                     values.get("platform_accounts", {}),
                     ensure_ascii=False,
                 ),
+                content_status,
+                initial_status,
                 now,
                 now,
             ),
@@ -760,6 +769,7 @@ def update_article(article_id, values):
         "cover_url",
         "source_url",
         "media_paths",
+        "content_status",
         "publish_mode",
         "target_platforms",
         "platform_actions",
@@ -782,6 +792,19 @@ def update_article(article_id, values):
         "automatic",
     }:
         raise ValueError("publish_mode 必须是 manual 或 automatic")
+    if "content_status" not in values and "publish_mode" in values:
+        values["content_status"] = (
+            "ready" if values["publish_mode"] == "automatic" else "draft"
+        )
+    if "content_status" in values and values["content_status"] not in {
+        "draft",
+        "ready",
+    }:
+        raise ValueError("content_status 必须是 draft 或 ready")
+    if "content_status" in values and "status" not in values:
+        current = get_article(article_id, include_records=False)
+        if current["status"] in {"draft", "ready"}:
+            values["status"] = values["content_status"]
     if "platform_actions" in values:
         invalid_actions = set(values["platform_actions"].values()) - {
             "draft",
@@ -844,7 +867,7 @@ def _get_platform_states(article_id):
             """
             SELECT * FROM article_platform_states
             WHERE article_id = ?
-            ORDER BY platform
+            ORDER BY platform, account_id, updated_at DESC
             """,
             (article_id,),
         ).fetchall()
@@ -866,59 +889,87 @@ def _set_platform_state(
     completed_at = now if status in {"drafted", "published", "failed"} else None
     started_at = now if status == "publishing" else None
     with connection() as conn:
-        conn.execute(
+        existing = conn.execute(
             """
-            INSERT INTO article_platform_states (
-                article_id, platform, action, account_id, status, attempts,
-                external_id, last_error, started_at, completed_at,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(article_id, platform) DO UPDATE SET
-                action = excluded.action,
-                account_id = excluded.account_id,
-                status = excluded.status,
-                attempts = article_platform_states.attempts + ?,
-                external_id = excluded.external_id,
-                last_error = excluded.last_error,
-                started_at = COALESCE(excluded.started_at, article_platform_states.started_at),
-                completed_at = excluded.completed_at,
-                updated_at = excluded.updated_at
+            SELECT id FROM article_platform_states
+            WHERE article_id = ? AND platform = ?
+              AND (
+                (account_id IS NULL AND ? IS NULL)
+                OR account_id = ?
+              )
             """,
-            (
-                article_id,
-                platform,
-                action,
-                account_id,
-                status,
-                1 if increment_attempt else 0,
-                external_id,
-                error,
-                started_at,
-                completed_at,
-                now,
-                now,
-                1 if increment_attempt else 0,
-            ),
-        )
+            (article_id, platform, account_id, account_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE article_platform_states
+                SET action = ?, status = ?, attempts = attempts + ?,
+                    external_id = ?, last_error = ?,
+                    started_at = COALESCE(?, started_at),
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    action,
+                    status,
+                    1 if increment_attempt else 0,
+                    external_id,
+                    error,
+                    started_at,
+                    completed_at,
+                    now,
+                    existing["id"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO article_platform_states (
+                    article_id, platform, action, account_id, status, attempts,
+                    external_id, last_error, started_at, completed_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    article_id,
+                    platform,
+                    action,
+                    account_id,
+                    status,
+                    1 if increment_attempt else 0,
+                    external_id,
+                    error,
+                    started_at,
+                    completed_at,
+                    now,
+                    now,
+                ),
+            )
 
 
 def _state_matches_target(state, action, account_id):
     if not state or state["action"] != action:
         return False
-    return (
-        account_id is None
-        or state["account_id"] is None
-        or state["account_id"] == account_id
+    return state["account_id"] == account_id
+
+
+def _find_platform_state(states, platform, account_id):
+    return next(
+        (
+            state for state in states
+            if state["platform"] == platform and state["account_id"] == account_id
+        ),
+        None,
     )
 
 
-def _finalize_article_platform_status(article_id, platforms):
-    states = {
-        state["platform"]: state
-        for state in _get_platform_states(article_id)
-        if state["platform"] in platforms
-    }
-    selected = [states.get(platform) for platform in platforms]
+def _finalize_article_platform_status(article_id, targets):
+    states = _get_platform_states(article_id)
+    selected = [
+        _find_platform_state(states, platform, account_id)
+        for platform, account_id in targets
+    ]
     statuses = {state["status"] if state else "pending" for state in selected}
     successful = statuses <= {"drafted", "published"}
     if successful:
@@ -949,6 +1000,14 @@ def _finalize_article_platform_status(article_id, platforms):
     return final_status
 
 
+def _enabled_publish_targets(settings):
+    return {
+        platform: target
+        for platform, target in (settings.get("auto_publish_targets") or {}).items()
+        if target.get("enabled")
+    }
+
+
 def publish_article(
     article_id,
     requested_actions=None,
@@ -956,11 +1015,14 @@ def publish_article(
     retry_failed=True,
     operation_id=None,
     operation_kind="manual",
+    force=False,
 ):
     if not operation_lock.acquire(blocking=False):
         logger.warning("文章发布被跳过：操作锁正在占用 article_id=%s", article_id)
         raise RuntimeError("已有同步或发布任务正在执行")
     owns_operation = operation_id is None
+    if force and operation_kind == "manual":
+        operation_kind = "republish"
     if owns_operation:
         operation_id = publish_progress.begin(
             operation_kind,
@@ -976,8 +1038,30 @@ def publish_article(
     started = time.perf_counter()
     try:
         article = get_article(article_id, include_records=False)
+        settings = get_settings()
+        publishers = get_platforms(settings)
+        default_targets = {
+            platform: target
+            for platform, target in _enabled_publish_targets(settings).items()
+            if (
+                platform in publishers
+                and publishers[platform].supports_content_type(
+                    article["article_type"]
+                )
+            )
+        }
         if requested_actions is not None:
-            actions = requested_actions
+            actions = dict(requested_actions)
+            accounts = dict(article.get("platform_accounts") or {})
+        elif default_targets:
+            actions = {
+                platform: target["action"]
+                for platform, target in default_targets.items()
+            }
+            accounts = {
+                platform: target["account_id"]
+                for platform, target in default_targets.items()
+            }
         else:
             actions = {
                 key: article["platform_actions"].get(
@@ -985,7 +1069,7 @@ def publish_article(
                 )
                 for key in article["target_platforms"]
             }
-        accounts = dict(article.get("platform_accounts") or {})
+            accounts = dict(article.get("platform_accounts") or {})
         if requested_accounts is not None:
             accounts.update(requested_accounts)
         platforms = list(actions)
@@ -994,8 +1078,6 @@ def publish_article(
         if set(actions.values()) - {"draft", "publish"}:
             raise ValueError("平台动作必须是 draft 或 publish")
 
-        settings = get_settings()
-        publishers = get_platforms(settings)
         unknown = set(platforms) - set(publishers)
         if unknown:
             raise ValueError(f"未知平台: {', '.join(sorted(unknown))}")
@@ -1026,9 +1108,7 @@ def publish_article(
 
         article = dict(article)
         article["platform_accounts"] = accounts
-        existing_states = {
-            state["platform"]: state for state in _get_platform_states(article_id)
-        }
+        existing_states = _get_platform_states(article_id)
         logger.info(
             "文章发布开始 article_id=%s title=%r actions=%s accounts=%s",
             article_id,
@@ -1038,15 +1118,23 @@ def publish_article(
         )
         _set_article_status(article_id, "publishing", "")
         results = []
+        final_targets = []
         for platform_key in platforms:
             publisher = publishers[platform_key]
             platform_action = actions[platform_key]
             account_id = accounts.get(platform_key)
-            state = existing_states.get(platform_key)
+            state = _find_platform_state(
+                existing_states, platform_key, account_id
+            )
             state_matches = _state_matches_target(
                 state, platform_action, account_id
             )
-            if state_matches and state["status"] in {"drafted", "published"}:
+            if (
+                not force
+                and state_matches
+                and state["status"] in {"drafted", "published"}
+            ):
+                final_targets.append((platform_key, account_id))
                 results.append(
                     {
                         "platform": platform_key,
@@ -1070,6 +1158,7 @@ def publish_article(
                 )
                 continue
             if state_matches and state["status"] == "failed" and not retry_failed:
+                final_targets.append((platform_key, account_id))
                 results.append(
                     {
                         "platform": platform_key,
@@ -1131,6 +1220,9 @@ def publish_article(
                     result_status,
                     output.get("external_id", ""),
                     "",
+                    account_id=resolved_account_id,
+                    trigger_source=operation_kind,
+                    forced=force,
                 )
                 _set_platform_state(
                     article_id,
@@ -1140,6 +1232,7 @@ def publish_article(
                     result_status,
                     external_id=output.get("external_id", ""),
                 )
+                final_targets.append((platform_key, resolved_account_id))
                 results.append(
                     {
                         "platform": platform_key,
@@ -1179,7 +1272,15 @@ def publish_article(
                     platform_action,
                 )
                 _record_publish(
-                    article_id, platform_key, platform_action, "failed", "", str(exc)
+                    article_id,
+                    platform_key,
+                    platform_action,
+                    "failed",
+                    "",
+                    str(exc),
+                    account_id=account_id,
+                    trigger_source=operation_kind,
+                    forced=force,
                 )
                 _set_platform_state(
                     article_id,
@@ -1189,6 +1290,7 @@ def publish_article(
                     "failed",
                     error=str(exc),
                 )
+                final_targets.append((platform_key, account_id))
                 results.append(
                     {
                         "platform": platform_key,
@@ -1209,7 +1311,7 @@ def publish_article(
                     advance=1,
                 )
 
-        final_status = _finalize_article_platform_status(article_id, platforms)
+        final_status = _finalize_article_platform_status(article_id, final_targets)
         logger.info(
             "文章发布结束 article_id=%s final_status=%s elapsed_ms=%.1f",
             article_id,
@@ -1470,7 +1572,7 @@ def generate_ai_article(values, settings=None):
             "cover_url": "",
             "tags": generated["tags"],
             "media_paths": [],
-            "publish_mode": "manual",
+            "content_status": "draft",
             "target_platforms": ["wechat"],
             "platform_actions": {"wechat": "draft"},
         }
@@ -1901,20 +2003,34 @@ def _enrich_article(article_id, settings=None):
     return get_article(article_id)
 
 
-def _record_publish(article_id, platform, action, status, external_id, error):
+def _record_publish(
+    article_id,
+    platform,
+    action,
+    status,
+    external_id,
+    error,
+    *,
+    account_id=None,
+    trigger_source="manual",
+    forced=False,
+):
     now = utc_now()
     with connection() as conn:
         conn.execute(
             """
             INSERT INTO publish_records (
-                article_id, platform, action, status, external_id, error,
-                created_at, published_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                article_id, platform, action, account_id, trigger_source,
+                forced, status, external_id, error, created_at, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 article_id,
                 platform,
                 action,
+                account_id,
+                trigger_source,
+                int(forced),
                 status,
                 external_id,
                 error,
@@ -1986,11 +2102,7 @@ def _run_auto_publish(operation_id):
         publish_progress.finish(operation_id, "completed", "未启用自动发布")
         return {"processed": 0, "results": [], "operation_id": operation_id}
 
-    targets = {
-        platform: target
-        for platform, target in (settings.get("auto_publish_targets") or {}).items()
-        if target.get("enabled")
-    }
+    targets = _enabled_publish_targets(settings)
     if not targets:
         logger.info("自动发布检查结束：未配置发布平台 processed=0")
         publish_progress.event(
@@ -2011,33 +2123,42 @@ def _run_auto_publish(operation_id):
         rows = conn.execute(
             """
             SELECT id, article_type FROM articles
-            WHERE publish_mode = 'automatic'
-              AND status IN ('ready', 'partial', 'failed', 'publishing')
+            WHERE content_status = 'ready'
             ORDER BY created_at
             """
         ).fetchall()
 
     publishers = get_platforms(settings)
-    actions = {
-        platform: target["action"] for platform, target in targets.items()
-    }
-
-    publish_progress.configure(
-        operation_id,
-        total=len(rows) * len(actions),
-    )
-    publish_progress.event(
-        operation_id,
-        f"找到 {len(rows)} 篇候选稿件，目标平台 {len(actions)} 个",
-        stage="scan",
-    )
-    results = []
+    jobs = []
     for row in rows:
-        article_id = row["id"]
         compatible_targets = {
             platform: target for platform, target in targets.items()
             if publishers[platform].supports_content_type(row["article_type"])
         }
+        states = _get_platform_states(row["id"])
+        if any(
+            _automatic_target_needs_run(
+                _find_platform_state(states, platform, target["account_id"]),
+                target["action"],
+                target["account_id"],
+            )
+            for platform, target in compatible_targets.items()
+        ):
+            jobs.append((row, compatible_targets))
+
+    publish_progress.configure(
+        operation_id,
+        total=sum(len(compatible_targets) for _, compatible_targets in jobs),
+    )
+    publish_progress.event(
+        operation_id,
+        f"检查 {len(rows)} 篇队列稿件，找到 {len(jobs)} 篇待处理稿件，"
+        f"目标平台 {len(targets)} 个",
+        stage="scan",
+    )
+    results = []
+    for row, compatible_targets in jobs:
+        article_id = row["id"]
         incompatible_count = len(targets) - len(compatible_targets)
         if incompatible_count:
             publish_progress.event(
@@ -2046,10 +2167,7 @@ def _run_auto_publish(operation_id):
                 level="warning",
                 stage="skipped",
                 article_id=article_id,
-                advance=incompatible_count,
             )
-        if not compatible_targets:
-            continue
 
         compatible_actions = {
             platform: target["action"]
@@ -2059,24 +2177,6 @@ def _run_auto_publish(operation_id):
             platform: target["account_id"]
             for platform, target in compatible_targets.items()
         }
-        states = {
-            state["platform"]: state for state in _get_platform_states(article_id)
-        }
-        if not any(
-            _automatic_target_needs_run(
-                states.get(platform), target["action"], target["account_id"]
-            )
-            for platform, target in compatible_targets.items()
-        ):
-            publish_progress.event(
-                operation_id,
-                f"稿件 #{article_id} 无需重复处理",
-                level="success",
-                stage="skipped",
-                article_id=article_id,
-                advance=len(compatible_actions),
-            )
-            continue
         try:
             results.append(
                 publish_article(
@@ -2085,6 +2185,7 @@ def _run_auto_publish(operation_id):
                     requested_accounts=compatible_accounts,
                     retry_failed=False,
                     operation_id=operation_id,
+                    operation_kind="automatic",
                 )
             )
         except Exception as exc:
@@ -2112,27 +2213,30 @@ def _run_auto_publish(operation_id):
         "operation_id": operation_id,
     }
 
-def retry_article_platform(article_id, platform):
-    states = {
-        state["platform"]: state for state in _get_platform_states(article_id)
-    }
-    state = states.get(platform)
-    if not state:
-        raise LookupError("该稿件还没有此平台的发布状态")
-    if state["status"] != "failed":
-        raise ValueError("只能重试发布失败的平台")
-    accounts = (
-        {platform: state["account_id"]}
-        if state["account_id"] is not None
-        else None
-    )
+def retry_article_platform(article_id, platform, account_id=None):
+    states = [
+        state for state in _get_platform_states(article_id)
+        if (
+            state["platform"] == platform
+            and state["status"] == "failed"
+            and (account_id is None or state["account_id"] == account_id)
+        )
+    ]
+    if not states:
+        raise LookupError("该稿件没有可重试的失败记录")
+    state = sorted(
+        states,
+        key=lambda item: item.get("updated_at") or "",
+        reverse=True,
+    )[0]
     return publish_article(
         article_id,
         requested_actions={platform: state["action"]},
-        requested_accounts=accounts,
+        requested_accounts={platform: state["account_id"]},
         retry_failed=True,
         operation_kind="retry",
     )
+
 
 def dashboard_summary():
     with connection() as conn:

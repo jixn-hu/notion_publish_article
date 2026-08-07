@@ -1808,6 +1808,316 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(detail["platform_states"][0]["status"], "drafted")
         self.assertEqual(detail["platform_states"][0]["attempts"], 1)
 
+
+
+    def test_platform_state_schema_migrates_to_account_identity(self):
+        first_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "迁移账号 A"},
+        ).json()
+        second_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "迁移账号 B"},
+        ).json()
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "状态迁移", "content_md": "正文"},
+        ).json()
+        with backend.db.connection() as conn:
+            conn.execute(
+                "DROP INDEX IF EXISTS idx_article_platform_states_target"
+            )
+            conn.execute("DROP TABLE article_platform_states")
+            conn.execute(
+                """
+                CREATE TABLE article_platform_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    article_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    account_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    external_id TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    started_at TEXT,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(article_id, platform)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO article_platform_states (
+                    article_id, platform, action, account_id, status, attempts,
+                    external_id, last_error, created_at, updated_at
+                ) VALUES (?, 'csdn', 'draft', ?, 'drafted', 1, 'old', '', 'now', 'now')
+                """,
+                (article["id"], first_account["id"]),
+            )
+
+        backend.db.init_db()
+
+        with backend.db.connection() as conn:
+            schema = conn.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'article_platform_states'
+                """
+            ).fetchone()["sql"]
+            preserved = conn.execute(
+                "SELECT * FROM article_platform_states"
+            ).fetchall()
+            conn.execute(
+                """
+                INSERT INTO article_platform_states (
+                    article_id, platform, action, account_id, status, attempts,
+                    external_id, last_error, created_at, updated_at
+                ) VALUES (?, 'csdn', 'draft', ?, 'drafted', 1, 'new', '', 'now', 'now')
+                """,
+                (article["id"], second_account["id"]),
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) FROM article_platform_states"
+            ).fetchone()[0]
+            account_foreign_key = next(
+                row for row in conn.execute(
+                    "PRAGMA foreign_key_list(article_platform_states)"
+                ).fetchall()
+                if row["from"] == "account_id"
+            )
+
+        self.assertNotIn("UNIQUE(article_id, platform)", schema)
+        self.assertEqual(account_foreign_key["on_delete"], "CASCADE")
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0]["external_id"], "old")
+        self.assertEqual(count, 2)
+
+    def test_manual_publish_uses_shared_default_targets(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "默认发布账号"},
+        ).json()
+        self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "auto_publish_targets": {
+                        "csdn": {
+                            "enabled": True,
+                            "account_id": account["id"],
+                            "action": "draft",
+                        }
+                    }
+                }
+            },
+        )
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "统一默认方案", "content_md": "正文"},
+        ).json()
+        publisher = Mock()
+        publisher.name = "CSDN"
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.supports_content_type.return_value = True
+        publisher.publish.return_value = {
+            "external_id": "default-draft",
+            "status": "drafted",
+            "account_id": account["id"],
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            response = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json={},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        publisher.publish.assert_called_once()
+        published_article = publisher.publish.call_args.args[0]
+        self.assertEqual(
+            published_article["platform_accounts"]["csdn"],
+            account["id"],
+        )
+        record = self.client.get(
+            f"/api/articles/{article['id']}"
+        ).json()["publish_records"][0]
+        self.assertEqual(record["account_id"], account["id"])
+        self.assertEqual(record["trigger_source"], "manual")
+
+    def test_force_republish_records_a_new_attempt(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "重发账号"},
+        ).json()
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "再次发布", "content_md": "正文"},
+        ).json()
+        publisher = Mock()
+        publisher.name = "CSDN"
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.supports_content_type.return_value = True
+        publisher.publish.return_value = {
+            "external_id": "republished-draft",
+            "status": "drafted",
+            "account_id": account["id"],
+        }
+        payload = {
+            "platform_actions": {"csdn": "draft"},
+            "platform_accounts": {"csdn": account["id"]},
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            first = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json=payload,
+            )
+            second = self.client.post(
+                f"/api/articles/{article['id']}/publish",
+                json={**payload, "force": True},
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(publisher.publish.call_count, 2)
+        detail = self.client.get(f"/api/articles/{article['id']}").json()
+        self.assertEqual(detail["platform_states"][0]["attempts"], 2)
+        self.assertEqual(len(detail["publish_records"]), 2)
+        self.assertEqual(detail["publish_records"][0]["forced"], 1)
+        self.assertEqual(
+            detail["publish_records"][0]["trigger_source"],
+            "republish",
+        )
+        self.assertEqual(detail["publish_records"][1]["forced"], 0)
+
+    def test_same_platform_accounts_have_independent_states(self):
+        first_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "账号 A"},
+        ).json()
+        second_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "账号 B"},
+        ).json()
+        article = self.client.post(
+            "/api/articles",
+            json={"title": "多账号发布", "content_md": "正文"},
+        ).json()
+        publisher = Mock()
+        publisher.name = "CSDN"
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.supports_content_type.return_value = True
+        publisher.publish.side_effect = lambda published, action: {
+            "external_id": f"draft-{published['platform_accounts']['csdn']}",
+            "status": "drafted",
+            "account_id": published["platform_accounts"]["csdn"],
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            for account in (first_account, second_account):
+                response = self.client.post(
+                    f"/api/articles/{article['id']}/publish",
+                    json={
+                        "platform_actions": {"csdn": "draft"},
+                        "platform_accounts": {"csdn": account["id"]},
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+
+        backend.db.init_db()
+        detail = self.client.get(f"/api/articles/{article['id']}").json()
+        self.assertEqual(publisher.publish.call_count, 2)
+        self.assertEqual(
+            {state["account_id"] for state in detail["platform_states"]},
+            {first_account["id"], second_account["id"]},
+        )
+
+    def test_auto_publish_only_processes_ready_content(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "csdn", "name": "队列账号"},
+        ).json()
+        self.client.put(
+            "/api/settings",
+            json={
+                "values": {
+                    "auto_publish_enabled": True,
+                    "auto_publish_targets": {
+                        "csdn": {
+                            "enabled": True,
+                            "account_id": account["id"],
+                            "action": "draft",
+                        }
+                    },
+                }
+            },
+        )
+        draft = self.client.post(
+            "/api/articles",
+            json={"title": "内容草稿", "content_md": "正文"},
+        ).json()
+        ready = self.client.post(
+            "/api/articles",
+            json={
+                "title": "发布队列稿件",
+                "content_md": "正文",
+                "content_status": "ready",
+            },
+        ).json()
+        publisher = Mock()
+        publisher.name = "CSDN"
+        publisher.implemented = True
+        publisher.is_enabled.return_value = True
+        publisher.is_configured.return_value = True
+        publisher.supports_content_type.return_value = True
+        publisher.publish.return_value = {
+            "external_id": "queue-draft",
+            "status": "drafted",
+            "account_id": account["id"],
+        }
+
+        with patch(
+            "backend.services.get_platforms",
+            return_value={"csdn": publisher},
+        ):
+            first = self.client.post("/api/automation/publish")
+            second = self.client.post("/api/automation/publish")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["processed"], 1)
+        self.assertEqual(second.json()["processed"], 0)
+        publisher.publish.assert_called_once()
+        self.assertEqual(publisher.publish.call_args.args[0]["id"], ready["id"])
+        progress = app_module.publish_progress.snapshot()
+        self.assertEqual(progress["status"], "completed")
+        self.assertTrue(any(
+            "找到 0 篇待处理稿件" in event["message"]
+            for event in progress["events"]
+        ))
+        draft_detail = self.client.get(
+            f"/api/articles/{draft['id']}"
+        ).json()
+        self.assertEqual(draft_detail["content_status"], "draft")
+        self.assertEqual(draft_detail["platform_states"], [])
+
     def test_platform_failure_does_not_stop_following_platform(self):
         article = self.client.post(
             "/api/articles",
@@ -4087,6 +4397,21 @@ class BackendApiTests(unittest.TestCase):
                     "platform_accounts": {"wechat": account["id"]},
                 },
             ).json()
+            with backend.db.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO article_platform_states (
+                        article_id, platform, action, account_id, status,
+                        attempts, created_at, updated_at
+                    ) VALUES (?, 'wechat', 'draft', ?, 'drafted', 1, ?, ?)
+                    """,
+                    (
+                        article["id"],
+                        account["id"],
+                        backend.db.utc_now(),
+                        backend.db.utc_now(),
+                    ),
+                )
 
             response = self.client.delete(f"/api/accounts/{account['id']}")
 
@@ -4104,7 +4429,12 @@ class BackendApiTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM wechat_account_settings WHERE account_id = ?",
                 (account["id"],),
             ).fetchone()[0]
+            state_count = conn.execute(
+                "SELECT COUNT(*) FROM article_platform_states WHERE account_id = ?",
+                (account["id"],),
+            ).fetchone()[0]
         self.assertEqual(settings_count, 0)
+        self.assertEqual(state_count, 0)
         missing = self.client.delete(f"/api/accounts/{account['id']}")
         self.assertEqual(missing.status_code, 404)
 

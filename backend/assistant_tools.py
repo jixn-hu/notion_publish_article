@@ -283,7 +283,7 @@ def _article_summary(article):
         "article_type": article.get("article_type") or "article",
         "status": article.get("status") or "",
         "tags": (article.get("tags") or [])[:8],
-        "publish_mode": article.get("publish_mode") or "manual",
+        "content_status": article.get("content_status") or "draft",
         "target_platforms": article.get("target_platforms") or [],
         "updated_at": article.get("updated_at"),
         "platform_states": [

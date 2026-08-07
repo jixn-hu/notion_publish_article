@@ -22,6 +22,10 @@ import News, { NewsPicker } from './News'
 import AIAssistant from './AIAssistant'
 import BackgroundTasks from './BackgroundTasks'
 import PublishProgress from './PublishProgress'
+import PublishDialog, {
+  publicationButtonState,
+  resolveArticleTargets
+} from './PublishDialog'
 import ImageViewer from './ImageViewer'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
@@ -58,8 +62,6 @@ const PLATFORM_LABELS = {
 }
 
 const BROWSER_PLATFORM_KEYS = ['wechat', 'xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
-const DRAFT_PLATFORM_KEYS = ['wechat', 'csdn']
-const PUBLISH_PLATFORM_KEYS = ['wechat', 'xiaohongshu', 'douyin', 'channels', 'bilibili', 'csdn']
 
 const CONTENT_TYPE_LABELS = {
   article: '文章',
@@ -68,6 +70,32 @@ const CONTENT_TYPE_LABELS = {
 }
 
 const ACTIVE_IMAGE_GENERATION = new Set(['queued', 'running'])
+
+const samePublicationAccount = (left, right) => (
+  Number(left || 0) === Number(right || 0)
+)
+
+function publicationStateForTarget (article, target) {
+  return (article.platform_states || []).find(state => (
+    state.platform === target.platform &&
+    state.action === target.action &&
+    samePublicationAccount(state.account_id, target.account_id)
+  ))
+}
+
+function visiblePublicationTargets (article, platforms, automationTargets) {
+  const targets = resolveArticleTargets(article, platforms, automationTargets)
+  const historical = (article.platform_states || [])
+    .filter(state => !targets.some(target => (
+      target.platform === state.platform
+    )))
+    .map(state => ({
+      platform: state.platform,
+      action: state.action,
+      account_id: state.account_id
+    }))
+  return [...targets, ...historical]
+}
 
 const imageGenerationMessage = article => {
   const generation = article?.ai_result?.image_generation
@@ -520,6 +548,7 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
   const [editing, setEditing] = useState(null)
   const [creating, setCreating] = useState(false)
   const [generating, setGenerating] = useState(false)
+  const [publishingArticle, setPublishingArticle] = useState(null)
   const isBusy = key => busyKeys.includes(key)
   const publishingBusy = busyKeys.some(key => (
     key === 'auto' || key.startsWith('publish-') || key.startsWith('retry-')
@@ -622,7 +651,7 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
       <section className='article-sheet'>
         <div className='article-table-head'>
           <span>稿件</span>
-          <span>类型 / 模式</span>
+          <span>类型 / 队列</span>
           <span>目标平台</span>
           <span>状态</span>
           <span>操作</span>
@@ -655,64 +684,36 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
               </div>
               <div className='type-cell'>
                 <b>{CONTENT_TYPE_LABELS[article.article_type] || article.article_type}</b>
-                <small>{article.publish_mode === 'automatic' ? '自动发布' : '手动发布'}</small>
+                <small>{article.content_status === 'ready' ? '发布队列' : '内容草稿'}</small>
               </div>
               <div className='platform-chips platform-state-list'>
-                {(article.publish_mode === 'automatic'
-                  ? Object.entries(automationTargets)
-                    .filter(([key, target]) => (
-                      target.enabled && platformSupports(key, article.article_type)
-                    ))
-                    .map(([key]) => key)
-                  : article.target_platforms.filter(key => (
-                    platformSupports(key, article.article_type)
-                  ))
-                ).map(key => {
-                  const state = article.platform_states?.find(item => item.platform === key)
-                  const action = state?.action ||
-                    (article.publish_mode === 'automatic'
-                      ? automationTargets[key]?.action
-                      : article.platform_actions?.[key])
-                  return (
-                    <div
-                      className={state ? `platform-state ${state.status}` : 'platform-state pending'}
-                      title={state?.last_error || ''}
-                      key={key}
-                    >
-                      <span>
-                        {PLATFORM_LABELS[key] || key}
-                        · {action === 'publish' ? '直发' : '草稿'}
-                      </span>
-                      <small>
-                        {state
-                          ? `${STATUS_LABELS[state.status] || state.status} · ${state.attempts} 次`
-                          : '等待执行'}
-                      </small>
-                      {state?.status === 'failed' && (
-                        <button
-                          type='button'
-                          disabled={publishingBusy}
-                          onClick={() => runAction(
-                            `retry-${article.id}-${key}`,
-                            () => api.retryArticlePlatform(article.id, key),
-                            publishResultNotice
-                          )}
-                        >
-                          重试
-                        </button>
-                      )}
-                    </div>
-                  )
-                })}
-                {article.publish_mode === 'automatic' &&
-                  !Object.entries(automationTargets).some(([key, target]) => (
-                    target.enabled && platformSupports(key, article.article_type)
-                  )) && (
-                    <div className='platform-state pending'>
-                      <span>当前类型没有可用的自动发布平台</span>
-                      <small>请前往自动化设置</small>
-                    </div>
-                  )}
+                {visiblePublicationTargets(article, platforms, automationTargets)
+                  .map(target => {
+                    const state = publicationStateForTarget(article, target)
+                    return (
+                      <div
+                        className={state ? `platform-state ${state.status}` : 'platform-state pending'}
+                        title={state?.last_error || ''}
+                        key={`${target.platform}-${target.account_id || 0}`}
+                      >
+                        <span>
+                          {PLATFORM_LABELS[target.platform] || target.platform}
+                          · {target.action === 'publish' ? '直发' : '草稿'}
+                        </span>
+                        <small>
+                          {state
+                            ? `${STATUS_LABELS[state.status] || state.status} · ${state.attempts} 次`
+                            : '等待执行'}
+                        </small>
+                      </div>
+                    )
+                  })}
+                {!visiblePublicationTargets(article, platforms, automationTargets).length && (
+                  <div className='platform-state pending'>
+                    <span>尚未配置发布目标</span>
+                    <small>打开发布管理选择平台</small>
+                  </div>
+                )}
               </div>
               <StatusPill value={article.status} />
               <div className='row-actions'>
@@ -731,13 +732,29 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
                 <button
                   className='publish-link'
                   disabled={publishingBusy || article.status === 'publishing'}
-                  onClick={() => runAction(
-                    `publish-${article.id}`,
-                    () => api.publishArticle(article.id),
-                    publishResultNotice
-                  )}
+                  onClick={() => {
+                    const actionState = publicationButtonState(
+                      article,
+                      platforms,
+                      automationTargets
+                    )
+                    if (['manage', 'setup'].includes(actionState)) {
+                      setPublishingArticle(article)
+                      return
+                    }
+                    runAction(
+                      `publish-${article.id}`,
+                      () => api.publishArticle(article.id),
+                      publishResultNotice
+                    ).catch(() => {})
+                  }}
                 >
-                  发布 →
+                  {{
+                    publish: '发布',
+                    continue: '继续发布',
+                    manage: '发布管理',
+                    setup: '设置发布'
+                  }[publicationButtonState(article, platforms, automationTargets)]} →
                 </button>
                 <button
                   className='delete-link'
@@ -782,8 +799,6 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
       {(editing || creating) && (
         <ArticleEditor
           article={editing}
-          accounts={accounts}
-          platforms={platforms}
           onClose={() => {
             setEditing(null)
             setCreating(false)
@@ -794,6 +809,20 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
             setCreating(false)
             await reload(status, query)
           }}
+        />
+      )}
+      {publishingArticle && (
+        <PublishDialog
+          article={publishingArticle}
+          accounts={accounts}
+          platforms={platforms}
+          automationTargets={automationTargets}
+          onClose={() => setPublishingArticle(null)}
+          onPublish={payload => runAction(
+            `publish-${publishingArticle.id}`,
+            () => api.publishArticle(publishingArticle.id, payload),
+            publishResultNotice
+          )}
         />
       )}
     </div>
@@ -1289,7 +1318,7 @@ function AIArticleGenerator ({ onClose, onGenerate }) {
   )
 }
 
-function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
+function ArticleEditor ({ article, onClose, onSaved }) {
   const empty = {
     title: '',
     author: '',
@@ -1299,13 +1328,16 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
     source_url: '',
     tags: [],
     media_paths: [],
-    publish_mode: 'manual',
-    target_platforms: ['wechat'],
-    platform_actions: { wechat: 'draft' },
-    platform_accounts: {},
+    content_status: 'draft',
     ai_result: {}
   }
-  const [form, setForm] = useState(article ? { ...article } : empty)
+  const [form, setForm] = useState(article
+    ? {
+        ...article,
+        content_status: article.content_status ||
+          (article.publish_mode === 'automatic' ? 'ready' : 'draft')
+      }
+    : empty)
   const [saving, setSaving] = useState(false)
   const [enriching, setEnriching] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -1313,16 +1345,6 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const [regeneratingImage, setRegeneratingImage] = useState(null)
   const [imageViewer, setImageViewer] = useState(null)
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }))
-  const selectedWechatAccount = accounts.find(account => (
-    account.platform === 'wechat' &&
-    String(account.id) === String(form.platform_accounts?.wechat || '')
-  ))
-  const wechatApiCannotPublish = selectedWechatAccount?.wechat?.publish_method === 'api' &&
-    selectedWechatAccount.wechat?.api_capabilities?.publish !== true
-  const canDirectPublish = key => (
-    PUBLISH_PLATFORM_KEYS.includes(key) &&
-    (key !== 'wechat' || !wechatApiCannotPublish)
-  )
   const aiImagePlan = form.ai_result?.image_plan || []
   const generatedImages = form.ai_result?.generated_images || []
   const imageGeneration = form.ai_result?.image_generation || {}
@@ -1333,47 +1355,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
   const hasRemoteImages = remoteCover ||
     /!\[[^\]]*\]\(\s*<?https?:\/\//i.test(form.content_md || '') ||
     (form.media_paths || []).some(path => /^https?:\/\//i.test(path))
-
-  useEffect(() => {
-    if (!wechatApiCannotPublish || form.platform_actions?.wechat !== 'publish') return
-    setForm(current => ({
-      ...current,
-      platform_actions: {
-        ...(current.platform_actions || {}),
-        wechat: 'draft'
-      }
-    }))
-  }, [wechatApiCannotPublish, form.platform_actions?.wechat])
-
-  const platformSupports = (key, contentType) => {
-    const supportedTypes = platforms.find(item => item.key === key)?.content_types
-    return !Array.isArray(supportedTypes) || supportedTypes.includes(contentType)
-  }
-  const availablePlatforms = Object.entries(PLATFORM_LABELS).filter(([key]) => (
-    platformSupports(key, form.article_type)
-  ))
-  const changeArticleType = articleType => {
-    setForm(current => {
-      const targetPlatforms = current.target_platforms.filter(key => (
-        platformSupports(key, articleType)
-      ))
-      return {
-        ...current,
-        article_type: articleType,
-        target_platforms: targetPlatforms,
-        platform_actions: Object.fromEntries(
-          Object.entries(current.platform_actions || {}).filter(([key]) => (
-            targetPlatforms.includes(key)
-          ))
-        ),
-        platform_accounts: Object.fromEntries(
-          Object.entries(current.platform_accounts || {}).filter(([key]) => (
-            targetPlatforms.includes(key)
-          ))
-        )
-      }
-    })
-  }
+  const changeArticleType = articleType => set('article_type', articleType)
 
   const save = async () => {
     setSaving(true)
@@ -1387,10 +1369,7 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
         source_url: form.source_url,
         tags: form.tags,
         media_paths: form.media_paths,
-        publish_mode: form.publish_mode,
-        target_platforms: form.target_platforms,
-        platform_actions: form.platform_actions,
-        platform_accounts: form.platform_accounts,
+        content_status: form.content_status,
         ai_result: form.ai_result
       }
       if (article) {
@@ -1568,26 +1547,6 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
     setForm(current => ({ ...current, cover_url: path }))
   }
 
-  const updatePlatformAccount = (platform, value) => {
-    setForm(current => {
-      const next = { ...(current.platform_accounts || {}) }
-      if (value) next[platform] = Number(value)
-      else delete next[platform]
-      const selectedAccount = accounts.find(account => (
-        account.platform === platform && String(account.id) === String(value)
-      ))
-      const apiCannotPublish = platform === 'wechat' &&
-        selectedAccount?.wechat?.publish_method === 'api' &&
-        selectedAccount.wechat?.api_capabilities?.publish !== true
-      return {
-        ...current,
-        platform_accounts: next,
-        platform_actions: apiCannotPublish
-          ? { ...(current.platform_actions || {}), wechat: 'draft' }
-          : current.platform_actions
-      }
-    })
-  }
 
   return (
     <div className='modal-backdrop' onMouseDown={onClose}>
@@ -1623,6 +1582,25 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
                 <option value='video'>视频</option>
               </select>
             </label>
+          </div>
+          <div className='content-status-field'>
+            <span>稿件状态</span>
+            <div className='segmented-control' role='group' aria-label='稿件状态'>
+              <button
+                type='button'
+                className={form.content_status === 'draft' ? 'active' : ''}
+                onClick={() => set('content_status', 'draft')}
+              >
+                内容草稿
+              </button>
+              <button
+                type='button'
+                className={form.content_status === 'ready' ? 'active' : ''}
+                onClick={() => set('content_status', 'ready')}
+              >
+                加入发布队列
+              </button>
+            </div>
           </div>
           <section className='cover-field'>
             <div className='cover-field-copy'>
@@ -1869,91 +1847,6 @@ function ArticleEditor ({ article, accounts, platforms, onClose, onSaved }) {
             <span>阅读原文 URL</span>
             <input value={form.source_url} onChange={e => set('source_url', e.target.value)} />
           </label>
-          <div className='field-grid'>
-            <label className='field'>
-              <span>发布方式</span>
-              <select value={form.publish_mode} onChange={e => set('publish_mode', e.target.value)}>
-                <option value='manual'>手动发布</option>
-                <option value='automatic'>自动发布</option>
-              </select>
-            </label>
-            <div className='field platform-target-field'>
-              <span>目标平台</span>
-              <div className='platform-action-list'>
-                {availablePlatforms.map(([key, label]) => (
-                  <div className='platform-action-row' key={key}>
-                    <label>
-                      <input
-                        type='checkbox'
-                        checked={form.target_platforms.includes(key)}
-                        onChange={e => {
-                          const next = e.target.checked
-                            ? [...form.target_platforms, key]
-                            : form.target_platforms.filter(item => item !== key)
-                          setForm(current => ({
-                            ...current,
-                            target_platforms: next,
-                            platform_actions: {
-                              ...current.platform_actions,
-                              [key]: current.platform_actions?.[key] ||
-                                (DRAFT_PLATFORM_KEYS.includes(key) ? 'draft' : 'publish')
-                            }
-                          }))
-                        }}
-                      />
-                      {label}
-                    </label>
-                    <select
-                      disabled={!form.target_platforms.includes(key)}
-                      value={form.platform_actions?.[key] || (DRAFT_PLATFORM_KEYS.includes(key) ? 'draft' : 'publish')}
-                      onChange={e => set('platform_actions', {
-                        ...form.platform_actions,
-                        [key]: e.target.value
-                      })}
-                    >
-                      {DRAFT_PLATFORM_KEYS.includes(key) && <option value='draft'>保存草稿</option>}
-                      {canDirectPublish(key) && <option value='publish'>直接发布</option>}
-                    </select>
-                    {BROWSER_PLATFORM_KEYS.includes(key) && form.target_platforms.includes(key) && (
-                      <select
-                        className='account-select'
-                        value={form.platform_accounts?.[key] || ''}
-                        onChange={e => updatePlatformAccount(key, e.target.value)}
-                      >
-                        <option value=''>选择发布账号</option>
-                        {accounts
-                          .filter(account => account.platform === key)
-                          .map(account => (
-                            <option
-                              key={account.id}
-                              value={account.id}
-                              disabled={key === 'wechat'
-                                ? account.wechat?.publish_method === 'api'
-                                  ? !account.wechat?.app_secret_configured
-                                  : account.status !== 'valid'
-                                : account.status !== 'valid'}
-                            >
-                              {account.name} · {key === 'wechat'
-                                ? account.wechat?.publish_method === 'api'
-                                  ? account.wechat?.app_secret_configured ? '官方 API' : 'API 未配置'
-                                  : account.status === 'valid' ? '浏览器' : '需登录'
-                                : account.status === 'valid' ? '可用' : '需登录'}
-                              {key === 'wechat' &&
-                                account.wechat?.publish_method === 'api' &&
-                                account.wechat?.app_secret_configured &&
-                                account.wechat?.api_capabilities?.publish !== true
-                                ? ' · 仅草稿'
-                                : ''}
-                            </option>
-                          ))}
-                      </select>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
           <section className='ai-editor-panel'>
             <header>
               <div>

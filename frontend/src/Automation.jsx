@@ -122,7 +122,7 @@ export default function Automation ({ data, platforms = [], notify, onSaved }) {
       <section className='settings-intro'>
         <span className='section-number'>SYSTEM / AUTOMATION</span>
         <h2>设定节奏，<br />再交给系统执行。</h2>
-        <p>自动发布按“稿件 + 平台”独立记录结果，已成功的平台不会重复处理。</p>
+        <p>手动与自动发布共用同一套目标方案，已成功的平台不会重复处理。</p>
       </section>
 
       <section className='settings-section'>
@@ -199,8 +199,8 @@ export default function Automation ({ data, platforms = [], notify, onSaved }) {
         <header>
           <span>03</span>
           <div>
-            <h3>自动发布</h3>
-            <p>选择参与自动发布的账号，并为每个平台指定保存草稿或直接发布。</p>
+            <h3>发布方案与自动发布</h3>
+            <p>设置默认发布账号与执行方式，内容库和自动化共用。</p>
           </div>
         </header>
         <div className='settings-content'>
@@ -214,16 +214,10 @@ export default function Automation ({ data, platforms = [], notify, onSaved }) {
                 onChange={event => set('auto_publish_interval_minutes', Number(event.target.value))}
               />
             </label>
-            <label className='field'>
-              <span>新同步稿件默认方式</span>
-              <select
-                value={form.default_publish_mode}
-                onChange={event => set('default_publish_mode', event.target.value)}
-              >
-                <option value='manual'>手动发布</option>
-                <option value='automatic'>自动发布</option>
-              </select>
-            </label>
+            <div className='automation-queue-scope'>
+              <span>自动发布范围</span>
+              <b>发布队列中的稿件</b>
+            </div>
           </div>
 
           <div className='automation-targets'>
@@ -293,7 +287,7 @@ export default function Automation ({ data, platforms = [], notify, onSaved }) {
             />
             <span>
               <b>启用自动发布</b>
-              <small>失败的平台会暂停自动重试，可在内容库中单独重试。</small>
+              <small>只处理发布队列；成功或失败的目标都不会自动重复执行。</small>
             </span>
           </label>
         </div>

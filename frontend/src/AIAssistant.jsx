@@ -159,7 +159,7 @@ function ConfigurationResult ({ result }) {
   const entries = Object.entries(result.values || {})
     .filter(([key]) => (
       key.endsWith('_enabled') ||
-      ['ai_model', 'default_publish_mode', 'rss_scan_interval_minutes'].includes(key)
+      ['ai_model', 'rss_scan_interval_minutes'].includes(key)
     ))
     .slice(0, 18)
   return (

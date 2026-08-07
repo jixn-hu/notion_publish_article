@@ -21,14 +21,14 @@ with sync_playwright() as playwright:
     assert page.get_by_role("heading", name="工作台").is_visible()
     assert page.get_by_text("Notion 是内容源").is_visible()
 
-    page.locator("nav button").nth(1).click()
+    page.locator("nav").get_by_role("button", name="内容库").click()
     page.locator(".library-toolbar .vermilion").click()
     assert page.locator(".editor-drawer h2").is_visible()
-    assert page.locator(".platform-action-row select").nth(0).input_value() == "draft"
+    assert "active" in page.get_by_role("button", name="内容草稿").get_attribute("class")
     assert page.locator(".ai-editor-panel").is_visible()
     page.locator(".editor-drawer footer .ghost").click()
 
-    page.locator("nav button").nth(2).click()
+    page.locator("nav").get_by_role("button", name="账号管理").click()
     assert page.get_by_role("heading", name="账号管理").is_visible()
     assert page.get_by_text("一个账号，").is_visible()
     assert page.get_by_role("button", name="＋ 添加小红书账号").is_visible()
@@ -41,7 +41,7 @@ with sync_playwright() as playwright:
     account_screenshot.parent.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(account_screenshot), full_page=True)
 
-    page.locator("nav button").nth(3).click()
+    page.locator("nav").get_by_role("button", name="设置").click()
     page.wait_for_selector(".settings-section h3")
     assert page.locator(".settings-section h3").nth(0).is_visible()
     assert page.locator(".settings-section h3").nth(1).is_visible()
@@ -53,9 +53,9 @@ with sync_playwright() as playwright:
     assert page.locator(".mapping-row").count() == 8
     assert page.locator(".mapping-row input").nth(0).input_value() == "标题"
 
-    page.locator("nav button").nth(4).click()
+    page.locator("nav").get_by_role("button", name="自动化").click()
     page.wait_for_selector(".settings-section h3")
-    assert page.get_by_role("heading", name="自动发布").is_visible()
+    assert page.get_by_role("heading", name="发布方案与自动发布").is_visible()
 
     screenshot = Path("artifacts/moflow-settings.png")
     screenshot.parent.mkdir(parents=True, exist_ok=True)

@@ -57,6 +57,7 @@ def init_db():
                 platform_accounts_json TEXT NOT NULL DEFAULT '{}',
                 ai_result_json TEXT NOT NULL DEFAULT '{}',
                 ai_enriched_at TEXT,
+                content_status TEXT NOT NULL DEFAULT 'draft',
                 status TEXT NOT NULL DEFAULT 'ready',
                 last_error TEXT NOT NULL DEFAULT '',
                 last_synced_at TEXT,
@@ -70,6 +71,9 @@ def init_db():
                 article_id INTEGER NOT NULL,
                 platform TEXT NOT NULL,
                 action TEXT NOT NULL DEFAULT 'publish',
+                account_id INTEGER,
+                trigger_source TEXT NOT NULL DEFAULT 'manual',
+                forced INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 external_id TEXT,
                 error TEXT NOT NULL DEFAULT '',
@@ -93,8 +97,7 @@ def init_db():
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
-                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL,
-                UNIQUE(article_id, platform)
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,7 +224,22 @@ def init_db():
                 ON publish_records(article_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_article_platform_states_status
                 ON article_platform_states(status, updated_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_article_platform_states_target
+                ON article_platform_states(
+                    article_id, platform, COALESCE(account_id, 0)
+                );
             """
+        )
+        _migrate_platform_state_identity(conn)
+        _ensure_columns(
+            conn,
+            "publish_records",
+            {
+                "action": "TEXT NOT NULL DEFAULT 'publish'",
+                "account_id": "INTEGER",
+                "trigger_source": "TEXT NOT NULL DEFAULT 'manual'",
+                "forced": "INTEGER NOT NULL DEFAULT 0",
+            },
         )
         # 将旧发布记录迁移为平台状态，升级后也能避免重复发布。
         now = utc_now()
@@ -236,12 +254,13 @@ def init_db():
                 r.article_id,
                 r.platform,
                 r.action,
-                NULL,
+                r.account_id,
                 r.status,
                 (
                     SELECT COUNT(*) FROM publish_records counted
                     WHERE counted.article_id = r.article_id
                       AND counted.platform = r.platform
+                      AND COALESCE(counted.account_id, 0) = COALESCE(r.account_id, 0)
                 ),
                 COALESCE(r.external_id, ''),
                 r.error,
@@ -254,12 +273,19 @@ def init_db():
                 SELECT MAX(latest.id) FROM publish_records latest
                 WHERE latest.article_id = r.article_id
                   AND latest.platform = r.platform
+                  AND COALESCE(latest.account_id, 0) = COALESCE(r.account_id, 0)
             )
               AND r.status IN ('drafted', 'published', 'failed')
+              AND NOT EXISTS (
+                  SELECT 1 FROM article_platform_states state
+                  WHERE state.article_id = r.article_id
+                    AND state.platform = r.platform
+                    AND COALESCE(state.account_id, 0) = COALESCE(r.account_id, 0)
+              )
             """,
             (now,),
         )
-        _ensure_columns(
+        added_article_columns = _ensure_columns(
             conn,
             "articles",
             {
@@ -271,13 +297,26 @@ def init_db():
                 "ai_enriched_at": "TEXT",
                 "media_paths_json": "TEXT NOT NULL DEFAULT '[]'",
                 "platform_accounts_json": "TEXT NOT NULL DEFAULT '{}'",
+                "content_status": "TEXT NOT NULL DEFAULT 'draft'",
             },
         )
-        _ensure_columns(
-            conn,
-            "publish_records",
-            {"action": "TEXT NOT NULL DEFAULT 'publish'"},
-        )
+        if "content_status" in added_article_columns:
+            conn.execute(
+                """
+                UPDATE articles
+                SET content_status = CASE
+                    WHEN publish_mode = 'automatic' THEN 'ready'
+                    ELSE 'draft'
+                END
+                """
+            )
+            conn.execute(
+                """
+                UPDATE articles
+                SET status = 'draft'
+                WHERE content_status = 'draft' AND status = 'ready'
+                """
+            )
         _ensure_columns(
             conn,
             "accounts",
@@ -315,13 +354,67 @@ def init_db():
         )
 
 
+def _migrate_platform_state_identity(conn):
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("article_platform_states",),
+    ).fetchone()
+    table_sql = "" if not row else str(row["sql"] or "").replace(" ", "").lower()
+    if "unique(article_id,platform)" not in table_sql:
+        return
+
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_article_platform_states_target;
+        CREATE TABLE article_platform_states_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            action TEXT NOT NULL,
+            account_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            external_id TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            started_at TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
+        INSERT INTO article_platform_states_v2 (
+            id, article_id, platform, action, account_id, status, attempts,
+            external_id, last_error, started_at, completed_at, created_at,
+            updated_at
+        )
+        SELECT
+            id, article_id, platform, action, account_id, status, attempts,
+            external_id, last_error, started_at, completed_at, created_at,
+            updated_at
+        FROM article_platform_states;
+        DROP TABLE article_platform_states;
+        ALTER TABLE article_platform_states_v2 RENAME TO article_platform_states;
+        CREATE INDEX idx_article_platform_states_status
+            ON article_platform_states(status, updated_at);
+        CREATE UNIQUE INDEX idx_article_platform_states_target
+            ON article_platform_states(
+                article_id, platform, COALESCE(account_id, 0)
+            );
+        """
+    )
+
+
 def _ensure_columns(conn, table, columns):
     existing = {
         row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     }
+    added = set()
     for name, definition in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            added.add(name)
+    return added
 
 
 def row_to_article(row):

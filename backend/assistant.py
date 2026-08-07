@@ -391,7 +391,7 @@ def _save_article(draft, values, settings):
             "cover_url": "",
             "tags": generated["tags"],
             "media_paths": [],
-            "publish_mode": "manual",
+            "content_status": "draft",
             "target_platforms": ["wechat"],
             "platform_actions": {"wechat": "draft"},
         }
