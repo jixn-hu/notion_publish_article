@@ -31,9 +31,9 @@ export default function About ({ version }) {
       icon: Bug
     },
     {
-      label: '版本发布',
-      detail: 'RELEASES',
-      href: `${GITHUB_URL}/releases`,
+      label: '更新记录',
+      detail: 'CHANGELOG',
+      href: `${GITHUB_URL}/blob/main/CHANGELOG.md`,
       icon: Tag
     }
   ]

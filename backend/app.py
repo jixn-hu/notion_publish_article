@@ -104,7 +104,7 @@ async def lifespan(_app):
 
 app = FastAPI(
     title="墨流 · AI 内容工作台",
-    version="1.0.0",
+    version="1.0.1",
     lifespan=lifespan,
 )
 
