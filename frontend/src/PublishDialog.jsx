@@ -20,6 +20,12 @@ const PLATFORM_LABELS = {
   csdn: 'CSDN'
 }
 
+const CONTENT_TYPE_LABELS = {
+  article: '文章',
+  image: '图文',
+  video: '视频'
+}
+
 const DRAFT_PLATFORMS = new Set(['wechat', 'csdn'])
 const SUCCESS_STATUSES = new Set(['drafted', 'published'])
 const STATUS_LABELS = {
@@ -41,6 +47,14 @@ function supportsArticle (platform, articleType) {
     platform.content_types.includes(articleType)
 }
 
+function isAvailablePlatform (platform, articleType) {
+  return Boolean(
+    platform?.implemented &&
+    platform?.enabled &&
+    supportsArticle(platform, articleType)
+  )
+}
+
 function sameAccount (left, right) {
   return Number(left || 0) === Number(right || 0)
 }
@@ -53,10 +67,10 @@ function matchingState (article, target) {
   ))
 }
 
-export function resolveArticleTargets (article, platforms, automationTargets) {
+function resolveArticleTargets (article, platforms, automationTargets) {
   const available = new Map(
     platforms
-      .filter(platform => supportsArticle(platform, article.article_type))
+      .filter(platform => isAvailablePlatform(platform, article.article_type))
       .map(platform => [platform.key, platform])
   )
   const defaults = Object.entries(automationTargets || {})
@@ -78,26 +92,23 @@ export function resolveArticleTargets (article, platforms, automationTargets) {
     }))
 }
 
-export function publicationButtonState (
-  article,
-  platforms,
-  automationTargets
-) {
-  const targets = resolveArticleTargets(article, platforms, automationTargets)
-  if (!targets.length || targets.some(target => !target.account_id)) {
-    return 'setup'
-  }
-  const states = targets.map(target => matchingState(article, target))
-  if (states.every(state => state && SUCCESS_STATUSES.has(state.status))) {
-    return 'manage'
-  }
-  if (states.some(Boolean)) return 'continue'
-  return 'publish'
-}
-
 function accountLabel (accounts, accountId) {
   return accounts.find(account => account.id === Number(accountId))?.name ||
     (accountId ? `账号 #${accountId}` : '未选择账号')
+}
+
+function preferredAccountId (article, target, platform, platformAccounts) {
+  const candidates = [
+    target?.account_id,
+    article.platform_accounts?.[platform]
+  ]
+  for (const candidate of candidates) {
+    if (platformAccounts.some(account => account.id === Number(candidate))) {
+      return Number(candidate)
+    }
+  }
+  return platformAccounts.find(account => account.status === 'valid')?.id ||
+    platformAccounts[0]?.id || ''
 }
 
 function statusIcon (status) {
@@ -119,34 +130,43 @@ export default function PublishDialog ({
   const [historyError, setHistoryError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [confirmKey, setConfirmKey] = useState('')
-  const platformMap = useMemo(
-    () => new Map(platforms.map(platform => [platform.key, platform])),
-    [platforms]
-  )
+
   const initialTargets = useMemo(
     () => resolveArticleTargets(article, platforms, automationTargets),
     [article, platforms, automationTargets]
   )
+  const availablePlatforms = useMemo(
+    () => platforms.filter(platform => (
+      isAvailablePlatform(platform, article.article_type)
+    )),
+    [article.article_type, platforms]
+  )
   const [rows, setRows] = useState(() => (
-    platforms
-      .filter(platform => supportsArticle(platform, article.article_type))
-      .map(platform => {
-        const target = initialTargets.find(item => item.platform === platform.key)
-        const action = target?.action ||
-          (DRAFT_PLATFORMS.has(platform.key) ? 'draft' : 'publish')
-        const accountId = target?.account_id ?? ''
-        const state = matchingState(article, {
-          platform: platform.key,
-          action,
-          account_id: accountId
-        })
-        return {
-          platform: platform.key,
-          action,
-          account_id: accountId,
-          selected: Boolean(target) && Boolean(accountId) && !SUCCESS_STATUSES.has(state?.status)
-        }
+    availablePlatforms.map(platform => {
+      const target = initialTargets.find(item => item.platform === platform.key)
+      const platformAccounts = accounts.filter(
+        account => account.platform === platform.key
+      )
+      const action = target?.action || article.platform_actions?.[platform.key] ||
+        (DRAFT_PLATFORMS.has(platform.key) ? 'draft' : 'publish')
+      const accountId = preferredAccountId(
+        article,
+        target,
+        platform.key,
+        platformAccounts
+      )
+      const state = matchingState(article, {
+        platform: platform.key,
+        action,
+        account_id: accountId
       })
+      return {
+        platform: platform.key,
+        action,
+        account_id: accountId,
+        selected: Boolean(target) && Boolean(accountId) && !SUCCESS_STATUSES.has(state?.status)
+      }
+    })
   ))
 
   useEffect(() => {
@@ -231,7 +251,7 @@ export default function PublishDialog ({
       >
         <header className='publish-dialog-head'>
           <div>
-            <span className='eyebrow'>DELIVERY / {article.id}</span>
+            <span className='eyebrow'>DELIVERY / {article.id} · {CONTENT_TYPE_LABELS[article.article_type] || article.article_type}</span>
             <h2 id='publish-dialog-title'>发布管理</h2>
             <p>{article.title}</p>
           </div>
@@ -252,7 +272,7 @@ export default function PublishDialog ({
             <div className='publish-section-title'>
               <div>
                 <span>发布目标</span>
-                <b>{rows.length} 个可用平台</b>
+                <b>{CONTENT_TYPE_LABELS[article.article_type] || article.article_type} · {rows.length} 个可用平台</b>
               </div>
               <span className={article.content_status === 'ready' ? 'queue-ready' : 'queue-draft'}>
                 {article.content_status === 'ready' ? '发布队列' : '内容草稿'}
@@ -260,8 +280,17 @@ export default function PublishDialog ({
             </div>
 
             <div className='publish-target-list'>
+              {!rows.length && (
+                <div className='publish-target-empty'>
+                  <AlertTriangle size={18} />
+                  <div>
+                    <b>暂无可用发布平台</b>
+                    <span>当前稿件为{CONTENT_TYPE_LABELS[article.article_type] || article.article_type}，请先在设置中启用支持该类型的渠道。</span>
+                  </div>
+                </div>
+              )}
               {rows.map(row => {
-                const platform = platformMap.get(row.platform)
+
                 const platformAccounts = accounts.filter(
                   account => account.platform === row.platform
                 )
@@ -273,8 +302,7 @@ export default function PublishDialog ({
                   selectedAccount.wechat?.api_capabilities?.publish !== true
                 const state = matchingState(detail, row)
                 const successful = SUCCESS_STATUSES.has(state?.status)
-                const enabled = platform?.implemented && platform?.enabled
-                const canSelect = enabled && Boolean(row.account_id) && !successful
+                const canSelect = Boolean(row.account_id) && !successful
                 return (
                   <div
                     className={`publish-target-row ${state?.status || 'pending'}`}
@@ -294,13 +322,15 @@ export default function PublishDialog ({
                       </span>
                       <span>
                         <b>{PLATFORM_LABELS[row.platform] || row.platform}</b>
-                        <small>{enabled ? accountLabel(accounts, row.account_id) : '渠道未启用'}</small>
+                        <small>{platformAccounts.length
+                          ? accountLabel(accounts, row.account_id)
+                          : '尚未添加账号'}</small>
                       </span>
                     </label>
 
                     <select
                       value={row.account_id}
-                      disabled={!enabled || submitting}
+                      disabled={!platformAccounts.length || submitting}
                       aria-label={`${PLATFORM_LABELS[row.platform]}发布账号`}
                       onChange={event => {
                         const accountId = event.target.value
@@ -327,7 +357,7 @@ export default function PublishDialog ({
 
                     <select
                       value={row.action}
-                      disabled={!enabled || submitting}
+                      disabled={!platformAccounts.length || submitting}
                       aria-label={`${PLATFORM_LABELS[row.platform]}执行方式`}
                       onChange={event => updateRow(row.platform, {
                         action: event.target.value,
@@ -390,15 +420,22 @@ export default function PublishDialog ({
               {!loading && !historyError && !(detail.publish_records || []).length && (
                 <p className='publish-history-empty'>暂无发布记录</p>
               )}
-              {(detail.publish_records || []).slice(0, 10).map(record => (
+              {(detail.publish_records || []).map(record => (
                 <div className={`publish-history-row ${record.status}`} key={record.id}>
                   <span>{statusIcon(record.status)}</span>
                   <div>
-                    <b>{PLATFORM_LABELS[record.platform] || record.platform}</b>
+                    <b>
+                      {PLATFORM_LABELS[record.platform] || record.platform} · {STATUS_LABELS[record.status] || record.status}
+                    </b>
                     <small>
                       {accountLabel(accounts, record.account_id)} ·
                       {record.action === 'draft' ? ' 保存草稿' : ' 直接发布'}
                     </small>
+                    {record.error && (
+                      <small className='publish-history-error' title={record.error}>
+                        {record.error}
+                      </small>
+                    )}
                   </div>
                   <div>
                     <b>

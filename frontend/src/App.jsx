@@ -6,6 +6,7 @@ import {
   HardDriveDownload,
   Image as ImageIcon,
   Plus,
+  Send,
   Sparkles,
   Trash2,
   Upload,
@@ -22,10 +23,7 @@ import News, { NewsPicker } from './News'
 import AIAssistant from './AIAssistant'
 import BackgroundTasks from './BackgroundTasks'
 import PublishProgress from './PublishProgress'
-import PublishDialog, {
-  publicationButtonState,
-  resolveArticleTargets
-} from './PublishDialog'
+import PublishDialog from './PublishDialog'
 import ImageViewer from './ImageViewer'
 
 const MarkdownComposer = lazy(() => import('./MarkdownComposer'))
@@ -70,32 +68,6 @@ const CONTENT_TYPE_LABELS = {
 }
 
 const ACTIVE_IMAGE_GENERATION = new Set(['queued', 'running'])
-
-const samePublicationAccount = (left, right) => (
-  Number(left || 0) === Number(right || 0)
-)
-
-function publicationStateForTarget (article, target) {
-  return (article.platform_states || []).find(state => (
-    state.platform === target.platform &&
-    state.action === target.action &&
-    samePublicationAccount(state.account_id, target.account_id)
-  ))
-}
-
-function visiblePublicationTargets (article, platforms, automationTargets) {
-  const targets = resolveArticleTargets(article, platforms, automationTargets)
-  const historical = (article.platform_states || [])
-    .filter(state => !targets.some(target => (
-      target.platform === state.platform
-    )))
-    .map(state => ({
-      platform: state.platform,
-      action: state.action,
-      account_id: state.account_id
-    }))
-  return [...targets, ...historical]
-}
 
 const imageGenerationMessage = article => {
   const generation = article?.ai_result?.image_generation
@@ -652,8 +624,6 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
         <div className='article-table-head'>
           <span>稿件</span>
           <span>类型 / 队列</span>
-          <span>目标平台</span>
-          <span>状态</span>
           <span>操作</span>
         </div>
         {visibleArticles.length
@@ -672,50 +642,12 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
                       {imageGenerationMessage(article)}
                     </small>
                   )}
-                  {articleFailureReason(article) && (
-                    <small
-                      className='article-error'
-                      title={articleFailureReason(article)}
-                    >
-                      失败原因：{articleFailureReason(article)}
-                    </small>
-                  )}
                 </div>
               </div>
               <div className='type-cell'>
                 <b>{CONTENT_TYPE_LABELS[article.article_type] || article.article_type}</b>
                 <small>{article.content_status === 'ready' ? '发布队列' : '内容草稿'}</small>
               </div>
-              <div className='platform-chips platform-state-list'>
-                {visiblePublicationTargets(article, platforms, automationTargets)
-                  .map(target => {
-                    const state = publicationStateForTarget(article, target)
-                    return (
-                      <div
-                        className={state ? `platform-state ${state.status}` : 'platform-state pending'}
-                        title={state?.last_error || ''}
-                        key={`${target.platform}-${target.account_id || 0}`}
-                      >
-                        <span>
-                          {PLATFORM_LABELS[target.platform] || target.platform}
-                          · {target.action === 'publish' ? '直发' : '草稿'}
-                        </span>
-                        <small>
-                          {state
-                            ? `${STATUS_LABELS[state.status] || state.status} · ${state.attempts} 次`
-                            : '等待执行'}
-                        </small>
-                      </div>
-                    )
-                  })}
-                {!visiblePublicationTargets(article, platforms, automationTargets).length && (
-                  <div className='platform-state pending'>
-                    <span>尚未配置发布目标</span>
-                    <small>打开发布管理选择平台</small>
-                  </div>
-                )}
-              </div>
-              <StatusPill value={article.status} />
               <div className='row-actions'>
                 <button onClick={() => setEditing(article)}>编辑</button>
                 <button
@@ -732,29 +664,10 @@ function Articles ({ articles, accounts, platforms, automationTargets, busyKeys,
                 <button
                   className='publish-link'
                   disabled={publishingBusy || article.status === 'publishing'}
-                  onClick={() => {
-                    const actionState = publicationButtonState(
-                      article,
-                      platforms,
-                      automationTargets
-                    )
-                    if (['manage', 'setup'].includes(actionState)) {
-                      setPublishingArticle(article)
-                      return
-                    }
-                    runAction(
-                      `publish-${article.id}`,
-                      () => api.publishArticle(article.id),
-                      publishResultNotice
-                    ).catch(() => {})
-                  }}
+                  onClick={() => setPublishingArticle(article)}
                 >
-                  {{
-                    publish: '发布',
-                    continue: '继续发布',
-                    manage: '发布管理',
-                    setup: '设置发布'
-                  }[publicationButtonState(article, platforms, automationTargets)]} →
+                  <Send size={13} />
+                  发布
                 </button>
                 <button
                   className='delete-link'
@@ -1559,12 +1472,6 @@ function ArticleEditor ({ article, onClose, onSaved }) {
           <button className='close-button' onClick={onClose}>×</button>
         </header>
         <div className='editor-body'>
-          {articleFailureReason(form) && (
-            <div className='publish-error-panel' role='alert'>
-              <span>上次发布失败</span>
-              <p>{articleFailureReason(form)}</p>
-            </div>
-          )}
           <label className='field full'>
             <span>标题</span>
             <input value={form.title} onChange={e => set('title', e.target.value)} />
@@ -1919,11 +1826,6 @@ function ArticleEditor ({ article, onClose, onSaved }) {
       />
     </div>
   )
-}
-
-function articleFailureReason (article) {
-  if (!article || !['failed', 'partial'].includes(article.status)) return ''
-  return article.latest_publish_error || article.last_error || ''
 }
 
 function publishResultNotice (result) {
