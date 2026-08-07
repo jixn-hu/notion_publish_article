@@ -632,7 +632,7 @@ function Accounts ({ notify, onChanged }) {
                           placeholder='http://127.0.0.1:8701/wechat'
                           onChange={event => setWechat('api_base_url', event.target.value)}
                         />
-                        <small>本机 SSH 转发可用 127.0.0.1；直接访问服务器时填写服务器地址。</small>
+                        <small>推荐通过 SSH 隧道使用；默认地址连接本机转发端口。</small>
                       </label>
                     )}
                   </div>
