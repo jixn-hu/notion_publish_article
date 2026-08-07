@@ -128,6 +128,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS wechat_account_settings (
                 account_id INTEGER PRIMARY KEY,
                 publish_method TEXT NOT NULL DEFAULT 'browser',
+                api_connection_mode TEXT NOT NULL DEFAULT 'direct',
+                api_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:8701/wechat',
                 app_id TEXT NOT NULL DEFAULT '',
                 app_secret_encrypted TEXT NOT NULL DEFAULT '',
                 api_status TEXT NOT NULL DEFAULT 'pending',
@@ -285,6 +287,16 @@ def init_db():
                 "profile_error": "TEXT NOT NULL DEFAULT ''",
                 "proxy_url": "TEXT NOT NULL DEFAULT ''",
                 "proxy_id": "INTEGER",
+            },
+        )
+        _ensure_columns(
+            conn,
+            "wechat_account_settings",
+            {
+                "api_connection_mode": "TEXT NOT NULL DEFAULT 'direct'",
+                "api_base_url": (
+                    "TEXT NOT NULL DEFAULT 'http://127.0.0.1:8701/wechat'"
+                ),
             },
         )
         conn.execute(

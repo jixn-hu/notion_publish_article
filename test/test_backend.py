@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import sqlite3
 import threading
 import tempfile
 import unittest
@@ -4136,6 +4137,158 @@ class BackendApiTests(unittest.TestCase):
                 (account["id"],),
             ).fetchone()[0]
         self.assertNotEqual(encrypted, "secret-value")
+
+    def test_wechat_api_route_defaults_to_official_endpoint(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-direct"},
+        ).json()
+
+        self.assertEqual(account["wechat"]["api_connection_mode"], "direct")
+        self.assertEqual(
+            account["wechat"]["api_base_url"],
+            "http://127.0.0.1:8701/wechat",
+        )
+        response = self.client.put(
+            f"/api/accounts/{account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "app_id": "wx-direct",
+                "app_secret": "secret-value",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        credentials = backend.accounts.get_wechat_api_credentials(account["id"])
+        self.assertEqual(credentials["api_connection_mode"], "direct")
+        self.assertEqual(
+            credentials["base_api"],
+            "https://api.weixin.qq.com/cgi-bin/",
+        )
+
+    def test_wechat_nginx_route_is_account_scoped(self):
+        nginx_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-nginx"},
+        ).json()
+        direct_account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-official"},
+        ).json()
+        response = self.client.put(
+            f"/api/accounts/{nginx_account['id']}/wechat",
+            json={
+                "publish_method": "api",
+                "api_connection_mode": "nginx",
+                "api_base_url": "https://relay.example.com:8701/wechat/",
+                "app_id": "wx-nginx",
+                "app_secret": "secret-value",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["wechat"]["api_base_url"],
+            "https://relay.example.com:8701/wechat",
+        )
+        credentials = backend.accounts.get_wechat_api_credentials(
+            nginx_account["id"]
+        )
+        self.assertEqual(credentials["api_connection_mode"], "nginx")
+        self.assertEqual(
+            credentials["base_api"],
+            "https://relay.example.com:8701/wechat/cgi-bin/",
+        )
+        refreshed_direct = self.client.get(
+            f"/api/accounts?platform=wechat"
+        ).json()
+        direct_config = next(
+            item["wechat"]
+            for item in refreshed_direct
+            if item["id"] == direct_account["id"]
+        )
+        self.assertEqual(direct_config["api_connection_mode"], "direct")
+
+    def test_wechat_api_route_rejects_invalid_mode_and_urls(self):
+        account = self.client.post(
+            "/api/accounts",
+            json={"platform": "wechat", "name": "wechat-invalid-route"},
+        ).json()
+        invalid_values = [
+            ("nginx", "ftp://relay.example.com/wechat"),
+            ("nginx", "http://user:pass@relay.example.com/wechat"),
+            ("nginx", "http://relay.example.com/wechat?token=secret"),
+            ("nginx", "http://relay.example.com/wechat#fragment"),
+            ("nginx", "http://relay.example.com:bad/wechat"),
+            ("other", "http://relay.example.com/wechat"),
+        ]
+        for mode, url in invalid_values:
+            with self.subTest(mode=mode, url=url):
+                response = self.client.put(
+                    f"/api/accounts/{account['id']}/wechat",
+                    json={
+                        "publish_method": "api",
+                        "api_connection_mode": mode,
+                        "api_base_url": url,
+                    },
+                )
+                self.assertEqual(response.status_code, 400)
+
+    def test_wechat_client_builds_direct_and_nginx_urls(self):
+        from publish_gzh import WechatOfficialAccountPublisher
+
+        direct = WechatOfficialAccountPublisher("app", "secret")
+        nginx = WechatOfficialAccountPublisher(
+            "app",
+            "secret",
+            base_api="http://127.0.0.1:8701/wechat/cgi-bin/",
+        )
+
+        self.assertEqual(
+            direct._build_url("token"),
+            "https://api.weixin.qq.com/cgi-bin/token",
+        )
+        self.assertEqual(
+            nginx._build_url("material/add_material"),
+            "http://127.0.0.1:8701/wechat/cgi-bin/material/add_material",
+        )
+
+    def test_wechat_settings_migration_adds_api_route_columns(self):
+        legacy_db = Path(self.temp_dir.name) / "legacy-wechat-settings.db"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE wechat_account_settings (
+                    account_id INTEGER PRIMARY KEY,
+                    publish_method TEXT NOT NULL DEFAULT 'browser',
+                    app_id TEXT NOT NULL DEFAULT '',
+                    app_secret_encrypted TEXT NOT NULL DEFAULT '',
+                    api_status TEXT NOT NULL DEFAULT 'pending',
+                    api_capabilities_json TEXT NOT NULL DEFAULT '{}',
+                    api_last_error TEXT NOT NULL DEFAULT '',
+                    api_last_checked_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+        with patch.object(backend.db, "DB_PATH", legacy_db):
+            backend.db.init_db()
+            with backend.db.connection() as conn:
+                columns = {
+                    row["name"]: row
+                    for row in conn.execute(
+                        "PRAGMA table_info(wechat_account_settings)"
+                    ).fetchall()
+                }
+
+        self.assertIn("api_connection_mode", columns)
+        self.assertIn("api_base_url", columns)
+        self.assertEqual(columns["api_connection_mode"]["dflt_value"], "'direct'")
+        self.assertEqual(
+            columns["api_base_url"]["dflt_value"],
+            "'http://127.0.0.1:8701/wechat'",
+        )
 
     def test_wechat_api_test_records_independent_capabilities(self):
         account = self.client.post(

@@ -4,10 +4,39 @@ import sqlite3
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from backend.browser import get_or_create_page, open_account_browser, open_account_dashboard
 from backend.db import DATA_DIR, connection, utc_now
 from backend.secret_store import decrypt_secret, encrypt_secret
+
+
+DEFAULT_WECHAT_RELAY_URL = "http://127.0.0.1:8701/wechat"
+WECHAT_OFFICIAL_API_BASE = "https://api.weixin.qq.com/cgi-bin/"
+
+
+def normalize_wechat_api_base_url(value):
+    raw = str(value or DEFAULT_WECHAT_RELAY_URL).strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Nginx 中继地址必须是有效的 HTTP 或 HTTPS 地址")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Nginx 中继地址端口无效") from exc
+    if parsed.username or parsed.password:
+        raise ValueError("Nginx 中继地址不能包含用户名或密码")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Nginx 中继地址不能包含查询参数或锚点")
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def resolve_wechat_api_base(api_connection_mode, api_base_url):
+    if api_connection_mode == "direct":
+        return WECHAT_OFFICIAL_API_BASE
+    relay_url = normalize_wechat_api_base_url(api_base_url)
+    return f"{relay_url}/cgi-bin/"
 
 
 SUPPORTED_ACCOUNT_PLATFORMS = {
@@ -144,6 +173,11 @@ def _row_to_account(row):
         account["wechat"] = {
             "publish_method": account.pop("wechat_publish_method", None)
             or "browser",
+            "api_connection_mode": account.pop(
+                "wechat_api_connection_mode", None
+            ) or "direct",
+            "api_base_url": account.pop("wechat_api_base_url", None)
+            or DEFAULT_WECHAT_RELAY_URL,
             "app_id": account.pop("wechat_app_id", None) or "",
             "app_secret_configured": bool(
                 account.pop("wechat_app_secret_encrypted", None)
@@ -160,6 +194,8 @@ def _row_to_account(row):
     else:
         for key in (
             "wechat_publish_method",
+            "wechat_api_connection_mode",
+            "wechat_api_base_url",
             "wechat_app_id",
             "wechat_app_secret_encrypted",
             "wechat_api_status",
@@ -177,6 +213,9 @@ ACCOUNT_SELECT = """
            proxies.proxy_url AS selected_proxy_url,
            proxies.status AS proxy_status,
            wechat_account_settings.publish_method AS wechat_publish_method,
+           wechat_account_settings.api_connection_mode
+               AS wechat_api_connection_mode,
+           wechat_account_settings.api_base_url AS wechat_api_base_url,
            wechat_account_settings.app_id AS wechat_app_id,
            wechat_account_settings.app_secret_encrypted
                AS wechat_app_secret_encrypted,
@@ -393,6 +432,8 @@ def update_wechat_account_settings(
     publish_method,
     app_id=None,
     app_secret=None,
+    api_connection_mode="direct",
+    api_base_url=None,
 ):
     account = get_account(account_id)
     if account["platform"] != "wechat":
@@ -400,16 +441,22 @@ def update_wechat_account_settings(
     publish_method = str(publish_method or "").strip().lower()
     if publish_method not in {"browser", "api"}:
         raise ValueError("公众号发布方式必须是 browser 或 api")
+    api_connection_mode = str(api_connection_mode or "").strip().lower()
+    if api_connection_mode not in {"direct", "nginx"}:
+        raise ValueError("公众号 API 请求线路必须是 direct 或 nginx")
+    api_base_url = normalize_wechat_api_base_url(api_base_url)
     now = utc_now()
     assignments = [
         "publish_method = ?",
+        "api_connection_mode = ?",
+        "api_base_url = ?",
         "api_status = 'pending'",
         "api_capabilities_json = '{}'",
         "api_last_error = ''",
         "api_last_checked_at = NULL",
         "updated_at = ?",
     ]
-    params = [publish_method, now]
+    params = [publish_method, api_connection_mode, api_base_url, now]
     if app_id is not None:
         assignments.append("app_id = ?")
         params.append(str(app_id).strip())
@@ -441,7 +488,8 @@ def get_wechat_api_credentials(account_id):
     with connection() as conn:
         row = conn.execute(
             """
-            SELECT app_id, app_secret_encrypted
+            SELECT app_id, app_secret_encrypted,
+                   api_connection_mode, api_base_url
             FROM wechat_account_settings
             WHERE account_id = ?
             """,
@@ -453,6 +501,11 @@ def get_wechat_api_credentials(account_id):
         "app_id": row["app_id"],
         "app_secret": decrypt_secret(row["app_secret_encrypted"]),
         "proxy_url": account.get("proxy_url", ""),
+        "api_connection_mode": row["api_connection_mode"] or "direct",
+        "base_api": resolve_wechat_api_base(
+            row["api_connection_mode"] or "direct",
+            row["api_base_url"] or DEFAULT_WECHAT_RELAY_URL,
+        ),
     }
 
 

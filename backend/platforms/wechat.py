@@ -61,13 +61,16 @@ class WechatApiPublisher(PlatformPublisher):
         credentials = get_wechat_api_credentials(self.account["id"])
         proxy_url = credentials["proxy_url"]
         logger.debug(
-            "创建微信客户端 proxy_mode=%s",
+            "创建微信客户端 proxy_mode=%s api_connection_mode=%s base_api=%s",
             "configured" if proxy_url else "direct",
+            credentials["api_connection_mode"],
+            redact_url(credentials["base_api"]),
         )
         return CachedWechatClient(
             app_id=credentials["app_id"],
             app_secret=credentials["app_secret"],
             proxy_url=proxy_url,
+            base_api=credentials["base_api"],
         )
 
     def test_connection(self):

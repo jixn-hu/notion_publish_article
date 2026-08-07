@@ -288,6 +288,8 @@ class AccountProxyPayload(BaseModel):
 
 class WechatAccountSettingsPayload(BaseModel):
     publish_method: str = "browser"
+    api_connection_mode: str = "direct"
+    api_base_url: str | None = Field(default=None, max_length=2048)
     app_id: str | None = Field(default=None, max_length=128)
     app_secret: str | None = Field(default=None, max_length=256)
 
@@ -411,6 +413,8 @@ def account_wechat_settings(
         payload.publish_method,
         payload.app_id,
         payload.app_secret,
+        payload.api_connection_mode,
+        payload.api_base_url,
     )
 
 

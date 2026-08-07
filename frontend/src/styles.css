@@ -7964,8 +7964,68 @@ select:focus-visible {
 }
 
 .wechat-account-settings .wechat-method-switch,
-.wechat-account-settings .wechat-api-fields {
+.wechat-account-settings .wechat-api-fields,
+.wechat-route-settings {
   margin-bottom: 14px;
+}
+
+.wechat-route-settings {
+  padding: 14px;
+  background: #f7f7f8;
+  border: 1px solid rgba(29, 29, 31, 0.08);
+  border-radius: 8px;
+}
+
+.wechat-route-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.wechat-route-heading b {
+  font-size: 13px;
+}
+
+.wechat-route-heading small,
+.wechat-relay-field > small {
+  color: #86868b;
+}
+
+.wechat-route-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  background: #e9e9ec;
+  border-radius: 8px;
+}
+
+.wechat-route-switch button {
+  min-height: 36px;
+  padding: 0 12px;
+  color: #66666b;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.wechat-route-switch button.active {
+  color: #1d1d1f;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(29, 29, 31, 0.12);
+}
+
+.wechat-relay-field {
+  margin-top: 12px;
+}
+
+.wechat-relay-field > small {
+  display: block;
+  margin-top: 6px;
+  line-height: 1.45;
 }
 
 .account-api-status {
@@ -8010,6 +8070,12 @@ select:focus-visible {
   .account-settings-form > footer {
     padding-right: 18px;
     padding-left: 18px;
+  }
+
+  .wechat-route-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .account-api-status {

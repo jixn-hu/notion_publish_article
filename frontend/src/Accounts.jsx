@@ -100,6 +100,8 @@ function Accounts ({ notify, onChanged }) {
   const [proxyAddress, setProxyAddress] = useState('')
   const [wechatForm, setWechatForm] = useState({
     publish_method: 'browser',
+    api_connection_mode: 'direct',
+    api_base_url: 'http://127.0.0.1:8701/wechat',
     app_id: '',
     app_secret: ''
   })
@@ -205,6 +207,8 @@ function Accounts ({ notify, onChanged }) {
     setSelectedProxyId(account.proxy_id ? String(account.proxy_id) : '')
     setWechatForm({
       publish_method: account.wechat?.publish_method || 'browser',
+      api_connection_mode: account.wechat?.api_connection_mode || 'direct',
+      api_base_url: account.wechat?.api_base_url || 'http://127.0.0.1:8701/wechat',
       app_id: account.wechat?.app_id || '',
       app_secret: ''
     })
@@ -227,6 +231,8 @@ function Accounts ({ notify, onChanged }) {
       if (account.platform === 'wechat') {
         const values = {
           publish_method: wechatForm.publish_method,
+          api_connection_mode: wechatForm.api_connection_mode,
+          api_base_url: wechatForm.api_base_url.trim(),
           app_id: wechatForm.app_id.trim()
         }
         if (wechatForm.app_secret) values.app_secret = wechatForm.app_secret
@@ -422,6 +428,11 @@ function Accounts ({ notify, onChanged }) {
                           <small>默认发布</small>
                           <b>{account.wechat?.publish_method === 'api' ? '官方 API' : '浏览器'}</b>
                         </span>
+                        <span className='account-fact'>
+                          <RadioTower size={14} />
+                          <small>API 线路</small>
+                          <b>{account.wechat?.api_connection_mode === 'nginx' ? 'Nginx 中继' : '微信官网'}</b>
+                        </span>
                       </>
                     )}
                     <span className={'account-fact ' + (account.proxy ? 'valid' : '')}>
@@ -590,6 +601,40 @@ function Accounts ({ notify, onChanged }) {
                       <RadioTower size={15} />
                       <span><b>官方 API</b><small>无需浏览器登录，按接口权限发布</small></span>
                     </button>
+                  </div>
+                  <div className='wechat-route-settings'>
+                    <div className='wechat-route-heading'>
+                      <b>API 请求线路</b>
+                      <small>仅影响官方 API 请求，不影响浏览器发布</small>
+                    </div>
+                    <div className='wechat-route-switch' role='group' aria-label='公众号 API 请求线路'>
+                      <button
+                        type='button'
+                        className={wechatForm.api_connection_mode === 'direct' ? 'active' : ''}
+                        onClick={() => setWechat('api_connection_mode', 'direct')}
+                      >
+                        微信官网
+                      </button>
+                      <button
+                        type='button'
+                        className={wechatForm.api_connection_mode === 'nginx' ? 'active' : ''}
+                        onClick={() => setWechat('api_connection_mode', 'nginx')}
+                      >
+                        Nginx 中继
+                      </button>
+                    </div>
+                    {wechatForm.api_connection_mode === 'nginx' && (
+                      <label className='field wechat-relay-field'>
+                        <span>中继地址</span>
+                        <input
+                          type='url'
+                          value={wechatForm.api_base_url}
+                          placeholder='http://127.0.0.1:8701/wechat'
+                          onChange={event => setWechat('api_base_url', event.target.value)}
+                        />
+                        <small>本机 SSH 转发可用 127.0.0.1；直接访问服务器时填写服务器地址。</small>
+                      </label>
+                    )}
                   </div>
                   <div className='wechat-api-fields'>
                     <label className='field'>

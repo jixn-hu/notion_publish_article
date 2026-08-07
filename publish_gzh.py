@@ -7,7 +7,7 @@ import time
 import os
 import mimetypes
 import logging
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from typing import List, Dict, Union, Tuple
 from md_to_html import md_to_wechat_html
 from bs4 import BeautifulSoup
@@ -27,12 +27,16 @@ class WechatOfficialAccountPublisher:
             app_secret: str,
             max_retries: int = 3,
             proxy_url: str = "",
+            base_api: str = "https://api.weixin.qq.com/cgi-bin/",
     ):
         self.app_id = app_id
         self.app_secret = app_secret
         self.access_token = None
         self.token_expire_time = 0
-        self.base_api = "https://api.weixin.qq.com/cgi-bin/"
+        parsed_base_api = urlsplit(base_api)
+        if parsed_base_api.scheme not in {"http", "https"} or not parsed_base_api.netloc:
+            raise ValueError("微信 API 地址必须是有效的 HTTP 或 HTTPS 地址")
+        self.base_api = f"{base_api.rstrip('/')}/"
         self.max_retries = max_retries
         self.session = requests.Session()
         self.session.trust_env = False  # 微信 API 不读取系统/环境代理
