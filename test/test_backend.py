@@ -684,7 +684,7 @@ class BackendApiTests(unittest.TestCase):
             content_html.index("Second paragraph"),
         )
 
-    def test_wechat_article_uses_inline_styles_that_survive_api_sanitizing(self):
+    def test_wechat_article_uses_flat_blocks_that_survive_api_sanitizing(self):
         from bs4 import BeautifulSoup
 
         from publish_gzh import MarkdownProcessor
@@ -692,19 +692,51 @@ class BackendApiTests(unittest.TestCase):
         content_html = MarkdownProcessor.convert_to_html(
             "## 为什么要这样收集想法\n\n"
             "- **闪念最怕来不及记**\n"
-            "- 打开 Notion 的步骤太多\n\n"
+            "- **更快记录**：想到就记，不用来回切应用\n\n"
             "---\n\n"
+            "1. 打开 Notion\n"
+            "2. 新建页面\n\n"
             "![操作截图](https://mmbiz.qpic.cn/demo.jpg)"
         )
         document = BeautifulSoup(content_html, "html.parser")
 
         self.assertIsNone(document.find("style"))
         self.assertIn("font-family", document.section.get("style", ""))
-        self.assertIn("border-left", document.h2.get("style", ""))
-        self.assertIn("padding-left", document.ul.get("style", ""))
+        self.assertIsNone(document.find(["h1", "h2", "h3", "h4", "h5", "h6"]))
+        self.assertIsNone(document.find(["ul", "ol", "li"]))
+        self.assertIsNone(document.find("hr"))
+        heading = next(
+            paragraph
+            for paragraph in document.find_all("p")
+            if "为什么要这样收集想法" in paragraph.get_text()
+        )
+        self.assertIn("border-left", heading.get("style", ""))
+        self.assertEqual(
+            heading.strong.get_text(strip=True),
+            "为什么要这样收集想法",
+        )
+        rows = [
+            paragraph.get_text("", strip=True)
+            for paragraph in document.find_all("p")
+            if paragraph.get_text("", strip=True).startswith(("•", "1.", "2."))
+        ]
+        self.assertEqual(
+            rows,
+            [
+                "•闪念最怕来不及记",
+                "•更快记录：想到就记，不用来回切应用",
+                "1. 打开 Notion",
+                "2. 新建页面",
+            ],
+        )
         self.assertIn("font-weight:700", document.strong.get("style", ""))
-        self.assertIn("border-top", document.hr.get("style", ""))
         self.assertIn("width:100%", document.img.get("style", ""))
+        self.assertFalse(
+            any(
+                not str(child).strip()
+                for child in document.section.children
+            )
+        )
 
     def test_wechat_image_post_places_all_images_before_text(self):
         from bs4 import BeautifulSoup

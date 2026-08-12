@@ -2,6 +2,13 @@
 
 本项目采用[语义化版本](https://semver.org/lang/zh-CN/)。版本号同时显示在前端“关于”页面和 FastAPI 接口文档中。
 
+## [1.0.3] - 2026-08-12
+
+### 修复
+
+- 公众号文章标题改用独立加粗段落，列表改用带可见圆点或序号的独立段落，避免微信保存草稿时重写 `h1-h6`、`ul`、`ol` 和 `li` 后产生空列表项、标题失去层级及内容错行。
+- 公众号 Markdown 输出移除语义分隔线和结构间空白节点；真实稿件回归会校验列表数量、章节与正文图片均完整保留。
+
 ## [1.0.2] - 2026-08-12
 
 ### 修复
@@ -27,6 +34,7 @@
 
 - 墨流首个公开版本，提供内容、素材、资讯、账号、Notion 同步、AI 创作和多平台发布的本地工作台。
 
-[1.0.2]: https://github.com/jixn-hu/notion_publish_article/compare/7c56678...main
+[1.0.3]: https://github.com/jixn-hu/notion_publish_article/compare/7e95176...main
+[1.0.2]: https://github.com/jixn-hu/notion_publish_article/compare/7c56678...7e95176
 [1.0.1]: https://github.com/jixn-hu/notion_publish_article/compare/9efb9f1...7c56678
 [1.0.0]: https://github.com/jixn-hu/notion_publish_article/commit/9efb9f1

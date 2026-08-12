@@ -1,5 +1,5 @@
 import markdown
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 
 BASE_STYLE = (
@@ -74,10 +74,103 @@ TAG_STYLES = {
     "td": "padding:10px 8px;border:1px solid #dfe3e8;text-align:left;",
 }
 
+HEADING_STYLES = {
+    "h1": TAG_STYLES["h1"],
+    "h2": TAG_STYLES["h2"],
+    "h3": TAG_STYLES["h3"],
+    "h4": TAG_STYLES["h4"],
+    "h5": TAG_STYLES["h5"],
+    "h6": TAG_STYLES["h6"],
+}
+
+LAYOUT_CONTAINERS = {
+    "section",
+    "blockquote",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+}
+
 
 def _append_style(tag, style):
     current = str(tag.get("style") or "").strip()
     tag["style"] = f"{current.rstrip(';')};{style}" if current else style
+
+
+def _convert_headings(document, wrapper):
+    for heading in list(wrapper.find_all(HEADING_STYLES)):
+        source_name = heading.name
+        heading.name = "p"
+        heading["style"] = HEADING_STYLES[source_name]
+        emphasis = document.new_tag("strong")
+        for child in list(heading.contents):
+            emphasis.append(child.extract())
+        heading.append(emphasis)
+
+
+def _append_list_item_content(row, item):
+    for child in list(item.contents):
+        if getattr(child, "name", None) in {"ul", "ol"}:
+            continue
+        if getattr(child, "name", None) == "p":
+            for paragraph_child in list(child.contents):
+                row.append(paragraph_child.extract())
+            child.decompose()
+            continue
+        row.append(child.extract())
+
+
+def _list_rows(document, list_tag, depth=0):
+    rows = []
+    ordered = list_tag.name == "ol"
+    try:
+        start = int(list_tag.get("start", 1))
+    except (TypeError, ValueError):
+        start = 1
+
+    for offset, item in enumerate(list_tag.find_all("li", recursive=False)):
+        nested_lists = [
+            child.extract()
+            for child in list(item.children)
+            if getattr(child, "name", None) in {"ul", "ol"}
+        ]
+        row = document.new_tag("p")
+        row["style"] = (
+            f"margin:6px 0 6px {depth * 20}px;line-height:1.75;"
+            "color:#2f3337;text-align:left;"
+        )
+        marker = f"{start + offset}." if ordered else "•"
+        row.append(NavigableString(f"{marker} "))
+        _append_list_item_content(row, item)
+        rows.append(row)
+        for nested in nested_lists:
+            rows.extend(_list_rows(document, nested, depth + 1))
+            nested.decompose()
+    return rows
+
+
+def _convert_lists(document, wrapper):
+    top_level_lists = [
+        item
+        for item in wrapper.find_all(["ul", "ol"])
+        if item.find_parent(["ul", "ol"]) is None
+    ]
+    for list_tag in top_level_lists:
+        for row in _list_rows(document, list_tag):
+            list_tag.insert_before(row)
+        list_tag.decompose()
+
+
+def _remove_layout_whitespace(wrapper):
+    for text in list(wrapper.find_all(string=True)):
+        if (
+            isinstance(text, NavigableString)
+            and not str(text).strip()
+            and getattr(text.parent, "name", None) in LAYOUT_CONTAINERS
+        ):
+            text.extract()
 
 
 def md_to_wechat_html(md_content):
@@ -93,6 +186,11 @@ def md_to_wechat_html(md_content):
     document.append(wrapper)
     for child in list(source.contents):
         wrapper.append(child.extract())
+
+    _convert_headings(document, wrapper)
+    _convert_lists(document, wrapper)
+    for separator in list(wrapper.find_all("hr")):
+        separator.decompose()
 
     for tag in wrapper.find_all(True):
         tag.attrs.pop("class", None)
@@ -113,5 +211,7 @@ def md_to_wechat_html(md_content):
                 "font-size:14px;color:#24292f;background-color:transparent;"
                 "padding:0;"
             )
+
+    _remove_layout_whitespace(wrapper)
 
     return str(wrapper)
