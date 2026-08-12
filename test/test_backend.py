@@ -684,6 +684,28 @@ class BackendApiTests(unittest.TestCase):
             content_html.index("Second paragraph"),
         )
 
+    def test_wechat_article_uses_inline_styles_that_survive_api_sanitizing(self):
+        from bs4 import BeautifulSoup
+
+        from publish_gzh import MarkdownProcessor
+
+        content_html = MarkdownProcessor.convert_to_html(
+            "## 为什么要这样收集想法\n\n"
+            "- **闪念最怕来不及记**\n"
+            "- 打开 Notion 的步骤太多\n\n"
+            "---\n\n"
+            "![操作截图](https://mmbiz.qpic.cn/demo.jpg)"
+        )
+        document = BeautifulSoup(content_html, "html.parser")
+
+        self.assertIsNone(document.find("style"))
+        self.assertIn("font-family", document.section.get("style", ""))
+        self.assertIn("border-left", document.h2.get("style", ""))
+        self.assertIn("padding-left", document.ul.get("style", ""))
+        self.assertIn("font-weight:700", document.strong.get("style", ""))
+        self.assertIn("border-top", document.hr.get("style", ""))
+        self.assertIn("width:100%", document.img.get("style", ""))
+
     def test_wechat_image_post_places_all_images_before_text(self):
         from bs4 import BeautifulSoup
 

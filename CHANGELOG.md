@@ -2,6 +2,13 @@
 
 本项目采用[语义化版本](https://semver.org/lang/zh-CN/)。版本号同时显示在前端“关于”页面和 FastAPI 接口文档中。
 
+## [1.0.2] - 2026-08-12
+
+### 修复
+
+- 公众号 Markdown 改用标签内联样式，避免官方 API 保存草稿时过滤 `<style>` 与 class 后导致标题、列表、段落和图片排版丢失。
+- 公众号官方 API 与浏览器发布共用同一套正文排版，保留文章图片原有位置。
+
 ## [1.0.1] - 2026-08-07
 
 ### 优化
@@ -20,5 +27,6 @@
 
 - 墨流首个公开版本，提供内容、素材、资讯、账号、Notion 同步、AI 创作和多平台发布的本地工作台。
 
-[1.0.1]: https://github.com/jixn-hu/notion_publish_article/compare/9efb9f1...main
+[1.0.2]: https://github.com/jixn-hu/notion_publish_article/compare/7c56678...main
+[1.0.1]: https://github.com/jixn-hu/notion_publish_article/compare/9efb9f1...7c56678
 [1.0.0]: https://github.com/jixn-hu/notion_publish_article/commit/9efb9f1

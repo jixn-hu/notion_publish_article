@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import markdown
 from bs4 import BeautifulSoup
 
+from md_to_html import md_to_wechat_html
+
 from backend.accounts import (
     account_avatar_path,
     list_accounts,
@@ -467,7 +469,7 @@ def _wechat_content_html(article, image_paths, uploaded_sources):
         for path, source in zip(image_paths, uploaded_sources)
     }
     document = BeautifulSoup(
-        markdown.markdown(article.get("content_md") or ""),
+        md_to_wechat_html(article.get("content_md") or ""),
         "html.parser",
     )
     inline_sources = []
